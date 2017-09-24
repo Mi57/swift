@@ -105,6 +105,10 @@ bool OwnershipModelEliminatorVisitor::visitLoadInst(LoadInst *LI) {
   if (Qualifier == LoadOwnershipQualifier::Unqualified)
     return false;
 
+  // If the loaded value is address-only, just return.
+  if (LI->getType().isAddressOnly(*LI->getFunction()))
+    return false;
+
   SILValue Result = B.emitLoadValueOperation(LI->getLoc(), LI->getOperand(),
                                              LI->getOwnershipQualifier());
 
@@ -121,6 +125,10 @@ bool OwnershipModelEliminatorVisitor::visitStoreInst(StoreInst *SI) {
   // If the qualifier is unqualified, there is nothing further to do
   // here. Just return.
   if (Qualifier == StoreOwnershipQualifier::Unqualified)
+    return false;
+
+  // If the stored value is address-only, just return.
+  if (SI->getSrc()->getType().isAddressOnly(*SI->getFunction()))
     return false;
 
   B.emitStoreValueOperation(SI->getLoc(), SI->getSrc(), SI->getDest(),

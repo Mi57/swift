@@ -3,6 +3,7 @@ silopt_register_sources(
   AccessMarkerElimination.cpp
   AddressLowering.cpp
   ClosureLifetimeFixup.cpp
+  BlockArgumentStorage.cpp
   ConstantPropagation.cpp
   DefiniteInitialization.cpp
   DIMemoryUseCollector.cpp
