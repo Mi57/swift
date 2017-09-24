@@ -64,10 +64,9 @@ SILModule &SILArgument::getModule() const {
 //                              SILBlockArgument
 //===----------------------------------------------------------------------===//
 
-static SILValue getIncomingValueForPred(const SILBasicBlock *BB,
-                                        const SILBasicBlock *Pred,
-                                        unsigned Index) {
-  const TermInst *TI = Pred->getTerminator();
+static Operand &getIncomingOperandForPred(SILBasicBlock *BB,
+                                          SILBasicBlock *Pred, unsigned Index) {
+  TermInst *TI = Pred->getTerminator();
 
   switch (TI->getTermKind()) {
   // TODO: This list is conservative. I think we can probably handle more of
@@ -76,26 +75,35 @@ static SILValue getIncomingValueForPred(const SILBasicBlock *BB,
   case TermKind::ReturnInst:
   case TermKind::ThrowInst:
   case TermKind::UnwindInst:
-    llvm_unreachable("Have terminator that implies no successors?!");
+    llvm_unreachable("The predecessor's terminator implies no successors.");
   case TermKind::TryApplyInst:
   case TermKind::SwitchValueInst:
   case TermKind::SwitchEnumAddrInst:
   case TermKind::CheckedCastAddrBranchInst:
   case TermKind::DynamicMethodBranchInst:
   case TermKind::YieldInst:
-    return SILValue();
+    llvm_unreachable("The predecessor's terminator produces no values.");
   case TermKind::BranchInst:
-    return cast<const BranchInst>(TI)->getArg(Index);
-  case TermKind::CondBranchInst:
-    return cast<const CondBranchInst>(TI)->getArgForDestBB(BB, Index);
-  case TermKind::CheckedCastBranchInst:
-    return cast<const CheckedCastBranchInst>(TI)->getOperand();
-  case TermKind::CheckedCastValueBranchInst:
-    return cast<const CheckedCastValueBranchInst>(TI)->getOperand();
-  case TermKind::SwitchEnumInst:
-    return cast<const SwitchEnumInst>(TI)->getOperand();
+    return cast<BranchInst>(TI)->getAllOperands()[Index];
+  case TermKind::CondBranchInst: {
+    auto *CBI = cast<CondBranchInst>(TI);
+    return (CBI->getTrueBB() == BB) ? CBI->getTrueOperands()[Index]
+                                    : CBI->getFalseOperands()[Index];
   }
-  llvm_unreachable("Unhandled TermKind?!");
+  case TermKind::CheckedCastBranchInst:
+    return cast<CheckedCastBranchInst>(TI)->getOperandRef();
+  case TermKind::CheckedCastValueBranchInst:
+    return cast<CheckedCastValueBranchInst>(TI)->getOperandRef();
+  case TermKind::SwitchEnumInst:
+    return cast<SwitchEnumInst>(TI)->getAllOperands()[0];
+  }
+  llvm_unreachable("Unhandled TermKind.");
+}
+
+static SILValue getIncomingValueForPred(const SILBasicBlock *BB,
+                                        const SILBasicBlock *Pred,
+                                        unsigned Index) {
+  return getIncomingValueForPred(BB, Pred, Index).get();
 }
 
 SILValue SILPHIArgument::getSingleIncomingValue() const {
@@ -140,6 +148,15 @@ bool SILPHIArgument::getIncomingValues(
   }
 
   return true;
+}
+
+void SILPHIArgument::getIncomingOperands(
+    llvm::SmallVectorImpl<Operand *> &OutArray) {
+  SILBasicBlock *Parent = getParent();
+
+  unsigned Index = getIndex();
+  for (SILBasicBlock *Pred : getParent()->getPredecessorBlocks())
+    OutArray.push_back(&getIncomingOperandForPred(Parent, Pred, Index));
 }
 
 SILValue SILPHIArgument::getIncomingValue(unsigned BBIndex) {

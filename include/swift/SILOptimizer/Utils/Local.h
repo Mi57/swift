@@ -246,7 +246,8 @@ public:
   /// If \p DEBlocks is provided, all dead-end blocks are ignored. This prevents
   /// unreachable-blocks to be included in the frontier.
   bool computeFrontier(Frontier &Fr, Mode mode,
-                       DeadEndBlocks *DEBlocks = nullptr);
+                       DeadEndBlocks *DEBlocks = nullptr,
+                       DominanceInfo *DT = nullptr);
 
   /// Returns true if the instruction \p Inst is located within the value's
   /// lifetime.

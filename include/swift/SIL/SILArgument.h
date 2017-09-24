@@ -159,6 +159,11 @@ public:
   /// payload argument is the enum itself (the operand of the switch_enum).
   bool getIncomingValues(llvm::SmallVectorImpl<SILValue> &OutArray);
 
+  /// Populates OutArray with the incoming operand for each predecessor of this
+  /// argument block. The operand source is the incoming value; the user is that
+  /// predecessor's terminator.
+  void getIncomingOperands(llvm::SmallVectorImpl<Operand *> &OutArray);
+
   /// Returns true if we were able to find incoming values for each predecessor
   /// of this arguments basic block. The found values are stored in OutArray.
   /// Note that for some predecessor terminators the incoming value is not
