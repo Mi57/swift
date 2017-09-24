@@ -348,7 +348,7 @@ void OpaqueValueVisitor::visitValue(SILValue value) {
   if (value->getType().isObject()
       && value->getType().isAddressOnly(pass.F->getModule())) {
     if (pass.valueStorageMap.contains(value)) {
-      assert(isa<SILFunctionArgument>(
+      assert(ApplySite::isa(value) || isa<SILFunctionArgument>(
           pass.valueStorageMap.getStorage(value).storageAddress));
       return;
     }
@@ -1486,6 +1486,9 @@ class AddressLowering : public SILModuleTransform {
 } // end anonymous namespace
 
 void AddressLowering::runOnFunction(SILFunction *F) {
+  if (!F->isDefinition())
+    return;
+
   auto *DA = PM->getAnalysis<DominanceAnalysis>();
 
   AddressLoweringState pass(F, DA->get(F));

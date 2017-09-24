@@ -506,3 +506,14 @@ bb0(%0 : $AnyObject):
   %7 = tuple ()
   return %7 : $()
 }
+
+// Helper 
+sil @singleIndirectFunc : $@convention(thin) <τ_0_0> () -> @out τ_0_0
+
+// !!!
+sil @singleIndirectApply : $@convention(thin) <τ_0_0> () -> @out τ_0_0 {
+bb0:
+  %2 = function_ref @singleIndirectFunc : $@convention(thin) <τ_0_0> () -> @out τ_0_0
+  %3 = apply %2<τ_0_0>() : $@convention(thin) <τ_0_0> () -> @out τ_0_0
+  return %3 : $τ_0_0
+}
