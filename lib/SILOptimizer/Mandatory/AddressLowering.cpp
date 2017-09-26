@@ -1241,6 +1241,26 @@ protected:
   void
   visitInitExistentialValueInst(InitExistentialValueInst *initExistential) {}
 
+  void visitReleaseValueInst(ReleaseValueInst *releaseInst) {
+    SILValue srcVal = releaseInst->getOperand();
+    ValueStorage &storage = pass.valueStorageMap.getStorage(srcVal);
+    SILValue srcAddr = storage.storageAddress;
+
+    B.createReleaseValueAddr(releaseInst->getLoc(), srcAddr,
+                             releaseInst->getAtomicity());
+    pass.markDead(releaseInst);
+  }
+
+  void visitRetainValueInst(RetainValueInst *retainInst) {
+    SILValue srcVal = retainInst->getOperand();
+    ValueStorage &storage = pass.valueStorageMap.getStorage(srcVal);
+    SILValue srcAddr = storage.storageAddress;
+
+    B.createRetainValueAddr(retainInst->getLoc(), srcAddr,
+                            retainInst->getAtomicity());
+    pass.markDead(retainInst);
+  }
+
   void visitReturnInst(ReturnInst *returnInst) {
     // Returns are rewritten for any function with indirect results after opaque
     // value rewriting.
@@ -1271,6 +1291,24 @@ protected:
     B.createCopyAddr(storeInst->getLoc(), srcAddr, storeInst->getDest(),
                      isTakeFlag, IsInitialization);
     pass.markDead(storeInst);
+  }
+
+  void visitStructExtractInst(StructExtractInst *extractInst) {
+    SILValue srcAddr =
+        pass.valueStorageMap.getStorage(extractInst->getOperand())
+            .storageAddress;
+
+    auto *SEA = B.createStructElementAddr(
+        extractInst->getLoc(), srcAddr, extractInst->getField(),
+        extractInst->getType().getAddressType());
+    if (extractInst->getType().isAddressOnly(pass.F->getModule()))
+      markRewritten(SEA);
+    else {
+      LoadInst *loadElement = B.createLoad(extractInst->getLoc(), SEA,
+                                           LoadOwnershipQualifier::Unqualified);
+      extractInst->replaceAllUsesWith(loadElement);
+      pass.markDead(extractInst);
+    }
   }
 
   void visitTupleInst(TupleInst *tupleInst) {
@@ -1411,6 +1449,10 @@ protected:
       }
       ++eltIdx;
     }
+  }
+
+  void visitStructExtractInst(StructExtractInst *extractInst) {
+    assert(storage->isRewritten());
   }
 
   void visitTupleExtractInst(TupleExtractInst *extractInst) {
