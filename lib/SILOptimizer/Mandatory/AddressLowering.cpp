@@ -91,6 +91,7 @@
 
 #define DEBUG_TYPE "address-lowering"
 #include "swift/SIL/DebugUtils.h"
+#include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILVisitor.h"
@@ -144,7 +145,7 @@ struct ValueStorage {
   bool isProjection() const {
     return projectionAndFlags.getInt() & IsProjectionMask;
   }
-  /// Return the operand the composes an aggregate from this value.
+  /// Return the operand that composes an aggregate from this value.
   Operand *getComposedOperand() const {
     assert(isProjection());
     return projectionAndFlags.getPointer();
@@ -689,8 +690,10 @@ SILValue AddressMaterialization::materializeProjection(Operand *operand) {
       // original function type.
       return pass.F->getArguments()[resultIdx];
     }
-    // TODO: emit tuple_element_addr
-    llvm_unreachable("Unimplemented");
+    SILValue tupleAddr = materializeAddress(tupleInst);
+    return B.createTupleElementAddr(tupleInst->getLoc(), tupleAddr,
+                                    operand->getOperandNumber(),
+                                    operand->get()->getType().getAddressType());
   }
   }
 }
@@ -1302,7 +1305,7 @@ protected:
         extractInst->getLoc(), srcAddr, extractInst->getField(),
         extractInst->getType().getAddressType());
     if (extractInst->getType().isAddressOnly(pass.F->getModule()))
-      markRewritten(SEA);
+      markRewritten(extractInst, SEA);
     else {
       LoadInst *loadElement = B.createLoad(extractInst->getLoc(), SEA,
                                            LoadOwnershipQualifier::Unqualified);
@@ -1449,6 +1452,7 @@ protected:
       }
       ++eltIdx;
     }
+    storage.markRewritten();
   }
 
   void visitStructExtractInst(StructExtractInst *extractInst) {
@@ -1530,6 +1534,8 @@ class AddressLowering : public SILModuleTransform {
 void AddressLowering::runOnFunction(SILFunction *F) {
   if (!F->isDefinition())
     return;
+
+  PrettyStackTraceSILFunction FuncScope("address-lowering", F);
 
   auto *DA = PM->getAnalysis<DominanceAnalysis>();
 

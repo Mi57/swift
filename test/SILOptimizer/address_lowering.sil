@@ -545,8 +545,9 @@ sil @testTupleProject : $@convention(thin) <T> (@in T) -> () {
 bb0(%0 : $T):
   %copy0 = copy_value %0 : $T
   %copy1 = copy_value %0 : $T
-  %tuple = tuple (%copy0 : $T, %copy0 : $T)
-  destroy_value %tuple : $(T, T)
+  %tuple1 = tuple (%copy0 : $T, %0 : $T)
+  %tuple2 = tuple (%tuple1 : $(T, T), %copy1 : $T)
+  destroy_value %tuple2 : $((T, T), T)
   %r = tuple ()
   return %r : $()
 }
