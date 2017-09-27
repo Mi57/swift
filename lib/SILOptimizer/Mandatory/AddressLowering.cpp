@@ -314,6 +314,7 @@ void OpaqueValueVisitor::mapValueStorage() {
       if (auto apply = ApplySite::isa(&II))
         visitApply(apply);
 
+      // An apply with a single indirect result is also considered a value.
       for (auto result : II.getResults())
         visitValue(result);
     }
@@ -714,13 +715,16 @@ class ApplyRewriter {
   AddressLoweringState &pass;
   ApplySite apply;
   SILBuilder argBuilder;
+  AddressMaterialization addrMat;
 
   /// For now, we assume that the apply site is a normal apply.
   ApplyInst *getApplyInst() const { return cast<ApplyInst>(apply); }
 
 public:
   ApplyRewriter(ApplySite origCall, AddressLoweringState &pass)
-      : pass(pass), apply(origCall), argBuilder(origCall.getInstruction()) {
+    : pass(pass), apply(origCall), argBuilder(origCall.getInstruction()),
+      addrMat(pass, argBuilder)
+  {
     argBuilder.setSILConventions(
         SILModuleConventions::getLoweredAddressConventions());
   }
@@ -864,7 +868,7 @@ SILValue ApplyRewriter::materializeIndirectResultAddress(
     auto &storage = pass.valueStorageMap.getStorage(origDirectResultVal);
     storage.markRewritten();
     // Pass the local storage address as the indirect result address.
-    return storage.storageAddress;
+    return addrMat.materializeAddress(origDirectResultVal);
   }
   // Allocate temporary call-site storage for an unused or loadable result.
   SILInstruction *origCallInst = apply.getInstruction();
@@ -910,10 +914,11 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
     if (!nonCanonicalUses.empty())
       canonicalizeResults(origDirectResultValues, nonCanonicalUses);
   } else {
-    // This call has a single, indirect result (convertApplyWithIndirectResults
-    // only handles call with at least one indirect result).
-    // An unused result can remain unmapped. Temporary storage will be allocated
-    // later when fixing up the call's uses.
+    // This call has a single result. Convert it to an indirect
+    // result. (convertApplyWithIndirectResults is only invoked for calls with
+    // at least one indirect result). An unused result can remain
+    // unmapped. Temporary storage will be allocated later when fixing up the
+    // call's uses.
     assert(origDirectResultValues.size() == 1);
     if (!origCallInst->use_empty()) {
       assert(pass.valueStorageMap.contains(origCallInst));
@@ -946,8 +951,8 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
       loweredCalleeConv.getSILArgIndexOfFirstIndirectResult();
 
   // Visit each result. Redirect results that are now indirect by calling
-  // materializeIndirectResultAddress.  Result that remain direct will be
-  // redirected later.  Populate newCallArgs and newDirectResultIndices.
+  // materializeIndirectResultAddress. Results that remain direct will be
+  // redirected later. Populate newCallArgs and newDirectResultIndices.
   for_each(
     apply.getSubstCalleeType()->getResults(),
     origDirectResultValues, 
