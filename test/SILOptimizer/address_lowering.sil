@@ -542,3 +542,43 @@ bb0(%0 : $T):
   %r = tuple ()
   return %r : $()
 }
+
+struct Pair<T> {
+  var x : T
+  var y : T
+}
+
+// CHECK-LABEL: sil @f150_testStructProject : $@convention(thin) <T> (@in T) -> () {
+// CHECK: bb0(%0 : $*T):
+// CHECK:   %1 = alloc_stack $T
+// CHECK:   %2 = alloc_stack $Pair<T>
+// CHECK:   %3 = alloc_stack $Pair<T>
+// CHECK:   %4 = alloc_stack $Pair<Pair<T>>
+// CHECK:   copy_addr %0 to [initialization] %1 : $*T
+// CHECK:   %6 = struct_element_addr %2 : $*Pair<T>, #Pair.x
+// CHECK:   copy_addr [take] %0 to [initialization] %6 : $*T
+// CHECK:   %8 = struct_element_addr %2 : $*Pair<T>, #Pair.y
+// CHECK:   copy_addr [take] %1 to [initialization] %8 : $*T
+// CHECK:   copy_addr %2 to [initialization] %3 : $*Pair<T>
+// CHECK:   %11 = struct_element_addr %4 : $*Pair<Pair<T>>, #Pair.x
+// CHECK:   copy_addr [take] %2 to [initialization] %11 : $*Pair<T>
+// CHECK:   %13 = struct_element_addr %4 : $*Pair<Pair<T>>, #Pair.y
+// CHECK:   copy_addr [take] %3 to [initialization] %13 : $*Pair<T>
+// CHECK:   destroy_addr %4 : $*Pair<Pair<T>>
+// CHECK:   %16 = tuple ()
+// CHECK:   dealloc_stack %4 : $*Pair<Pair<T>>
+// CHECK:   dealloc_stack %3 : $*Pair<T>
+// CHECK:   dealloc_stack %2 : $*Pair<T>
+// CHECK:   dealloc_stack %1 : $*T
+// CHECK:   return %16 : $()
+// CHECK-LABEL: } // end sil function 'f150_testStructProject'
+sil @f150_testStructProject : $@convention(thin) <T> (@in T) -> () {
+bb0(%0 : $T):
+  %copy0 = copy_value %0 : $T
+  %struct1 = struct $Pair<T> (%0 : $T, %copy0 : $T)
+  %struct_copy = copy_value %struct1 : $Pair<T>
+  %struct2 = struct $Pair<Pair<T>> (%struct1 : $Pair<T>, %struct_copy : $Pair<T>)
+  destroy_value %struct2 : $Pair<Pair<T>>
+  %r = tuple ()
+  return %r : $()
+}

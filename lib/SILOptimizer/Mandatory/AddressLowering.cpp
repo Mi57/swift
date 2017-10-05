@@ -109,7 +109,7 @@ using llvm::PointerIntPair;
 
 llvm::cl::opt<bool>
     OptimizeOpaqueAddressLowering("optimize-opaque-address-lowering",
-                                  llvm::cl::init(false));
+                                  llvm::cl::init(true));
 
 // Visit all call results.
 // Stop when the visitor returns `false`.
@@ -518,6 +518,9 @@ bool OpaqueStorageAllocation::canProjectFrom(SingleValueInstruction *innerVal,
     }
     return false;
   }
+  case SILInstructionKind::StructInst:
+    composingValue = cast<StructInst>(composingUse);
+    break;
   case SILInstructionKind::TupleInst:
     composingValue = cast<TupleInst>(composingUse);
     break;
@@ -679,6 +682,17 @@ SILValue AddressMaterialization::materializeProjection(Operand *operand) {
   case SILInstructionKind::ReturnInst: {
     assert(pass.loweredFnConv.hasIndirectSILResults());
     return pass.F->getArguments()[0];
+  }
+  case SILInstructionKind::StructInst: {
+    auto *structInst = cast<StructInst>(user);
+
+    auto fieldIter = structInst->getStructDecl()->getStoredProperties().begin();
+    std::advance(fieldIter, operand->getOperandNumber());
+
+    SILValue structAddr = materializeAddress(structInst);
+    return B.createStructElementAddr(
+        structInst->getLoc(), structAddr, *fieldIter,
+        operand->get()->getType().getAddressType());
   }
   case SILInstructionKind::TupleInst: {
     auto *tupleInst = cast<TupleInst>(user);
@@ -1319,6 +1333,11 @@ protected:
     }
   }
 
+  void visitStructInst(StructInst *structInst) {
+    // Structs are rewritten on the def-side, where both direct and indirect
+    // elements are composed.
+  }
+
   void visitTupleInst(TupleInst *tupleInst) {
     // Tuples are rewritten on the def-side, where both direct and indirect
     // elements are composed.
@@ -1434,6 +1453,17 @@ protected:
     storage->markRewritten();
   }
 
+  void visitStructInst(StructInst *structInst) {
+    ValueStorage &storage = pass.valueStorageMap.getStorage(structInst);
+
+    // For each element, initialize the operand's memory. Some struct elements
+    // may be loadable types.
+    for (Operand &operand : structInst->getAllOperands())
+      addrMat.initializeOperandMem(&operand);
+
+    storage.markRewritten();
+  }
+
   void visitTupleInst(TupleInst *tupleInst) {
     ValueStorage &storage = pass.valueStorageMap.getStorage(tupleInst);
     if (storage.isProjection()
@@ -1443,20 +1473,9 @@ protected:
     }
     // For each element, initialize the operand's memory. Some tuple elements
     // may be loadable types.
-    SILValue tupleAddr = addrMat.materializeAddress(tupleInst);
-    unsigned eltIdx = 0;
-    for (Operand &operand : tupleInst->getAllOperands()) {
-      SILType eltTy = operand.get()->getType();
-      if (eltTy.isAddressOnly(pass.F->getModule()))
-        addrMat.initializeOperandMem(&operand);
-      else {
-        auto *elementAddr = B.createTupleElementAddr(
-            tupleInst->getLoc(), tupleAddr, eltIdx, eltTy.getAddressType());
-        B.createStore(tupleInst->getLoc(), operand.get(), elementAddr,
-                      StoreOwnershipQualifier::Unqualified);
-      }
-      ++eltIdx;
-    }
+    for (Operand &operand : tupleInst->getAllOperands())
+      addrMat.initializeOperandMem(&operand);
+
     storage.markRewritten();
   }
 
