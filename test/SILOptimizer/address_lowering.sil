@@ -163,12 +163,12 @@ bb0(%0 : $*T, %1 : $*T, %2 : $T):
   debug_value_addr %0 : $*T, var, name "t", argno 1
   debug_value_addr %1 : $*T, var, name "u", argno 2
   debug_value %2 : $T, let, name "x", argno 3
-  %6 = copy_value %2 : $T
   %7 = load %0 : $*T
+  %6 = copy_value %2 : $T
   store %6 to %0 : $*T
   destroy_value %7 : $T
-  %10 = copy_value %2 : $T
   %11 = load %1 : $*T
+  %10 = copy_value %2 : $T
   store %10 to %1 : $*T
   destroy_value %11 : $T
   destroy_value %2 : $T
@@ -550,27 +550,17 @@ struct Pair<T> {
 
 // CHECK-LABEL: sil @f150_testStructProject : $@convention(thin) <T> (@in T) -> () {
 // CHECK: bb0(%0 : $*T):
-// CHECK:   %1 = alloc_stack $T
-// CHECK:   %2 = alloc_stack $Pair<T>
-// CHECK:   %3 = alloc_stack $Pair<T>
-// CHECK:   %4 = alloc_stack $Pair<Pair<T>>
-// CHECK:   copy_addr %0 to [initialization] %1 : $*T
-// CHECK:   %6 = struct_element_addr %2 : $*Pair<T>, #Pair.x
-// CHECK:   copy_addr [take] %0 to [initialization] %6 : $*T
-// CHECK:   %8 = struct_element_addr %2 : $*Pair<T>, #Pair.y
-// CHECK:   copy_addr [take] %1 to [initialization] %8 : $*T
-// CHECK:   copy_addr %2 to [initialization] %3 : $*Pair<T>
-// CHECK:   %11 = struct_element_addr %4 : $*Pair<Pair<T>>, #Pair.x
-// CHECK:   copy_addr [take] %2 to [initialization] %11 : $*Pair<T>
-// CHECK:   %13 = struct_element_addr %4 : $*Pair<Pair<T>>, #Pair.y
-// CHECK:   copy_addr [take] %3 to [initialization] %13 : $*Pair<T>
-// CHECK:   destroy_addr %4 : $*Pair<Pair<T>>
-// CHECK:   %16 = tuple ()
-// CHECK:   dealloc_stack %4 : $*Pair<Pair<T>>
-// CHECK:   dealloc_stack %3 : $*Pair<T>
-// CHECK:   dealloc_stack %2 : $*Pair<T>
-// CHECK:   dealloc_stack %1 : $*T
-// CHECK:   return %16 : $()
+// CHECK:   [[ALLOC:%.*]] = alloc_stack $Pair<Pair<T>>
+// CHECK:   [[ELT_X:%.*]] = struct_element_addr [[ALLOC]] : $*Pair<Pair<T>>, #Pair.x
+// CHECK:   [[ELT_XY:%.*]] = struct_element_addr [[ELT_X]] : $*Pair<T>, #Pair.y
+// CHECK:   copy_addr %0 to [initialization] [[ELT_XY]] : $*T
+// CHECK:   [[ELT_XX:%.*]] = struct_element_addr [[ELT_X]] : $*Pair<T>, #Pair.x
+// CHECK:   copy_addr [take] %0 to [initialization] [[ELT_XX]] : $*T
+// CHECK:   [[ELT_Y:%.*]] = struct_element_addr [[ALLOC]] : $*Pair<Pair<T>>, #Pair.y
+// CHECK:   copy_addr [[ELT_X]] to [initialization] [[ELT_Y]] : $*Pair<T>
+// CHECK:   destroy_addr [[ALLOC]] : $*Pair<Pair<T>>
+// CHECK:   dealloc_stack [[ALLOC]] : $*Pair<Pair<T>>
+// CHECK:   return %{{.*}} : $()
 // CHECK-LABEL: } // end sil function 'f150_testStructProject'
 sil @f150_testStructProject : $@convention(thin) <T> (@in T) -> () {
 bb0(%0 : $T):

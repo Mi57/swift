@@ -165,12 +165,12 @@ bb0(%0 : $*T, %1 : $*T, %2 : $T):
   debug_value_addr %0 : $*T, var, name "t", argno 1
   debug_value_addr %1 : $*T, var, name "u", argno 2
   debug_value %2 : $T, let, name "x", argno 3
-  %6 = copy_value %2 : $T
   %7 = load %0 : $*T
+  %6 = copy_value %2 : $T
   store %6 to %0 : $*T
   destroy_value %7 : $T
-  %10 = copy_value %2 : $T
   %11 = load %1 : $*T
+  %10 = copy_value %2 : $T
   store %10 to %1 : $*T
   destroy_value %11 : $T
   destroy_value %2 : $T

@@ -479,7 +479,6 @@ unsigned OpaqueStorageAllocation::insertIndirectReturnArgs() {
 /// Is this operand composing an aggregate from a subobject, or simply
 /// forwarding the operand's value to storage defined elsewhere?
 ///
-/// TODO: Handle struct.
 /// TODO: Make this a visitor.
 bool OpaqueStorageAllocation::canProjectFrom(SingleValueInstruction *innerVal,
                                              SILInstruction *composingUse) {
@@ -511,13 +510,6 @@ bool OpaqueStorageAllocation::canProjectFrom(SingleValueInstruction *innerVal,
   }
   case SILInstructionKind::ReturnInst:
     return true;
-  case SILInstructionKind::StoreInst: {
-    if (cast<StoreInst>(composingUse)->getSrc() == innerVal
-        && isa<CopyValueInst>(innerVal)) {
-      return true;
-    }
-    return false;
-  }
   case SILInstructionKind::StructInst:
     composingValue = cast<StructInst>(composingUse);
     break;
@@ -540,6 +532,32 @@ bool OpaqueStorageAllocation::canProjectFrom(SingleValueInstruction *innerVal,
   return false;
 }
 
+// Check if this is a store->copy pair.
+//
+// We could check that no instructions write to memory (or destroy the copy
+// source) in between--but the goal here is not to discover copy coalescing
+// opportunities. I expect a copy-propagation prepass to do that for us. That
+// prepass should have already identified the fused copy->operand pairs and
+// inserted the copy just before the store, struct, enum, tuple, etc.
+// The non-store cases are handled naturally as projections. Store is special
+// because its memory location can be written by any instruction.
+static bool isStoreCopy(SILValue value) {
+  auto *copyInst = dyn_cast<CopyValueInst>(value);
+  if (!copyInst)
+    return false;
+
+  if (!copyInst->hasOneUse())
+    return false;
+
+  // Handle stores and aggregate composition.
+  auto *storeInst = dyn_cast<StoreInst>(value->getSingleUse()->getUser());
+  if (!storeInst)
+    return false;
+
+  auto storePos = SILBasicBlock::iterator(storeInst);
+  return storeInst->getSrc() == copyInst && &*std::prev(storePos) == copyInst;
+}
+
 /// Allocate storage for a single opaque/resilient value.
 void OpaqueStorageAllocation::allocateForValue(SILValue value,
                                                ValueStorage &storage) {
@@ -560,17 +578,27 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
     return;
   }
 
-  if (value->hasOneUse()) {
-    // TODO: Handle block arguments.
-    // TODO: Handle subobjects with a single composition, and other non-mutating
-    // uses such as @in arguments.
-    if (auto *def = dyn_cast<SingleValueInstruction>(value)) {
-      Operand *useOper = *value->use_begin();
-      if (canProjectFrom(def, useOper->getUser())) {
-        storage.setComposedOperand(useOper);
+  // Find a use with allocated storage that we can project from. Typically,
+  // canProjectFrom will be true for only one use, and the other uses will be
+  // copies.
+  //
+  // TODO: Handle block arguments.
+  if (auto *def = dyn_cast<SingleValueInstruction>(value)) {
+    for (Operand *use : value->getUses()) {
+      if (canProjectFrom(def, use->getUser())) {
+        DEBUG(llvm::dbgs() << "  PROJECT "; def->dump();
+              llvm::dbgs() << "  into "; use->getUser()->dump());
+        storage.setComposedOperand(use);
         return;
       }
     }
+  }
+
+  // isStoreCopy identifies copies that directly write to an external memory
+  // locaiton. Other copy->operand cases are handled by canProjectFrom above.
+  if (isStoreCopy(value)) {
+    storage.setComposedOperand(value->getSingleUse());
+    return;
   }
 
   SILBuilder allocBuilder(pass.F->begin()->begin());
