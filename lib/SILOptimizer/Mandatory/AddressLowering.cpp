@@ -90,6 +90,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "address-lowering"
+#include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SIL/SILArgument.h"
@@ -145,7 +146,9 @@ struct ValueStorage {
   bool isProjection() const {
     return projectionAndFlags.getInt() & IsProjectionMask;
   }
-  /// Return the operand that composes an aggregate from this value.
+  /// Return the operand that either
+  /// (1) composes an aggregate from this value -- the value is the operand def.
+  /// (2) borrows this value -- the value us the operand use.
   Operand *getComposedOperand() const {
     assert(isProjection());
     return projectionAndFlags.getPointer();
@@ -234,13 +237,17 @@ struct AddressLoweringState {
   // Dominators remain valid throughout this pass.
   DominanceInfo *domInfo;
 
+  // Map opened archetypes so that AllocStackInst can be created on demand.
+  SILOpenedArchetypesTracker openedArchetypesTracker;
+
   // All opaque values and associated storage.
   ValueStorageMap valueStorageMap;
   // All call sites with formally indirect SILArgument or SILResult conventions.
   // Calls are removed from the set when rewritten.
   SmallSetVector<ApplySite, 16> indirectApplies;
   // All function-exiting terminators (return or throw instructions).
-  SmallVector<TermInst *, 8> returnInsts;
+  // These are ReturnInsts, but we pass it off as ArrayRef<SILInstruction*>.
+  SmallVector<SILInstruction *, 8> returnInsts;
   // Delete these instructions after performing transformations.
   // They must not have any remaining users.
   SmallSetVector<SILInstruction *, 16> instsToDelete;
@@ -249,7 +256,7 @@ struct AddressLoweringState {
       : F(F),
         loweredFnConv(F->getLoweredFunctionType(),
                       SILModuleConventions::getLoweredAddressConventions()),
-        domInfo(domInfo) {}
+        domInfo(domInfo), openedArchetypesTracker(F) {}
 
   bool isDead(SILInstruction *inst) const { return instsToDelete.count(inst); }
 
@@ -313,6 +320,8 @@ void OpaqueValueVisitor::mapValueStorage() {
     for (auto &II : *BB) {
       if (auto apply = ApplySite::isa(&II))
         visitApply(apply);
+
+      pass.openedArchetypesTracker.registerOpenedArchetypes(&II);
 
       // An apply with a single indirect result is also considered a value.
       for (auto result : II.getResults())
@@ -384,6 +393,7 @@ protected:
   unsigned insertIndirectReturnArgs();
   bool canProjectFrom(SingleValueInstruction *innerVal,
                       SILInstruction *composingUse);
+  AllocStackInst *createStackAllocation(SILValue value, ValueStorage &storage);
   void allocateForValue(SILValue value, ValueStorage &storage);
 };
 } // end anonymous namespace
@@ -410,6 +420,7 @@ void OpaqueStorageAllocation::allocateOpaqueStorage() {
 
   // Create an AllocStack for every opaque value defined in the function.  Visit
   // values in post-order to create storage for aggregates before subobjects.
+  // WARNING: This may split critical edges.
   for (auto &valueStorageI : reversed(pass.valueStorageMap))
     allocateForValue(valueStorageI.first, valueStorageI.second);
 }
@@ -421,6 +432,7 @@ void OpaqueStorageAllocation::convertIndirectFunctionArgs() {
   SILBuilder argBuilder(pass.F->getEntryBlock()->begin());
   argBuilder.setSILConventions(
       SILModuleConventions::getLoweredAddressConventions());
+  argBuilder.setOpenedArchetypesTracker(&pass.openedArchetypesTracker);
 
   auto fnConv = pass.F->getConventions();
   unsigned argIdx = fnConv.getSILArgIndexOfFirstParam();
@@ -558,6 +570,66 @@ static bool isStoreCopy(SILValue value) {
   return storeInst->getSrc() == copyInst && &*std::prev(storePos) == copyInst;
 }
 
+AllocStackInst *
+OpaqueStorageAllocation::createStackAllocation(SILValue value,
+                                               ValueStorage &storage) {
+  SILType allocTy = value->getType();
+
+  auto createAllocStack = [&](SILInstruction *allocPoint,
+                             ArrayRef<SILInstruction *> deallocPoints) {
+    SILBuilder allocBuilder(allocPoint);
+    allocBuilder.setSILConventions(
+      SILModuleConventions::getLoweredAddressConventions());
+    allocBuilder.setOpenedArchetypesTracker(&pass.openedArchetypesTracker);
+
+    AllocStackInst *allocInstr =
+      allocBuilder.createAllocStack(value.getLoc(), allocTy);
+
+    for (SILInstruction *deallocPoint : deallocPoints) {
+      SILBuilder B(deallocPoint);
+      B.createDeallocStack(value.getLoc(), allocInstr);
+    }
+    return allocInstr;
+  };
+
+  if (allocTy.isOpenedExistential()) {
+    // Don't allow non-instructions to have opened archetypes.
+    auto *def = cast<SingleValueInstruction>(value);
+
+    // OpenExistential-ish instructions are guaranteed--they project their
+    // operand's storage--so should never reach here.
+    assert(!getOpenedArchetypeOf(def));
+
+    // For all other instructions, just allocate storage immediately before the
+    // value is defined.
+    DeadEndBlocks DEBlocks(pass.F);
+    llvm::SmallVector<SILInstruction *, 8> UsePoints;
+    ValueLifetimeAnalysis VLA(def);
+    ValueLifetimeAnalysis::Frontier Frontier;
+    if (!VLA.computeFrontier(Frontier, ValueLifetimeAnalysis::AllowToModifyCFG,
+                             &DEBlocks)) {
+      // !!! update dominfo !!!
+      // Just pass DT into VLA + splitEdge!!!
+    }
+    return createAllocStack(def, Frontier);
+  }
+  return createAllocStack(&*pass.F->begin()->begin(), pass.returnInsts);
+}
+
+static Operand *getGuaranteedStorageOperand(SILValue value) {
+  switch (value->getKind()) {
+  default:
+    DEBUG(value->dump());
+    llvm_unreachable("Unexpected guaranteed value.");
+
+  case ValueKind::StructExtractInst:
+  case ValueKind::TupleExtractInst:
+  case ValueKind::OpenExistentialValueInst:
+  case ValueKind::OpenExistentialBoxValueInst:
+    return &cast<SingleValueInstruction>(value)->getAllOperands()[0];
+  }
+}
+
 /// Allocate storage for a single opaque/resilient value.
 void OpaqueStorageAllocation::allocateForValue(SILValue value,
                                                ValueStorage &storage) {
@@ -575,6 +647,12 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
   // Argument loads already have a storage address.
   if (storage.storageAddress) {
     assert(isa<SILFunctionArgument>(storage.storageAddress));
+    return;
+  }
+
+  // Values with guaranteed inherit storage from one of their operands.
+  if (value.getOwnershipKind() == ValueOwnershipKind::Guaranteed) {
+    storage.setComposedOperand(getGuaranteedStorageOperand(value));
     return;
   }
 
@@ -601,21 +679,7 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
     return;
   }
 
-  SILBuilder allocBuilder(pass.F->begin()->begin());
-  allocBuilder.setSILConventions(
-      SILModuleConventions::getLoweredAddressConventions());
-  AllocStackInst *allocInstr =
-      allocBuilder.createAllocStack(value.getLoc(), value->getType());
-
-  storage.storageAddress = allocInstr;
-
-  // Insert stack deallocations.
-  for (TermInst *termInst : pass.returnInsts) {
-    SILBuilder deallocBuilder(termInst);
-    deallocBuilder.setSILConventions(
-        SILModuleConventions::getLoweredAddressConventions());
-    deallocBuilder.createDeallocStack(allocInstr->getLoc(), allocInstr);
-  }
+  storage.storageAddress = createStackAllocation(value, storage);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1109,7 +1173,7 @@ protected:
 };
 
 void ReturnRewriter::rewriteReturns() {
-  for (TermInst *termInst : pass.returnInsts) {
+  for (SILInstruction *termInst : pass.returnInsts) {
     // TODO: handle throws
     rewriteReturn(cast<ReturnInst>(termInst));
   }
@@ -1344,6 +1408,10 @@ protected:
   }
 
   void visitStructExtractInst(StructExtractInst *extractInst) {
+    assert(extractInst->getOperand()
+           == pass.valueStorageMap.getStorage(extractInst)
+                  .getComposedOperand()
+                  ->get());
     SILValue srcAddr =
         pass.valueStorageMap.getStorage(extractInst->getOperand())
             .storageAddress;
@@ -1594,6 +1662,7 @@ void AddressLowering::runOnFunction(SILFunction *F) {
   AddressLoweringState pass(F, DA->get(F));
 
   // Rewrite function args and insert alloc_stack/dealloc_stack.
+  // WARNING: This may split critical edges.
   OpaqueStorageAllocation allocator(pass);
   allocator.allocateOpaqueStorage();
 
