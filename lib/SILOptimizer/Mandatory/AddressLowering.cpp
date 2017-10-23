@@ -296,6 +296,7 @@ public:
   void mapValueStorage();
 
 protected:
+  void visitBBArg(SILPHIArgument *bbArg);
   void visitApply(ApplySite applySite);
   void visitValue(SILValue value);
 };
@@ -313,9 +314,11 @@ void OpaqueValueVisitor::mapValueStorage() {
 
     // Opaque function arguments have already been replaced.
     if (BB != pass.F->getEntryBlock()) {
-      for (auto argI = BB->args_begin(), argEnd = BB->args_end();
-           argI != argEnd; ++argI) {
-        visitValue(*argI);
+      for (auto argI = BB->args_begin(), nextI = argI, argEnd = BB->args_end();
+           nextI != argEnd; argI = nextI) {
+        ++nextI;
+        // This modifies the arg list.
+        visitBBArg(cast<SILPHIArgument>(*argI));
       }
     }
     for (auto &II : *BB) {
@@ -329,6 +332,23 @@ void OpaqueValueVisitor::mapValueStorage() {
         visitValue(result);
     }
   }
+}
+
+void OpaqueValueVisitor::visitBBArg(SILPHIArgument *bbArg) {
+  auto *bb = bbArg->getParent();
+  SILType addrTy = bbArg->getType().getAddressType();
+
+  SILBuilder argBuilder(bb->begin());
+  argBuilder.setSILConventions(
+      SILModuleConventions::getLoweredAddressConventions());
+  LoadInst *loadArg = argBuilder.createLoad(
+      SILValue(bbArg).getLoc(), SILUndef::get(addrTy, pass.F->getModule()),
+      LoadOwnershipQualifier::Unqualified);
+  bbArg->replaceAllUsesWith(loadArg);
+
+  auto *addrArg = bb->replacePHIArgument(
+      bbArg->getIndex(), addrTy, ValueOwnershipKind::Trivial, bbArg->getDecl());
+  loadArg->setOperand(addrArg);
 }
 
 /// Populate `indirectApplies` and insert this apply in `valueStorageMap` if
@@ -360,8 +380,9 @@ void OpaqueValueVisitor::visitValue(SILValue value) {
   if (value->getType().isObject()
       && value->getType().isAddressOnly(pass.F->getModule())) {
     if (pass.valueStorageMap.contains(value)) {
-      assert(ApplySite::isa(value) || isa<SILFunctionArgument>(
-          pass.valueStorageMap.getStorage(value).storageAddress));
+      assert(ApplySite::isa(value)
+             || isa<SILArgument>(
+                    pass.valueStorageMap.getStorage(value).storageAddress));
       return;
     }
     pass.valueStorageMap.insertValue(value);
@@ -445,8 +466,7 @@ void OpaqueStorageAllocation::convertIndirectFunctionArgs() {
       SILType addrType = arg->getType().getAddressType();
 
       LoadInst *loadArg = argBuilder.createLoad(
-          RegularLocation(const_cast<ValueDecl *>(arg->getDecl())),
-          SILUndef::get(addrType, pass.F->getModule()),
+          SILValue(arg).getLoc(), SILUndef::get(addrType, pass.F->getModule()),
           LoadOwnershipQualifier::Unqualified);
 
       arg->replaceAllUsesWith(loadArg);
@@ -649,9 +669,9 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
     }
   }
 
-  // Argument loads already have a storage address.
+  // Function and block argument loads already have a storage address.
   if (storage.storageAddress) {
-    assert(isa<SILFunctionArgument>(storage.storageAddress));
+    assert(isa<SILArgument>(storage.storageAddress));
     return;
   }
 
@@ -1346,6 +1366,12 @@ protected:
     ApplyRewriter(applyInst, pass).rewriteIndirectParameter(currOper);
   }
 
+  // br bbNN(%opaque : $T)
+  void visitBranchInst(BranchInst *branchInst) {
+    ValueStorage &storage = pass.valueStorageMap.getStorage(currOper->get());
+    currOper->set(storage.storageAddress);
+  }
+
   void visitCopyValueInst(CopyValueInst *copyInst) {
     ValueStorage &storage = pass.valueStorageMap.getStorage(copyInst);
     // Fold a copy into a store.
@@ -1445,6 +1471,8 @@ protected:
     assert(storeInst->getOwnershipQualifier()
            == StoreOwnershipQualifier::Unqualified);
 
+    // FIXME: Try not to special-case CopyValue.
+#if 0
     if (storage.isProjection()) {
       assert(!srcAddr);
       auto *copyInst = cast<CopyValueInst>(srcVal);
@@ -1454,6 +1482,7 @@ protected:
       srcAddr = srcStorage.storageAddress;
       isTakeFlag = IsNotTake;
     }
+#endif
     // Bitwise copy the value. Two locations now share ownership. This is
     // modeled as a take-init.
     B.createCopyAddr(storeInst->getLoc(), srcAddr, storeInst->getDest(),
@@ -1566,8 +1595,7 @@ protected:
   }
 
   void visitCopyValueInst(CopyValueInst *copyInst) {
-    // A folded copy is not rewritten.
-    assert(storage->isProjection() || storage->isRewritten());
+    assert(storage->isRewritten());
   }
 
   void visitEnumInst(EnumInst *enumInst) {
@@ -1673,8 +1701,8 @@ static void rewriteFunction(AddressLoweringState &pass) {
     SILValue valueDef = valueStorageI.first;
 
     // TODO: MultiValueInstruction: ApplyInst
-    if (auto *defInst = dyn_cast<SingleValueInstruction>(valueDef))
-      defVisitor.visitInst(defInst);
+    auto *defInst = cast<SingleValueInstruction>(valueDef);
+    defVisitor.visitInst(defInst);
 
     SmallVector<Operand *, 8> uses(valueDef->getUses());
     for (Operand *oper : uses)
@@ -1726,6 +1754,8 @@ void AddressLowering::runOnFunction(SILFunction *F) {
 
   PrettyStackTraceSILFunction FuncScope("address-lowering", F);
 
+  DEBUG(llvm::dbgs() << "LOWERADDRESS: " << F->getName() << "\n"; F->dump());
+
   auto *DA = PM->getAnalysis<DominanceAnalysis>();
 
   AddressLoweringState pass(F, DA->get(F));
@@ -1734,8 +1764,6 @@ void AddressLowering::runOnFunction(SILFunction *F) {
   // WARNING: This may split critical edges.
   OpaqueStorageAllocation allocator(pass);
   allocator.allocateOpaqueStorage();
-
-  DEBUG(llvm::dbgs() << "\nREWRITING: " << F->getName(); F->dump());
 
   // Rewrite instructions with address-only operands or results.
   rewriteFunction(pass);
