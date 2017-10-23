@@ -1138,12 +1138,20 @@ namespace {
 
     SILValue emitCopyValue(SILBuilder &B, SILLocation loc,
                            SILValue value) const override {
-      return B.createCopyValue(loc, value);
+      if (B.getFunction().hasQualifiedOwnership())
+        return B.createCopyValue(loc, value);
+
+      B.createRetainValue(loc, value, B.getDefaultAtomicity());
+      return value;
     }
 
     void emitDestroyValue(SILBuilder &B, SILLocation loc,
                           SILValue value) const override {
-      B.createDestroyValue(loc, value);
+      if (B.getFunction().hasQualifiedOwnership()) {
+        B.createDestroyValue(loc, value);
+        return;
+      }
+      B.emitReleaseValueAndFold(loc, value);
     }
   };
 
