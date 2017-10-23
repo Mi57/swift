@@ -573,23 +573,36 @@ bb0(%0 : $T):
   return %r : $()
 }
 
-protocol P {}
+protocol P {
+  func foo()
+}
 
-//!!!
+// CHECK-LABEL: sil hidden @testOpenedArchetype : $@convention(thin) (@in P) -> () {
+// CHECK: bb0(%0 : $*P):
+// CHECK:   [[ALLOC:%.*]] = alloc_stack $P, var, name "q"
+// CHECK:   copy_addr %0 to [initialization] [[ALLOC]] : $*P
+// CHECK:   [[OPEN:%.*]] = open_existential_addr immutable_access %0 : $*P to $*[[ARCHETYPE:@opened(.*)]] P
+// CHECK:   [[WT:%.*]] = witness_method $[[ARCHETYPE]] P, #P.foo!1 : <Self where Self : P> (Self) -> () -> (), [[OPEN]] : $*[[ARCHETYPE]] P : $@convention(witness_method) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
+// CHECK:   [[TMP:%.*]] = alloc_stack $[[ARCHETYPE]] P
+// CHECK:   copy_addr [[OPEN]] to [initialization] [[TMP]] : $*[[ARCHETYPE]] P
+// CHECK:   %{{.*}} = apply [[WT]]<[[ARCHETYPE]] P>([[TMP]]) : $@convention(witness_method) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
+// CHECK:   dealloc_stack [[TMP]] : $*[[ARCHETYPE]] P
+// CHECK:   destroy_addr [[ALLOC]] : $*P
+// CHECK:   dealloc_stack [[ALLOC]] : $*P
+// CHECK:   destroy_addr %0 : $*P
+// CHECK:   %{{.*}} = tuple ()
+// CHECK:   return %{{.*}} : $()
+// CHECK-LABEL: } // end sil function 'testOpenedArchetype'
 sil hidden @testOpenedArchetype : $@convention(thin) (@in P) -> () {
 bb0(%0 : $P):
   %2 = alloc_stack $P, var, name "q"
   %3 = copy_value %0 : $P
   store %3 to %2 : $*P
-  %5 = begin_access [read] [static] %2 : $*P
-  %6 = copy_value %3 : $P
-  end_access %5 : $*P
-  %8 = open_existential_value %6 : $P to $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P
+  %8 = open_existential_value %0 : $P to $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P
   %9 = witness_method $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P, #P.foo!1 : <Self where Self : P> (Self) -> () -> (), %8 : $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P : $@convention(witness_method) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
   // Test that we can handle owned value of type opened archetype.
   %10 = copy_value %8 : $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P
   %11 = apply %9<@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P>(%10) : $@convention(witness_method) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
-  destroy_value %6 : $P
   destroy_addr %2 : $*P
   dealloc_stack %2 : $*P
   destroy_value %0 : $P

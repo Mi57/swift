@@ -99,6 +99,7 @@
 #include "swift/SILOptimizer/Analysis/PostOrderAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/Local.h"
+#include "swift/SILOptimizer/Utils/StackNesting.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/CommandLine.h"
@@ -576,14 +577,14 @@ OpaqueStorageAllocation::createStackAllocation(SILValue value,
   SILType allocTy = value->getType();
 
   auto createAllocStack = [&](SILInstruction *allocPoint,
-                             ArrayRef<SILInstruction *> deallocPoints) {
+                              ArrayRef<SILInstruction *> deallocPoints) {
     SILBuilder allocBuilder(allocPoint);
     allocBuilder.setSILConventions(
-      SILModuleConventions::getLoweredAddressConventions());
+        SILModuleConventions::getLoweredAddressConventions());
     allocBuilder.setOpenedArchetypesTracker(&pass.openedArchetypesTracker);
 
     AllocStackInst *allocInstr =
-      allocBuilder.createAllocStack(value.getLoc(), allocTy);
+        allocBuilder.createAllocStack(value.getLoc(), allocTy);
 
     for (SILInstruction *deallocPoint : deallocPoints) {
       SILBuilder B(deallocPoint);
@@ -616,16 +617,16 @@ OpaqueStorageAllocation::createStackAllocation(SILValue value,
   return createAllocStack(&*pass.F->begin()->begin(), pass.returnInsts);
 }
 
-static Operand *getGuaranteedStorageOperand(SILValue value) {
+static Operand *getBorrowedStorageOperand(SILValue value) {
   switch (value->getKind()) {
   default:
-    DEBUG(value->dump());
-    llvm_unreachable("Unexpected guaranteed value.");
+    return nullptr;
 
   case ValueKind::StructExtractInst:
   case ValueKind::TupleExtractInst:
   case ValueKind::OpenExistentialValueInst:
   case ValueKind::OpenExistentialBoxValueInst:
+    assert(value.getOwnershipKind() == ValueOwnershipKind::Guaranteed);
     return &cast<SingleValueInstruction>(value)->getAllOperands()[0];
   }
 }
@@ -650,9 +651,18 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
     return;
   }
 
-  // Values with guaranteed inherit storage from one of their operands.
-  if (value.getOwnershipKind() == ValueOwnershipKind::Guaranteed) {
-    storage.setComposedOperand(getGuaranteedStorageOperand(value));
+  // TupleExtract from an apply are handled specially until we have multi-result
+  // calls. Force them to allocate storage.
+  if (auto *TEI = dyn_cast<TupleExtractInst>(value)) {
+    if (ApplySite::isa(TEI->getOperand())) {
+      storage.storageAddress = createStackAllocation(value, storage);
+      return;
+    }
+  }
+
+  // Values that borrow their operand inherit storage from that operand.
+  if (auto *storageOper = getBorrowedStorageOperand(value)) {
+    storage.setComposedOperand(storageOper);
     return;
   }
 
@@ -1291,6 +1301,17 @@ public:
 
   void visitOperand(Operand *operand) {
     currOper = operand;
+    // Special handling for opened archetypes because a single result somehow
+    // produces both a value of the opened type and the metatype itself :/
+    if (operand->getUser()->isTypeDependentOperand(*operand)) {
+      CanType openedTy = operand->get()->getType().getSwiftRValueType();
+      assert(openedTy->isOpenedExistential());
+      SILValue archetypeDef =
+          pass.openedArchetypesTracker.getOpenedArchetypeDef(
+              CanArchetypeType(openedTy->castTo<ArchetypeType>()));
+      operand->set(archetypeDef);
+      return;
+    }
     visit(operand->getUser());
   }
 
@@ -1355,6 +1376,31 @@ protected:
   void
   visitInitExistentialValueInst(InitExistentialValueInst *initExistential) {}
 
+  // Rewrite opened existentials on the use-side, which may produce either
+  // loadable or address-only types.
+  void
+  visitOpenExistentialValueInst(OpenExistentialValueInst *openExistential) {
+    assert(currOper
+           == pass.valueStorageMap.getStorage(openExistential)
+                  .getComposedOperand());
+    SILValue srcAddr =
+        pass.valueStorageMap.getStorage(currOper->get()).storageAddress;
+    // Mutable access is always by address.
+    auto *OEA =
+        B.createOpenExistentialAddr(openExistential->getLoc(), srcAddr,
+                                    openExistential->getType().getAddressType(),
+                                    OpenedExistentialAccess::Immutable);
+    // Henceforth track this operned archetype using open_existential_addr.
+    pass.openedArchetypesTracker.unregisterOpenedArchetypes(openExistential);
+    pass.openedArchetypesTracker.registerOpenedArchetypes(OEA);
+    markRewritten(openExistential, OEA);
+  }
+
+  void visitOpenExistentialBoxValueInst(
+      OpenExistentialBoxValueInst *openExistentialBox) {
+    llvm::report_fatal_error("Unimplemented");
+  }
+
   void visitReleaseValueInst(ReleaseValueInst *releaseInst) {
     SILValue srcVal = releaseInst->getOperand();
     ValueStorage &storage = pass.valueStorageMap.getStorage(srcVal);
@@ -1407,11 +1453,13 @@ protected:
     pass.markDead(storeInst);
   }
 
+  // A struct_extract from an opaque struct.
   void visitStructExtractInst(StructExtractInst *extractInst) {
-    assert(extractInst->getOperand()
-           == pass.valueStorageMap.getStorage(extractInst)
-                  .getComposedOperand()
-                  ->get());
+    assert(!pass.valueStorageMap.contains(extractInst)
+           || extractInst->getOperand()
+                  == pass.valueStorageMap.getStorage(extractInst)
+                         .getComposedOperand()
+                         ->get());
     SILValue srcAddr =
         pass.valueStorageMap.getStorage(extractInst->getOperand())
             .storageAddress;
@@ -1536,6 +1584,17 @@ protected:
 
     assert(storage->storageAddress);
     storage->markRewritten();
+  }
+
+  void visitOpenExistentialValueInst(
+      OpenExistentialValueInst *openExistentialValue) {
+    // Rewritten on the use-side because storage is inherited from the source.
+    assert(storage->isRewritten());
+  }
+
+  void visitOpenExistentialBoxValueInst(
+      OpenExistentialBoxValueInst *openExistentialBox) {
+    llvm::report_fatal_error("Unimplemented");
   }
 
   void visitLoadInst(LoadInst *loadInst) {
@@ -1671,8 +1730,6 @@ void AddressLowering::runOnFunction(SILFunction *F) {
   // Rewrite instructions with address-only operands or results.
   rewriteFunction(pass);
 
-  invalidateAnalysis(F, SILAnalysis::InvalidationKind::Instructions);
-
   // Instructions that were explicitly marked dead should already have no
   // users.
   //
@@ -1697,6 +1754,12 @@ void AddressLowering::runOnFunction(SILFunction *F) {
   // Delete instructions in postorder
   recursivelyDeleteTriviallyDeadInstructions(pass.instsToDelete.takeVector(),
                                              true);
+
+  StackNesting().correctStackNesting(F);
+
+  // The CFG may change because of criticalEdge splitting during
+  // createStackAllocation or StackNesting.
+  invalidateAnalysis(F, SILAnalysis::InvalidationKind::BranchesAndInstructions);
 }
 
 /// The entry point to this function transformation.
