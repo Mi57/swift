@@ -555,6 +555,9 @@ bool OpaqueStorageAllocation::canProjectFrom(SingleValueInstruction *innerVal,
 // The non-store cases are handled naturally as projections. Store is special
 // because its memory location can be written by any instruction.
 static bool isStoreCopy(SILValue value) {
+  // FIXME: This try not to use this.
+  return false;
+#if 0
   auto *copyInst = dyn_cast<CopyValueInst>(value);
   if (!copyInst)
     return false;
@@ -569,6 +572,7 @@ static bool isStoreCopy(SILValue value) {
 
   auto storePos = SILBasicBlock::iterator(storeInst);
   return storeInst->getSrc() == copyInst && &*std::prev(storePos) == copyInst;
+#endif
 }
 
 AllocStackInst *
@@ -609,8 +613,8 @@ OpaqueStorageAllocation::createStackAllocation(SILValue value,
     ValueLifetimeAnalysis::Frontier Frontier;
     if (!VLA.computeFrontier(Frontier, ValueLifetimeAnalysis::AllowToModifyCFG,
                              &DEBlocks)) {
-      // !!! update dominfo !!!
-      // Just pass DT into VLA + splitEdge!!!
+      // FIXME: update dominfo !!!
+      // (Just pass DT into VLA + splitEdge).
     }
     return createAllocStack(def, Frontier);
   }
