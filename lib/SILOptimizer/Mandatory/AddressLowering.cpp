@@ -762,7 +762,9 @@ SILValue AddressMaterialization::materializeProjection(Operand *operand) {
 
   switch (user->getKind()) {
   default:
-    DEBUG(user->dump());
+#ifndef NDEBUG
+    user->dump();
+#endif
     llvm_unreachable("Unexpected subobject composition.");
   case SILInstructionKind::EnumInst: {
     auto *enumInst = cast<EnumInst>(user);
@@ -1330,7 +1332,9 @@ protected:
   }
 
   void visitSILInstruction(SILInstruction *I) {
-    DEBUG(I->dump());
+#ifndef NDEBUG
+    I->dump();
+#endif
     llvm_unreachable("Unimplemented?!");
   }
 
@@ -1539,7 +1543,9 @@ protected:
   }
 
   void visitSILInstruction(SILInstruction *I) {
-    DEBUG(I->dump());
+#ifndef NDEBUG
+    I->dump();
+#endif
     llvm_unreachable("Unimplemented?!");
   }
 
