@@ -317,8 +317,9 @@ void OpaqueValueVisitor::mapValueStorage() {
       for (auto argI = BB->args_begin(), nextI = argI, argEnd = BB->args_end();
            nextI != argEnd; argI = nextI) {
         ++nextI;
-        // This modifies the arg list.
-        visitBBArg(cast<SILPHIArgument>(*argI));
+        // This modifies the arg list. (FIXME: maybe not).
+        //!!!visitBBArg(cast<SILPHIArgument>(*argI));
+        visitValue(*argI);
       }
     }
     for (auto &II : *BB) {
@@ -338,6 +339,8 @@ void OpaqueValueVisitor::visitBBArg(SILPHIArgument *bbArg) {
   auto *bb = bbArg->getParent();
   SILType addrTy = bbArg->getType().getAddressType();
 
+  /* Rewrite BBArg in place??
+   * This doesn't really make sense because the caller isn't providing storage.
   SILBuilder argBuilder(bb->begin());
   argBuilder.setSILConventions(
       SILModuleConventions::getLoweredAddressConventions());
@@ -349,6 +352,10 @@ void OpaqueValueVisitor::visitBBArg(SILPHIArgument *bbArg) {
   auto *addrArg = bb->replacePHIArgument(
       bbArg->getIndex(), addrTy, ValueOwnershipKind::Trivial, bbArg->getDecl());
   loadArg->setOperand(addrArg);
+
+  // This load will be inserted in the valueStorageMap when we process the block
+  // instructions.
+  */
 }
 
 /// Populate `indirectApplies` and insert this apply in `valueStorageMap` if
@@ -381,7 +388,7 @@ void OpaqueValueVisitor::visitValue(SILValue value) {
       && value->getType().isAddressOnly(pass.F->getModule())) {
     if (pass.valueStorageMap.contains(value)) {
       assert(ApplySite::isa(value)
-             || isa<SILArgument>(
+             || isa<SILFunctionArgument>(
                     pass.valueStorageMap.getStorage(value).storageAddress));
       return;
     }
@@ -413,6 +420,8 @@ public:
 protected:
   void convertIndirectFunctionArgs();
   unsigned insertIndirectReturnArgs();
+  void canProjectBBArgs(SILPHIArgument *bbArg,
+                        SmallVectorImpl<SILValue> canProjectArgs);
   bool canProjectFrom(SingleValueInstruction *innerVal,
                       SILInstruction *composingUse);
   AllocStackInst *createStackAllocation(SILValue value, ValueStorage &storage);
@@ -509,6 +518,37 @@ unsigned OpaqueStorageAllocation::insertIndirectReturnArgs() {
   return argIdx;
 }
 
+// Populate canProjectArgs with all inputs to bbArg that can reused the
+// argument's storage.
+//
+// Blocks are marked white, grey, or black.
+// 
+// All block start white.
+// Set all phi predecessor blocks black.
+// 
+// For each phi-in:
+// 
+//   Mark the current predecessor grey (from black) if it is *not* a critical
+//   edge.  We know no other source will be live out of that predecessor because
+//   this block it will be marked black when we process the other phi inputs.
+// 
+//   For all uses: scan the CFG backward following all predecessors.
+//     If the current block is:
+//     White: mark it grey and CONTINUE.
+//     Grey: STOP.
+//     Black: BAIL.
+//   If all uses are processed, record this phi-in as a possible projection.
+//   Mark all grey blocks black.
+//
+// In the end, we have a set of non-interfering phi inputs that can reuse the
+// bbArg's storage.
+//
+// TODO: review this algorithm, it's just a prototype.
+void OpaqueStorageAllocation::canProjectBBArgs(SILPHIArgument *bbArg,
+  SmallVectorImpl<SILValue> canProjectArgs) {
+  
+}
+
 /// Is this operand composing an aggregate from a subobject, or simply
 /// forwarding the operand's value to storage defined elsewhere?
 ///
@@ -552,10 +592,9 @@ bool OpaqueStorageAllocation::canProjectFrom(SingleValueInstruction *innerVal,
   }
   ValueStorage &storage = pass.valueStorageMap.getStorage(composingValue);
   if (SILValue addr = storage.storageAddress) {
-    if (auto *stackInst = dyn_cast<AllocStackInst>(addr)) {
-      assert(pass.domInfo->properlyDominates(stackInst, innerVal));
-      return true;
-    }
+    if (auto *stackInst = dyn_cast<AllocStackInst>(addr))
+      return pass.domInfo->properlyDominates(stackInst, innerVal);
+
     if (isa<SILFunctionArgument>(addr)) {
       return true;
     }
@@ -655,10 +694,69 @@ static Operand *getBorrowedStorageOperand(SILValue value) {
   }
 }
 
+// Return true if this value can reuse storage projected from one of its uses.
+// \param storage is the value's storage information.
+static bool canProjectTo(SILValue value, ValueStorage &storage) {
+  // Function arguments use caller storage. The proxy load will be mapped to an
+  // address-type SILFunctionArgument.
+  if (isa<SILFunctionArgument>(storage.storageAddress))
+    return false;
+
+  // TODO: Remove this with multi-result calls.
+  if (auto apply = ApplySite::isa(value)) {
+    // Result tuples will be canonicalized during apply rewriting so the tuple
+    // itself is unused.
+    if (value->getType().is<TupleType>()) {
+      assert(apply.getSubstCalleeType()->getNumResults() > 1);
+      return false;
+    }
+  }
+
+  // TupleExtract from an apply are handled specially until we have multi-result
+  // calls. Force them to allocate storage.
+  // 
+  // TODO: Remove this case. We should be able reuse storage for out args.
+  if (auto *TEI = dyn_cast<TupleExtractInst>(value)) {
+    if (ApplySite::isa(TEI->getOperand())) {
+      return false;
+    }
+  }
+
+  // Values that borrow their operand inherit storage from that operand, not
+  // their use.
+  if (getBorrowedStorageOperand(value))
+    return false;
+
+  return true;
+}
+
 /// Allocate storage for a single opaque/resilient value.
 void OpaqueStorageAllocation::allocateForValue(SILValue value,
                                                ValueStorage &storage) {
+  // Function args are not inserted in valuestorageMap. Instead, a
+  // proxy load instruction is inserted.
   assert(!isa<SILFunctionArgument>(value));
+
+  if (canProjectTo(value, storage)) {
+    if (auto *bbArg = dyn_cast<SILPHIArgument>(value)) {
+      SmallVector<
+      canProjectBBArgs();
+      
+    }
+    // Find a use with allocated storage that we can project from. Typically,
+    // canProjectFrom will be true for only one use, and the other uses will be
+    // copies.
+    if (auto *def = dyn_cast<SingleValueInstruction>(value)) {
+      for (Operand *use : value->getUses()) {
+        if (canProjectFrom(def, use->getUser())) {
+          DEBUG(llvm::dbgs() << "  PROJECT "; def->dump();
+                llvm::dbgs() << "  into "; use->getUser()->dump());
+          storage.setComposedOperand(use);
+          return;
+        }
+      }
+    }
+  }
 
   if (auto apply = ApplySite::isa(value)) {
     // Result tuples will be canonicalized during apply rewriting so the tuple
@@ -670,6 +768,7 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
   }
 
   // Function and block argument loads already have a storage address.
+  // BBArg operands
   if (storage.storageAddress) {
     assert(isa<SILArgument>(storage.storageAddress));
     return;
@@ -690,22 +789,6 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
     return;
   }
 
-  // Find a use with allocated storage that we can project from. Typically,
-  // canProjectFrom will be true for only one use, and the other uses will be
-  // copies.
-  //
-  // TODO: Handle block arguments.
-  if (auto *def = dyn_cast<SingleValueInstruction>(value)) {
-    for (Operand *use : value->getUses()) {
-      if (canProjectFrom(def, use->getUser())) {
-        DEBUG(llvm::dbgs() << "  PROJECT "; def->dump();
-              llvm::dbgs() << "  into "; use->getUser()->dump());
-        storage.setComposedOperand(use);
-        return;
-      }
-    }
-  }
-
   // isStoreCopy identifies copies that directly write to an external memory
   // locaiton. Other copy->operand cases are handled by canProjectFrom above.
   if (isStoreCopy(value)) {
@@ -714,6 +797,8 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
   }
 
   storage.storageAddress = createStackAllocation(value, storage);
+
+  // If this value is a BB arg, process all input at once to be more efficient.
 }
 
 //===----------------------------------------------------------------------===//
