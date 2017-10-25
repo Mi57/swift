@@ -296,7 +296,6 @@ public:
   void mapValueStorage();
 
 protected:
-  void visitBBArg(SILPHIArgument *bbArg);
   void visitApply(ApplySite applySite);
   void visitValue(SILValue value);
 };
@@ -314,13 +313,8 @@ void OpaqueValueVisitor::mapValueStorage() {
 
     // Opaque function arguments have already been replaced.
     if (BB != pass.F->getEntryBlock()) {
-      for (auto argI = BB->args_begin(), nextI = argI, argEnd = BB->args_end();
-           nextI != argEnd; argI = nextI) {
-        ++nextI;
-        // This modifies the arg list. (FIXME: maybe not).
-        //!!!visitBBArg(cast<SILPHIArgument>(*argI));
+      for (auto *arg : BB->args())
         visitValue(*argI);
-      }
     }
     for (auto &II : *BB) {
       if (auto apply = ApplySite::isa(&II))
@@ -333,30 +327,6 @@ void OpaqueValueVisitor::mapValueStorage() {
         visitValue(result);
     }
   }
-}
-
-// FIXME!!!: remove this, but do the phi replacement during rewriting!!!
-void OpaqueValueVisitor::visitBBArg(SILPHIArgument *bbArg) {
-  auto *bb = bbArg->getParent();
-  SILType addrTy = bbArg->getType().getAddressType();
-
-  /* Rewrite BBArg in place??
-   * This doesn't really make sense because the caller isn't providing storage.
-  SILBuilder argBuilder(bb->begin());
-  argBuilder.setSILConventions(
-      SILModuleConventions::getLoweredAddressConventions());
-  LoadInst *loadArg = argBuilder.createLoad(
-      SILValue(bbArg).getLoc(), SILUndef::get(addrTy, pass.F->getModule()),
-      LoadOwnershipQualifier::Unqualified);
-  bbArg->replaceAllUsesWith(loadArg);
-
-  auto *addrArg = bb->replacePHIArgument(
-      bbArg->getIndex(), addrTy, ValueOwnershipKind::Trivial, bbArg->getDecl());
-  loadArg->setOperand(addrArg);
-
-  // This load will be inserted in the valueStorageMap when we process the block
-  // instructions.
-  */
 }
 
 /// Populate `indirectApplies` and insert this apply in `valueStorageMap` if
@@ -1535,8 +1505,7 @@ protected:
 
   // Opaque branch argument.
   void visitBranchInst(BranchInst *branchInst) {
-    ValueStorage &storage = pass.valueStorageMap.getStorage(currOper->get());
-    currOper->set(storage.storageAddress);
+    currOper->set(SILUndef::get(currOper->getType(), pass.F->getModule()));
   }
 
   // Opaque checked cast source.
@@ -1545,7 +1514,7 @@ protected:
     llvm::report_fatal_error("Unimplemented");
   }
 
-  // Opaque copy source operand.
+  // Copy from an opaque source operand.
   void visitCopyValueInst(CopyValueInst *copyInst) {
     ValueStorage &storage = pass.valueStorageMap.getStorage(copyInst);
     // Fold a copy into a store.
@@ -1789,6 +1758,7 @@ protected:
     llvm_unreachable("Unimplemented?!");
   }
 
+  // Call returning a single opaque value.
   void visitApplyInst(ApplyInst *applyInst) {
     assert(isa<SingleValueInstruction>(applyInst) &&
            "beforeVisit assumes that ApplyInst is an SVI");
@@ -1801,10 +1771,12 @@ protected:
     rewriter.convertApplyWithIndirectResults();
   }
 
+  // Copy into an opaque value.
   void visitCopyValueInst(CopyValueInst *copyInst) {
     assert(storage->isRewritten());
   }
 
+  // Define an opaque enum value.
   void visitEnumInst(EnumInst *enumInst) {
     SILValue enumAddr;
     if (enumInst->hasOperand()) {
@@ -1821,6 +1793,7 @@ protected:
     storage->markRewritten();
   }
 
+  // Define an existential.
   void visitInitExistentialValueInst(
       InitExistentialValueInst *initExistentialValue) {
 
@@ -1831,17 +1804,20 @@ protected:
     storage->markRewritten();
   }
 
+  // Project an opaque value out of an existential.
   void visitOpenExistentialValueInst(
       OpenExistentialValueInst *openExistentialValue) {
     // Rewritten on the use-side because storage is inherited from the source.
     assert(storage->isRewritten());
   }
 
+  // Project an opaque value out of a box-type existential.
   void visitOpenExistentialBoxValueInst(
       OpenExistentialBoxValueInst *openExistentialBox) {
     llvm::report_fatal_error("Unimplemented");
   }
 
+  // Load an opaque value.
   void visitLoadInst(LoadInst *loadInst) {
     // Bitwise copy the value. Two locations now share ownership. This is
     // modeled as a take-init.
@@ -1853,6 +1829,7 @@ protected:
     storage->markRewritten();
   }
 
+  // Define an opaque struct.
   void visitStructInst(StructInst *structInst) {
     ValueStorage &storage = pass.valueStorageMap.getStorage(structInst);
 
@@ -1864,6 +1841,7 @@ protected:
     storage.markRewritten();
   }
 
+  // Define an opaque tuple.
   void visitTupleInst(TupleInst *tupleInst) {
     ValueStorage &storage = pass.valueStorageMap.getStorage(tupleInst);
     if (storage.isProjection()
@@ -1879,10 +1857,12 @@ protected:
     storage.markRewritten();
   }
 
+  // Extract an opaque struct member.
   void visitStructExtractInst(StructExtractInst *extractInst) {
     assert(storage->isRewritten());
   }
 
+  // Extract an opaque tuple element.
   void visitTupleExtractInst(TupleExtractInst *extractInst) {
     // If the source is an opaque tuple, as opposed to a call result, then the
     // extract is rewritten on the use-side.
@@ -1900,6 +1880,49 @@ protected:
 };
 } // end anonymous namespace
 
+// Rewrite a BranchInst omitting dead arguments.
+static void removeBranchArgs(BranchInst *BI,
+                             SmallVectorImpl<unsigned> &deadArgIndices,
+                             AddressLoweringState &pass) {
+
+  llvm::SmallVector<SILValue, 4> branchArgs;
+
+  auto nextDeadArgI = deadArgIndices.begin();
+  for (unsigned i : range(BI->getNumArgs())) {
+    if (i == *nextDeadArgI) {
+      ++nextDeadArgI;
+      continue;
+    }
+    branchArgs.push_back(BI->getArg(i));
+  }
+  assert(nextDeadArgI == deadArgIndices.end());
+
+  SILBuilder B(BI);
+  B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
+  B.createBranch(BI->getLoc(), BI->getDestBB(), branchArgs);
+
+  BI->eraseFromParent();
+}
+
+// Remove all opaque block arguments. Their inputs have already been substituted
+// with Undef.
+//
+// FIXME: Generalize to other terminator.
+static void removeOpaqueBBArgs(SILBasicBlock *bb, AddressLoweringState &pass) {
+  auto *bb = bbArg->getParent();
+
+  SmallVector<unsigned, 16> deadArgIndices;
+  for (auto *bbArg : bb->getArguments()) {
+    if (bbArg->getType().isAddressOnly(pass.F->getModule()))
+      deadArgs.push_back(bbArg->getIndex());
+  }
+  for (auto *predBB : bb->predecessors())
+    removeBranchArgs(deadArgs);
+
+  for (auto *deadArgIdx : deadArgs)
+    bb->eraseArgument(deadArgIdx);
+}
+
 static void rewriteFunction(AddressLoweringState &pass) {
   AddressOnlyDefRewriter defVisitor(pass);
   AddressOnlyUseRewriter useVisitor(pass);
@@ -1908,9 +1931,12 @@ static void rewriteFunction(AddressLoweringState &pass) {
     SILValue valueDef = valueStorageI.first;
 
     // TODO: MultiValueInstruction: ApplyInst
-    auto *defInst = cast<SingleValueInstruction>(valueDef);
-    defVisitor.visitInst(defInst);
-
+    if (auto *inst = dyn_cast<SingleValueInstruction>(valueDef))
+      defVisitor.visitInst(inst);
+    else {
+      // Opaque block args are removed after all instructions are rewritten.
+      assert(isa<SILPHIArgument>(valueDef));
+    }
     SmallVector<Operand *, 8> uses(valueDef->getUses());
     for (Operand *oper : uses)
       useVisitor.visitOperand(oper);
@@ -1999,6 +2025,9 @@ void AddressLowering::runOnFunction(SILFunction *F) {
   // Delete instructions in postorder
   recursivelyDeleteTriviallyDeadInstructions(pass.instsToDelete.takeVector(),
                                              true);
+
+  for (auto *bb : *F)
+    removeOpaqueBBArgs(bb);
 
   StackNesting().correctStackNesting(F);
 
