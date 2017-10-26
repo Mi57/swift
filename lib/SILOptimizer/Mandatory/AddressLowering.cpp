@@ -313,8 +313,8 @@ void OpaqueValueVisitor::mapValueStorage() {
 
     // Opaque function arguments have already been replaced.
     if (BB != pass.F->getEntryBlock()) {
-      for (auto *arg : BB->args())
-        visitValue(*argI);
+      for (auto *arg : BB->getArguments())
+        visitValue(arg);
     }
     for (auto &II : *BB) {
       if (auto apply = ApplySite::isa(&II))
@@ -393,7 +393,7 @@ protected:
   unsigned insertIndirectReturnArgs();
   bool canProjectFrom(ArrayRef<SILValue> innerVals,
                       SILInstruction *composingUse);
-  bool getProjectionFromUser(ArrayRef<SILValue> innerVals, SILValue value,
+  bool setProjectionFromUser(ArrayRef<SILValue> innerVals, SILValue value,
                              ValueStorage &storage);
   void canProjectBBArgs(SILPHIArgument *bbArg,
                         SmallVectorImpl<SILValue> &projectedBBArgs);
@@ -572,7 +572,7 @@ bool OpaqueStorageAllocation::canProjectFrom(ArrayRef<SILValue> innerVals,
 }
 
 /// Find a use of this value that can provide storage for this value.
-bool OpaqueStorageAllocation::getProjectionFromUser(
+bool OpaqueStorageAllocation::setProjectionFromUser(
     ArrayRef<SILValue> innerVals, SILValue value, ValueStorage &storage) {
   for (Operand *use : value->getUses()) {
     if (canProjectFrom(innerVals, use->getUser())) {
@@ -652,7 +652,7 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg,
   canProjectBBArgs(bbArg, projectedBBArgs);
 
   // Only project the block arg if it's inputs can project.
-  if (!getProjectionFromUser(projectedBBArgs, bbArg, storage))
+  if (!setProjectionFromUser(projectedBBArgs, bbArg, storage))
     storage.storageAddress = createStackAllocation(bbArg, storage);
 
   // Regardless of whether we projected from a user or allocated storage,
@@ -763,7 +763,7 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
 
   // Attempt to reuse a user's storage.
   if (canProjectTo(value, storage)
-      && getProjectionFromUser(value, value, storage)) {
+      && setProjectionFromUser(value, value, storage)) {
     return;
   }
 
@@ -1054,7 +1054,7 @@ static void insertStackDeallocationAtCall(AllocStackInst *allocInst,
     break;
   }
   case SILInstructionKind::TryApplyInst:
-    // TODO!!!: insert dealloc in the catch block.
+    // FIXME!!!: insert dealloc in the catch block.
     llvm_unreachable("not implemented for this instruction!");
   case SILInstructionKind::PartialApplyInst:
     llvm_unreachable("partial apply cannot have indirect results.");
@@ -1430,6 +1430,7 @@ void ReturnRewriter::rewriteReturn(ReturnInst *returnInst) {
         B.createTuple(returnInst->getLoc(),
                       pass.loweredFnConv.getSILResultType(), newDirectResults);
   }
+  // Rewrite the returned value.
   SILValue origFullResult = returnInst->getOperand();
   returnInst->setOperand(newReturnVal);
   if (auto *fullResultInst = origFullResult->getDefiningInstruction()) {
@@ -1504,8 +1505,24 @@ protected:
   }
 
   // Opaque branch argument.
-  void visitBranchInst(BranchInst *branchInst) {
-    currOper->set(SILUndef::get(currOper->getType(), pass.F->getModule()));
+  void visitBranchInst(BranchInst *BI) {
+    SILValue predStorageAddress =
+        pass.valueStorageMap.getStorage(currOper->get()).storageAddress;
+
+    unsigned argIdx = BI->getArgIndexOfOperand(currOper->getOperandNumber());
+    auto *bbArg = cast<SILPHIArgument>(BI->getDestBB()->getArgument(argIdx));
+    SILValue succStorageAddress = addrMat.materializeAddress(bbArg);
+
+    // If this branch argument is not a projection of the block argument, then
+    // copy its value in to block arg storage.
+    if (predStorageAddress != succStorageAddress) {
+      B.createCopyAddr(BI->getLoc(), predStorageAddress, succStorageAddress,
+                       IsTake, IsInitialization);
+    }
+    // Set this operand to Undef. Dead block arguments are removed after
+    // rewriting.
+    currOper->set(
+        SILUndef::get(currOper->get()->getType(), pass.F->getModule()));
   }
 
   // Opaque checked cast source.
@@ -1531,7 +1548,32 @@ protected:
   }
 
   // Opaque conditional branch argument.
-  void visitCondBranchInst(CondBranchInst *condBranchInst) {
+  void visitCondBranchInst(CondBranchInst *CBI) {
+    SILValue predStorageAddress =
+        pass.valueStorageMap.getStorage(currOper->get()).storageAddress;
+
+    unsigned operIdx = currOper->getOperandNumber();
+    bool isTruePath = CBI->isTrueOperandIndex(operIdx);
+    unsigned argIdx =
+        operIdx
+        - (isTruePath ? CBI->getFalseOperands()[0].getOperandNumber()
+                      : CBI->getTrueOperands()[0].getOperandNumber());
+
+    auto *destBB = isTruePath ? CBI->getTrueBB() : CBI->getFalseBB();
+    auto *bbArg = cast<SILPHIArgument>(destBB->getArgument(argIdx));
+    SILValue succStorageAddress = addrMat.materializeAddress(bbArg);
+
+    // If this branch argument is not a projection of the block argument, then
+    // copy its value in to block arg storage.
+    if (predStorageAddress != succStorageAddress) {
+      B.createCopyAddr(CBI->getLoc(), predStorageAddress, succStorageAddress,
+                       IsTake, IsInitialization);
+    }
+    // Set this operand to Undef. Dead block arguments are removed after
+    // rewriting.
+    currOper->set(
+        SILUndef::get(currOper->get()->getType(), pass.F->getModule()));
+
     ValueStorage &storage = pass.valueStorageMap.getStorage(currOper->get());
     currOper->set(storage.storageAddress);
     llvm::report_fatal_error("Untested.");
@@ -1737,6 +1779,15 @@ public:
 
   void visitInst(SILInstruction *inst) { visit(inst); }
 
+  // Set the storage address for am opaque block arg and mark it rewritten.
+  // Opaque block args are only removed after all instructions are rewritten.
+  void rewriteBBArg(SILPHIArgument *bbArg) {
+    auto &storage = pass.valueStorageMap.getStorage(bbArg);
+    assert(!storage.isRewritten());
+    storage.storageAddress = addrMat.materializeAddress(bbArg);
+    storage.markRewritten();
+  }
+
 protected:
   void beforeVisit(SILInstruction *I) {
     // This cast succeeds beecause only specific instructions get added to
@@ -1880,22 +1931,56 @@ protected:
 };
 } // end anonymous namespace
 
+// Given an array of terminator operand values, produce an array of
+// operands with those corresponding to deadArgIndices stripped out.
+static void filterDeadArgs(OperandValueArrayRef origArgs,
+                           ArrayRef<unsigned> deadArgIndices,
+                           SmallVectorImpl<SILValue> &newArgs) {
+  auto nextDeadArgI = deadArgIndices.begin();
+  for (unsigned i : indices(origArgs)) {
+    if (i == *nextDeadArgI) {
+      ++nextDeadArgI;
+      continue;
+    }
+    newArgs.push_back(origArgs[i]);
+  }
+  assert(nextDeadArgI == deadArgIndices.end());
+}
+
+// Rewrite a CondBranchInst omitting dead arguments.
+static void removeCondBranchArgs(CondBranchInst *CBI, SILBasicBlock *targetBB,
+                                 ArrayRef<unsigned> deadArgIndices,
+                                 AddressLoweringState &pass) {
+  SmallVector<SILValue, 8> trueArgs;
+  SmallVector<SILValue, 8> falseArgs;
+
+  if (targetBB == CBI->getTrueBB())
+    filterDeadArgs(CBI->getTrueArgs(), deadArgIndices, trueArgs);
+  else
+    trueArgs.append(CBI->getTrueArgs().begin(), CBI->getTrueArgs().end());
+
+  if (targetBB == CBI->getFalseBB())
+    filterDeadArgs(CBI->getFalseArgs(), deadArgIndices, falseArgs);
+  else
+    falseArgs.append(CBI->getFalseArgs().begin(), CBI->getFalseArgs().end());
+
+  SILBuilder B(CBI);
+  B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
+  B.createCondBranch(CBI->getLoc(), CBI->getCondition(), CBI->getTrueBB(),
+                     trueArgs, CBI->getFalseBB(), falseArgs,
+                     CBI->getTrueBBCount(), CBI->getFalseBBCount());
+  CBI->eraseFromParent();
+
+  llvm_unreachable("Untested"); //!!!
+}
+
 // Rewrite a BranchInst omitting dead arguments.
 static void removeBranchArgs(BranchInst *BI,
                              SmallVectorImpl<unsigned> &deadArgIndices,
                              AddressLoweringState &pass) {
 
   llvm::SmallVector<SILValue, 4> branchArgs;
-
-  auto nextDeadArgI = deadArgIndices.begin();
-  for (unsigned i : range(BI->getNumArgs())) {
-    if (i == *nextDeadArgI) {
-      ++nextDeadArgI;
-      continue;
-    }
-    branchArgs.push_back(BI->getArg(i));
-  }
-  assert(nextDeadArgI == deadArgIndices.end());
+  filterDeadArgs(BI->getArgs(), deadArgIndices, branchArgs);
 
   SILBuilder B(BI);
   B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
@@ -1909,17 +1994,27 @@ static void removeBranchArgs(BranchInst *BI,
 //
 // FIXME: Generalize to other terminator.
 static void removeOpaqueBBArgs(SILBasicBlock *bb, AddressLoweringState &pass) {
-  auto *bb = bbArg->getParent();
+  if (bb->isEntry())
+    return;
 
   SmallVector<unsigned, 16> deadArgIndices;
   for (auto *bbArg : bb->getArguments()) {
     if (bbArg->getType().isAddressOnly(pass.F->getModule()))
-      deadArgs.push_back(bbArg->getIndex());
+      deadArgIndices.push_back(bbArg->getIndex());
   }
-  for (auto *predBB : bb->predecessors())
-    removeBranchArgs(deadArgs);
+  if (deadArgIndices.empty())
+    return;
 
-  for (auto *deadArgIdx : deadArgs)
+  for (auto *predBB : bb->getPredecessorBlocks()) {
+    if (auto *CBI = dyn_cast<CondBranchInst>(predBB->getTerminator())) {
+      removeCondBranchArgs(cast<CondBranchInst>(predBB->getTerminator()), bb,
+                           deadArgIndices, pass);
+    } else {
+      removeBranchArgs(cast<BranchInst>(predBB->getTerminator()),
+                       deadArgIndices, pass);
+    }
+  }
+  for (unsigned deadArgIdx : deadArgIndices)
     bb->eraseArgument(deadArgIdx);
 }
 
@@ -1933,10 +2028,9 @@ static void rewriteFunction(AddressLoweringState &pass) {
     // TODO: MultiValueInstruction: ApplyInst
     if (auto *inst = dyn_cast<SingleValueInstruction>(valueDef))
       defVisitor.visitInst(inst);
-    else {
-      // Opaque block args are removed after all instructions are rewritten.
-      assert(isa<SILPHIArgument>(valueDef));
-    }
+    else
+      defVisitor.rewriteBBArg(cast<SILPHIArgument>(valueDef));
+
     SmallVector<Operand *, 8> uses(valueDef->getUses());
     for (Operand *oper : uses)
       useVisitor.visitOperand(oper);
@@ -2007,10 +2101,23 @@ void AddressLowering::runOnFunction(SILFunction *F) {
   // Add the rest of the instructions to the dead list in post order.
   // FIXME: make sure we cleaned up address-only BB arguments.
   for (auto &valueStorageI : reversed(pass.valueStorageMap)) {
+    SILValue val = valueStorageI.first;
+#ifndef NDEBUG
+    auto &storage = pass.valueStorageMap.getStorage(val);
+    // Returned tuples and multi-result calls are currently values without
+    // storage.  Everything else must have been rewritten.
+    assert(storage.isRewritten()
+           || (!storage.storageAddress
+               && (isa<TupleInst>(val)) || ApplySite::isa(val)));
+#endif
     // TODO: MultiValueInstruction: ApplyInst
-    auto *deadInst = dyn_cast<SingleValueInstruction>(valueStorageI.first);
-    if (!deadInst)
+    auto *deadInst = dyn_cast<SingleValueInstruction>(val);
+    if (!deadInst) {
+      // Just skip block args. Remove all of a block's dead args in one pass to
+      // avoid rewriting all predecessors terminators multiple times :(.
+      assert(isa<SILPHIArgument>(val));
       continue;
+    }
 
     DEBUG(llvm::dbgs() << "DEAD "; deadInst->dump());
 #ifndef NDEBUG
@@ -2026,8 +2133,9 @@ void AddressLowering::runOnFunction(SILFunction *F) {
   recursivelyDeleteTriviallyDeadInstructions(pass.instsToDelete.takeVector(),
                                              true);
 
-  for (auto *bb : *F)
-    removeOpaqueBBArgs(bb);
+  // Remove block args after removing all instructions that may use them.
+  for (auto &bb : *F)
+    removeOpaqueBBArgs(&bb, pass);
 
   StackNesting().correctStackNesting(F);
 

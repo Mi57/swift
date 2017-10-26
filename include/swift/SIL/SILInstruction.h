@@ -6655,6 +6655,12 @@ public:
   unsigned getNumArgs() const { return Operands.size(); }
   SILValue getArg(unsigned i) const { return Operands[i].get(); }
 
+  unsigned getArgIndexOfOperand(unsigned OpIndex) {
+    assert(OpIndex < getNumOperands()
+           && "OpIndex must be an index for an actual operand");
+    return OpIndex;
+  }
+
   ArrayRef<Operand> getAllOperands() const { return Operands.asArray(); }
   MutableArrayRef<Operand> getAllOperands() { return Operands.asArray(); }
 };
