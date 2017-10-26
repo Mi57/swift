@@ -2466,6 +2466,8 @@ public:
             return true;
           else
             break;
+        case SILInstructionKind::RetainValueAddrInst:
+          return false;
         case SILInstructionKind::DestroyAddrInst:
           return true;
         case SILInstructionKind::UncheckedAddrCastInst: {

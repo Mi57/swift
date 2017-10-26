@@ -576,8 +576,8 @@ bool OpaqueStorageAllocation::setProjectionFromUser(
     ArrayRef<SILValue> innerVals, SILValue value, ValueStorage &storage) {
   for (Operand *use : value->getUses()) {
     if (canProjectFrom(innerVals, use->getUser())) {
-      DEBUG(llvm::dbgs() << "  PROJECT "; value->dump();
-            llvm::dbgs() << "  into "; use->getUser()->dump());
+      DEBUG(llvm::dbgs() << "  PROJECT "; use->getUser()->dump();
+            llvm::dbgs() << "  into "; value->dump());
       storage.setComposedOperand(use);
       return true;
     }
@@ -890,7 +890,7 @@ SILValue AddressMaterialization::initializeOperandMem(Operand *operand) {
     ValueStorage &storage = pass.valueStorageMap.getStorage(def);
     // Source value should already be rewritten.
     assert(storage.isRewritten());
-    if (storage.isProjection())
+    if (storage.isProjection() && storage.getComposedOperand() == operand)
       destAddr = storage.storageAddress;
     else {
       destAddr = materializeProjection(operand);
@@ -1125,8 +1125,7 @@ void ApplyRewriter::canonicalizeResults(
       }
       SILBuilder B(releaseInst);
       B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
-      auto &TL = pass.F->getModule().getTypeLowering(result->getType());
-      TL.emitDestroyValue(B, releaseInst->getLoc(), result);
+      B.emitDestroyValueOperation(releaseInst->getLoc(), result);
     }
     releaseInst->eraseFromParent();
   }
@@ -1532,6 +1531,9 @@ protected:
 
   // Copy from an opaque source operand.
   void visitCopyValueInst(CopyValueInst *copyInst) {
+    // FIXME!!! Don't expect to see these any more.
+    llvm_unreachable("Unexpected copy_value");
+#if 0 // !!!
     ValueStorage &storage = pass.valueStorageMap.getStorage(copyInst);
     // Fold a copy into a store.
     if (storage.isProjection()
@@ -1544,6 +1546,7 @@ protected:
     B.createCopyAddr(copyInst->getLoc(), srcAddr, destAddr, IsNotTake,
                      IsInitialization);
     markRewritten(copyInst, destAddr);
+#endif
   }
 
   // Opaque conditional branch argument.
@@ -1636,8 +1639,12 @@ protected:
     ValueStorage &storage = pass.valueStorageMap.getStorage(srcVal);
     SILValue srcAddr = storage.storageAddress;
 
-    B.createReleaseValueAddr(releaseInst->getLoc(), srcAddr,
-                             releaseInst->getAtomicity());
+    // FIXME: We lower retain_value to retain_value_addr, but lower
+    // release_value to destroy_addr. This is confusingly assymetric.  We should
+    // remove the release_value_addr instruction complete and just add a flag to
+    // destroy_addr to indicate whether IRGen should "outline" its codegen.
+    // FIXME: destroy_addr ignores the "atomicity" flag. Do we care?
+    B.createDestroyAddr(releaseInst->getLoc(), srcAddr);
     pass.markDead(releaseInst);
   }
 
