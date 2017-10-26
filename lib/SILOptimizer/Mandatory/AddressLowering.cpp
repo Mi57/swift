@@ -1110,9 +1110,8 @@ void ApplyRewriter::canonicalizeResults(
   auto *applyInst = getApplyInst();
 
   for (Operand *operand : nonCanonicalUses) {
-    auto *destroyInst = dyn_cast<DestroyValueInst>(operand->getUser());
-    if (!destroyInst)
-      llvm::report_fatal_error("Simultaneous use of multiple call results.");
+    SILInstruction *releaseInst = dyn_cast<ReleaseValueInst>(operand->getUser());
+    assert(releaseInst && "Simultaneous use of multiple call results.");
 
     for (unsigned resultIdx : indices(directResultValues)) {
       SingleValueInstruction *result = directResultValues[resultIdx];
@@ -1124,12 +1123,12 @@ void ApplyRewriter::canonicalizeResults(
                                                   applyInst, resultIdx);
         directResultValues[resultIdx] = result;
       }
-      SILBuilder B(destroyInst);
+      SILBuilder B(releaseInst);
       B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
       auto &TL = pass.F->getModule().getTypeLowering(result->getType());
-      TL.emitDestroyValue(B, destroyInst->getLoc(), result);
+      TL.emitDestroyValue(B, releaseInst->getLoc(), result);
     }
-    destroyInst->eraseFromParent();
+    releaseInst->eraseFromParent();
   }
 }
 
