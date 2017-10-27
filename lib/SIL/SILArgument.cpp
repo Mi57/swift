@@ -96,6 +96,38 @@ static SILValue getIncomingValueForPred(const SILBasicBlock *BB,
   llvm_unreachable("Unhandled TermKind?!");
 }
 
+static Operand &getIncomingOperandForPred(SILBasicBlock *BB,
+                                          SILBasicBlock *Pred, unsigned Index) {
+  TermInst *TI = Pred->getTerminator();
+
+  switch (TI->getTermKind()) {
+  case TermKind::UnreachableInst:
+  case TermKind::ReturnInst:
+  case TermKind::ThrowInst:
+    llvm_unreachable("Have terminator that implies no successors?!");
+  case TermKind::TryApplyInst:
+  case TermKind::SwitchValueInst:
+  case TermKind::SwitchEnumAddrInst:
+  case TermKind::CheckedCastAddrBranchInst:
+  case TermKind::DynamicMethodBranchInst:
+    llvm_unreachable("No block arguments.");
+  case TermKind::BranchInst:
+    return cast<BranchInst>(TI)->getAllOperands()[Index];
+  case TermKind::CondBranchInst: {
+    auto *CBI = cast<CondBranchInst>(TI);
+    return (CBI->getTrueBB() == BB) ? CBI->getTrueOperands()[Index]
+                                    : CBI->getFalseOperands()[Index];
+  }
+  case TermKind::CheckedCastBranchInst:
+    return cast<CheckedCastBranchInst>(TI)->getOperandRef();
+  case TermKind::CheckedCastValueBranchInst:
+    return cast<CheckedCastValueBranchInst>(TI)->getOperandRef();
+  case TermKind::SwitchEnumInst:
+    return cast<SwitchEnumInst>(TI)->getAllOperands()[0];
+  }
+  llvm_unreachable("Unhandled TermKind?!");
+}
+
 SILValue SILPHIArgument::getSingleIncomingValue() const {
   const SILBasicBlock *Parent = getParent();
   const SILBasicBlock *PredBB = Parent->getSinglePredecessorBlock();
@@ -138,6 +170,15 @@ bool SILPHIArgument::getIncomingValues(
   }
 
   return true;
+}
+
+void SILPHIArgument::getIncomingOperands(
+    llvm::SmallVectorImpl<Operand *> &OutArray) {
+  SILBasicBlock *Parent = getParent();
+
+  unsigned Index = getIndex();
+  for (SILBasicBlock *Pred : getParent()->getPredecessorBlocks())
+    OutArray.push_back(&getIncomingOperandForPred(Parent, Pred, Index));
 }
 
 SILValue SILPHIArgument::getIncomingValue(unsigned BBIndex) {
