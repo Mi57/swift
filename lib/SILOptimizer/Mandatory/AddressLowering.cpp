@@ -223,6 +223,25 @@ public:
 
     return valueVector.back().second;
   }
+#ifndef NDEBUG
+  void dump() {
+    llvm::dbgs() << "ValueStorageMap:\n";
+    for (auto &valStoragePair : valueVector) {
+      valStoragePair.first->dump();
+      auto &storage = valStoragePair.second;
+      if (storage.isProjection()) {
+        llvm::dbgs() << " projection: ";
+        storage.getComposedOperand()->getUser()->dump();
+      } else {
+        llvm::dbgs() << " storage: ";
+        if (storage.storageAddress)
+          storage.storageAddress->dump();
+        else
+          llvm::dbgs() << " None\n";
+      }
+    }
+  }
+#endif
 };
 } // end anonymous namespace
 
@@ -391,12 +410,11 @@ public:
 protected:
   void convertIndirectFunctionArgs();
   unsigned insertIndirectReturnArgs();
-  bool canProjectFrom(ArrayRef<SILValue> innerVals,
+  bool canProjectFrom(std::function<bool(SILValue)> checkDom,
                       SILInstruction *composingUse);
-  bool setProjectionFromUser(ArrayRef<SILValue> innerVals, SILValue value,
+  template <typename C>
+  bool setProjectionFromUser(C innerVals, SILValue value,
                              ValueStorage &storage);
-  void canProjectBBArgs(SILPHIArgument *bbArg,
-                        SmallVectorImpl<SILValue> &projectedBBArgs);
   void allocateForBBArg(SILPHIArgument *bbArg, ValueStorage &storage);
   void allocateForValue(SILValue value, ValueStorage &storage);
   AllocStackInst *createStackAllocation(SILValue value, ValueStorage &storage);
@@ -502,28 +520,10 @@ unsigned OpaqueStorageAllocation::insertIndirectReturnArgs() {
 /// forwarding the operand's value to storage defined elsewhere?
 ///
 /// TODO: Make this a visitor.
-bool OpaqueStorageAllocation::canProjectFrom(ArrayRef<SILValue> innerVals,
-                                             SILInstruction *composingUse) {
+bool OpaqueStorageAllocation::canProjectFrom(
+    std::function<bool(SILValue)> checkDom, SILInstruction *composingUse) {
   if (!OptimizeOpaqueAddressLowering)
     return false;
-
-  auto checkDom = [&](SILValue storageDef) {
-    for (auto innerVal : innerVals) {
-      if (auto *innerInst = innerVal->getDefiningInstruction()) {
-        if (!pass.domInfo->properlyDominates(storageDef, innerInst))
-          return false;
-      } else {
-        auto *bbArg = cast<SILPHIArgument>(innerVal);
-        // For block arguments, the storage def's block must structly dominate
-        // the argument's block.
-        if (!pass.domInfo->properlyDominates(innerVal,
-                                             &*bbArg->getParent()->begin())) {
-          return false;
-        }
-      }
-    }
-    return true;
-  };
 
   SILValue composingValue;
   switch (composingUse->getKind()) {
@@ -566,16 +566,37 @@ bool OpaqueStorageAllocation::canProjectFrom(ArrayRef<SILValue> innerVals,
       return true;
     }
   } else if (storage.isProjection())
-    return canProjectFrom(innerVals, storage.getComposedOperand()->getUser());
+    return canProjectFrom(checkDom, storage.getComposedOperand()->getUser());
 
   return false;
 }
 
 /// Find a use of this value that can provide storage for this value.
-bool OpaqueStorageAllocation::setProjectionFromUser(
-    ArrayRef<SILValue> innerVals, SILValue value, ValueStorage &storage) {
+// `C` is a Range of SILValues. e.g. ArrayRef<SILValue>.
+template <typename C>
+bool OpaqueStorageAllocation::setProjectionFromUser(C innerVals, SILValue value,
+                                                    ValueStorage &storage) {
+
+  auto checkDom = [&](SILValue storageDef) {
+    for (SILValue innerVal : innerVals) {
+      if (auto *innerInst = innerVal->getDefiningInstruction()) {
+        if (!pass.domInfo->properlyDominates(storageDef, innerInst))
+          return false;
+      } else {
+        auto *bbArg = cast<SILPHIArgument>(innerVal);
+        // For block arguments, the storage def's block must structly dominate
+        // the argument's block.
+        if (!pass.domInfo->properlyDominates(innerVal,
+                                             &*bbArg->getParent()->begin())) {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+
   for (Operand *use : value->getUses()) {
-    if (canProjectFrom(innerVals, use->getUser())) {
+    if (canProjectFrom(checkDom, use->getUser())) {
       DEBUG(llvm::dbgs() << "  PROJECT "; use->getUser()->dump();
             llvm::dbgs() << "  into "; value->dump());
       storage.setComposedOperand(use);
@@ -585,81 +606,185 @@ bool OpaqueStorageAllocation::setProjectionFromUser(
   return false;
 }
 
-// Populate canProjectArgs with all inputs to bbArg that can reuse the
+// Populate projectedBBArgs with all inputs to bbArg that can reuse the
 // argument's storage.
 //
 // Blocks are marked white, grey, or black.
 //
 // All blocks start white.
-// Set all phi predecessor blocks black.
+// Set all predecessor blocks black.
 //
-// For each phi-in:
+// For each incoming value:
 //
 //   Mark the current predecessor white (from black) if it is *not* a critical
 //   edge.  We know no other source will be live out of that predecessor because
-//   this block will be marked black when we process the other phi inputs.
+//   this block will be marked black when we process the other incoming values.
 //
 //   For all uses: scan the CFG backward following predecessors.
 //     If the current block is:
-//     White: mark it grey and CONTINUE.
-//     Grey: STOP.
-//     Black: CONTINUE.
+//     White: mark it grey and continue scanning.
+//     Grey: stop scanning and continue with the next use.
+//     Black: record an interference, stop scanning, continue with the next use.
 //
-//   If no black blocks were reached, record this phi-in as a valid projection.
+//   If no black blocks were reached, record this incoming value as a valid
+//   projection.
 //
-//   Mark all grey blocks black. This will mark the phi-in predecessor black
-//   again, along with any other blocks in which the phi-in valie is live-out.
+//   Mark all grey blocks black. This will mark the incoming predecessor black
+//   again, along with any other blocks in which the incoming value is live-out.
 //
-// In the end, we have a set of non-interfering phi inputs that can reuse the
-// bbArg's storage.
+// In the end, we have a set of non-interfering incoming values that can reuse
+// the bbArg's storage.
 //
 // TODO: Do something optimal for switch_enum. Can we always project?
 //
 // TODO: review and test this algorithm, it's just a prototype.
-void OpaqueStorageAllocation::canProjectBBArgs(
-    SILPHIArgument *bbArg, SmallVectorImpl<SILValue> &projectedBBArgs) {
+namespace {
+class BlockArgumentStorageOptimizer {
+  class Result {
+    friend class BlockArgumentStorageOptimizer;
+    SmallVector<Operand *, 4> projectedBBArgs;
 
-  SmallVector<std::pair<SILBasicBlock *, SILValue>, 4> phiIns;
-  bbArg->getIncomingValues(phiIns);
+    struct GetOper {
+      SILValue operator()(Operand *oper) const { return oper->get(); }
+    };
 
-  // Prune the single phi-in case.
-  if (phiIns.size() == 1) {
-    projectedBBArgs.push_back(phiIns[0].second);
-    return;
+  public:
+    ArrayRef<Operand *> getArgumentProjections() const {
+      return projectedBBArgs;
+    }
+
+    // LLVM needs a map_range.
+    iterator_range<
+        llvm::mapped_iterator<ArrayRef<Operand *>::iterator, GetOper>>
+    getIncomingValueRange() const {
+      return make_range(
+          llvm::map_iterator(getArgumentProjections().begin(), GetOper()),
+          llvm::map_iterator(getArgumentProjections().end(), GetOper()));
+    }
+
+    void clear() { projectedBBArgs.clear(); }
+  };
+
+  SILPHIArgument *bbArg;
+  Result result;
+
+  // Working state for this bbArg.
+  //
+  // TODO: These are possible candidates for bitsets since we're reusing storage
+  // across multiple uses and want to perform a fast union.
+  SmallPtrSet<SILBasicBlock *, 16> blackBlocks;
+  SmallPtrSet<SILBasicBlock *, 16> greyBlocks;
+
+  // Working state per-incoming-value.
+  SmallVector<SILBasicBlock *, 16> liveBBWorklist;
+
+public:
+  BlockArgumentStorageOptimizer(SILPHIArgument *bbArg) : bbArg(bbArg) {}
+
+  Result &&computeArgumentProjections() &&;
+
+protected:
+  bool computeIncomingLiveness(Operand *useOper, SILBasicBlock *defBB);
+};
+} // namespace
+
+// Process an incoming value.
+//
+// Fully compute liveness from this use operand. Return true if no interference
+// was detected along the way.
+bool BlockArgumentStorageOptimizer::
+computeIncomingLiveness(Operand *useOper, SILBasicBlock *defBB) {
+  bool noInterference = true;
+
+  auto visitLiveBlock = [&](SILBasicBlock *liveBB) {
+    if (blackBlocks.count(liveBB))
+      noInterference = false;
+    else if (greyBlocks.insert(liveBB).second && liveBB != defBB)
+      liveBBWorklist.push_back(liveBB);
+  };
+
+  assert(liveBBWorklist.empty());
+
+  visitLiveBlock(useOper->getUser()->getParent());
+
+  while (!liveBBWorklist.empty()) {
+    auto *succBB = liveBBWorklist.pop_back_val();
+    for (auto *predBB : succBB->getPredecessorBlocks())
+      visitLiveBlock(predBB);
+  }
+  return noInterference;
+}
+
+// Process this bbArg, recording in the Result which incoming values can reuse
+// storage with the argument itself.
+BlockArgumentStorageOptimizer::Result &&
+BlockArgumentStorageOptimizer::computeArgumentProjections() && {
+  SmallVector<Operand *, 4> incomingOperands;
+  bbArg->getIncomingOperands(incomingOperands);
+
+  // Prune the single incoming value case.
+  if (incomingOperands.size() == 1) {
+    result.projectedBBArgs.push_back(incomingOperands[0]);
+    return std::move(result);
   }
 
-  SmallPtrSet<SILBasicBlock *, 4> blackBlocks;
-  SmallPtrSet<SILBasicBlock *, 4> greyBlocks;
-
-  SILBasicBlock *phiPred;
-  SILValue phiIn;
-  for (auto &blockValPair : phiIns) {
-    std::tie(phiPred, phiIn) = blockValPair;
-    //!!! algo above
+  SILBasicBlock *succBB = bbArg->getParent();
+  for (auto *predBB : succBB->getPredecessorBlocks()) {
+    // Disallow block arguments on critical edges.
+    assert(predBB->getSingleSuccessorBlock() == succBB);
+    blackBlocks.insert(predBB);
   }
+
+  for (auto *incomingOper : incomingOperands) {
+    SILBasicBlock *incomingPred = incomingOper->getUser()->getParent();
+    SILValue incomingVal = incomingOper->get();
+
+    bool erased = blackBlocks.erase(incomingPred);
+    (void)erased;
+    assert(erased);
+
+    bool noInterference = true;
+    // Continue marking live blocks even after detecting an interference so that
+    // the live set is complete when evaluating subsequent incoming vales.
+    for (auto *use : incomingVal->getUses()) {
+      noInterference &=
+        computeIncomingLiveness(use, incomingVal->getParentBlock());
+    }
+    if (noInterference)
+      result.projectedBBArgs.push_back(incomingOper);
+
+    blackBlocks.insert(greyBlocks.begin(), greyBlocks.end());
+    assert(blackBlocks.count(incomingPred));
+    greyBlocks.clear();
+  }
+  return std::move(result);
 }
 
 // Allocate storage for a BB arg. Unlike normal values, this checks all the
-// incoming values to determine whether any are candidates for projection.
+// incoming values to determine whether any are also candidates for projection.
 void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg,
                                                ValueStorage &storage) {
-  // projectedBBArgs records bb args that can be projected to. We compute them
-  // up-front to determine whether the bb arg itself can project from its
-  // uses. Once storage is allocated for this value (assuming it is a bb arg),
-  // these will be assigned to the same storage as the bb arg and skipped when
-  // we later visit the argument value itself.
-  SmallVector<SILValue, 4> projectedBBArgs;
-  canProjectBBArgs(bbArg, projectedBBArgs);
+  // BlockArgumentStorageOptimizer computes the incoming values of a basic block
+  // argument that can share storage with the block argument. The algorithm
+  // processes all incoming values at once, so it is is run when visiting the
+  // block argument.
+  //
+  // The incoming value projections are computed first to give them
+  // priority. Then we determine if the block argument itself can share storage
+  // with one of its users, given that it may already has projections to
+  // incoming values.
+  auto argStorageResult =
+      BlockArgumentStorageOptimizer(bbArg).computeArgumentProjections();
 
-  // Only project the block arg if it's inputs can project.
-  if (!setProjectionFromUser(projectedBBArgs, bbArg, storage))
+  if (!setProjectionFromUser(argStorageResult.getIncomingValueRange(), bbArg,
+                             storage)) {
     storage.storageAddress = createStackAllocation(bbArg, storage);
+  }
 
   // Regardless of whether we projected from a user or allocated storage,
-  // provide this storage to all the phi inputs that can reuse it.
-  for (SILValue argIn : projectedBBArgs) {
-    pass.valueStorageMap.getStorage(argIn).storageAddress =
-        storage.storageAddress;
+  // provide this storage to all the incoming values that can reuse it.
+  for (Operand *argOper : argStorageResult.getArgumentProjections()) {
+    pass.valueStorageMap.getStorage(argOper->get()).setComposedOperand(argOper);
   }
 }
 
@@ -756,14 +881,14 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
   // Function and argument loads already have a storage address before
   // allocating value storage.
   //
-  // Inputs to block arguments may have already inherited storage from the block
+  // Inputs to block arguments may have already projected storage from the block
   // arguments.
-  if (storage.storageAddress)
+  if (storage.storageAddress || storage.isProjection())
     return;
 
   // Attempt to reuse a user's storage.
   if (canProjectTo(value, storage)
-      && setProjectionFromUser(value, value, storage)) {
+      && setProjectionFromUser(ArrayRef<SILValue>(value), value, storage)) {
     return;
   }
 
@@ -926,6 +1051,25 @@ SILValue AddressMaterialization::materializeProjection(Operand *operand) {
     user->dump();
 #endif
     llvm_unreachable("Unexpected subobject composition.");
+  case SILInstructionKind::BranchInst: {
+    auto *BI = cast<BranchInst>(user);
+    unsigned bbArgIdx = BI->getArgIndexOfOperand(operand->getOperandNumber());
+    return materializeAddress(BI->getDestBB()->getArgument(bbArgIdx));
+  }
+  case SILInstructionKind::CondBranchInst: {
+    auto *CBI = cast<CondBranchInst>(user);
+    // TODO: Add CondBranchInst::getBlockArgForOperand?
+    unsigned opIdx = operand->getOperandNumber();
+    unsigned bbArgIdx;
+    if (CBI->isTrueOperandIndex(opIdx)) {
+      bbArgIdx = opIdx - CBI->getTrueOperands()[0].getOperandNumber();
+      return materializeAddress(CBI->getTrueBB()->getArgument(bbArgIdx));
+    } else {
+      assert(CBI->isFalseOperandIndex(opIdx));
+      bbArgIdx = opIdx - CBI->getFalseOperands()[0].getOperandNumber();
+      return materializeAddress(CBI->getFalseBB()->getArgument(bbArgIdx));
+    }
+  }
   case SILInstructionKind::EnumInst: {
     auto *enumInst = cast<EnumInst>(user);
     SILValue enumAddr = materializeAddress(enumInst);
@@ -2011,7 +2155,11 @@ static void removeOpaqueBBArgs(SILBasicBlock *bb, AddressLoweringState &pass) {
   if (deadArgIndices.empty())
     return;
 
-  for (auto *predBB : bb->getPredecessorBlocks()) {
+  // Iterate while modifying the predecessor's terminators.
+  for (auto predI = bb->pred_begin(), nextI = predI, predE = bb->pred_end();
+       predI != predE; predI = nextI) {
+    ++nextI;
+    auto *predBB = *predI;
     if (auto *CBI = dyn_cast<CondBranchInst>(predBB->getTerminator())) {
       removeCondBranchArgs(cast<CondBranchInst>(predBB->getTerminator()), bb,
                            deadArgIndices, pass);
@@ -2087,7 +2235,8 @@ void AddressLowering::runOnFunction(SILFunction *F) {
 
   PrettyStackTraceSILFunction FuncScope("address-lowering", F);
 
-  DEBUG(llvm::dbgs() << "LOWERADDRESS: " << F->getName() << "\n"; F->dump());
+  DEBUG(llvm::dbgs() << "Address Lowering: " << F->getName() << "\n";
+        F->dump());
 
   auto *DA = PM->getAnalysis<DominanceAnalysis>();
 
@@ -2097,6 +2246,8 @@ void AddressLowering::runOnFunction(SILFunction *F) {
   // WARNING: This may split critical edges.
   OpaqueStorageAllocation allocator(pass);
   allocator.allocateOpaqueStorage();
+
+  DEBUG(pass.valueStorageMap.dump());
 
   // Rewrite instructions with address-only operands or results.
   rewriteFunction(pass);
