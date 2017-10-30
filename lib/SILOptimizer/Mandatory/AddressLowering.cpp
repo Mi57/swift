@@ -834,12 +834,13 @@ static bool canProjectTo(SILValue value, ValueStorage &storage) {
   // calls. Force them to allocate storage.
   //
   // FIXME: Remove this case. We should be able reuse storage for out args.
+#if 0 //!!!
   if (auto *TEI = dyn_cast<TupleExtractInst>(value)) {
     if (ApplySite::isa(TEI->getOperand())) {
       return false;
     }
   }
-
+#endif
   // Values that borrow their operand inherit storage from that operand, not
   // their use.
   if (getBorrowedStorageOperand(value))
@@ -1748,10 +1749,14 @@ protected:
   }
 
   void visitDestroyValueInst(DestroyValueInst *destroyInst) {
+    // FIXME!!! Don't expect to see these any more.
+    llvm_unreachable("Unexpected destroy_value");
+#if 0 // !!!
     SILValue srcVal = destroyInst->getOperand();
     SILValue srcAddr = pass.valueStorageMap.getStorage(srcVal).storageAddress;
     B.createDestroyAddr(destroyInst->getLoc(), srcAddr);
     pass.markDead(destroyInst);
+#endif
   }
 
   // Opaque enum payload. Handle EnumInst on the def side to handle both opaque
