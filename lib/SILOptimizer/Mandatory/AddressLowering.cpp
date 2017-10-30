@@ -793,8 +793,18 @@ static Operand *getBorrowedStorageOperand(SILValue value) {
   default:
     return nullptr;
 
-  case ValueKind::StructExtractInst:
   case ValueKind::TupleExtractInst:
+    // TupleExtract from an apply are handled specially until we have
+    // multi-result calls. Force them to allocate storage.
+    //
+    // FIXME: Remove this case. We should be able reuse storage for out args.
+    if (auto *TEI = dyn_cast<TupleExtractInst>(value)) {
+      if (ApplySite::isa(TEI->getOperand())) {
+        return nullptr;
+      }
+    }
+    LLVM_FALLTHROUGH;
+  case ValueKind::StructExtractInst:
   case ValueKind::OpenExistentialValueInst:
   case ValueKind::OpenExistentialBoxValueInst:
     assert(value.getOwnershipKind() == ValueOwnershipKind::Guaranteed);
