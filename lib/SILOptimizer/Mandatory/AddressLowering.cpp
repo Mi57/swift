@@ -149,7 +149,8 @@ struct ValueStorage {
   }
   /// Return the operand that either
   /// (1) composes an aggregate from this value -- the value is the operand def.
-  /// (2) borrows this value -- the value us the operand use.
+  /// (2) borrows this value -- the value is the operand use or a block argument
+  /// corresponding to the operand use.
   Operand *getComposedOperand() const {
     assert(isProjection());
     return projectionAndFlags.getPointer();
@@ -764,6 +765,17 @@ BlockArgumentStorageOptimizer::computeArgumentProjections() && {
 // incoming values to determine whether any are also candidates for projection.
 void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg,
                                                ValueStorage &storage) {
+  // SwitchEnum arguments are different than normal phi-like arguments. The
+  // incoming value uses its own storage, and the block argument is always a
+  // projection of that storage.
+  if (auto *predBB = bbArg->getParent()->getSinglePredecessorBlock()) {
+    if (auto *SEI = dyn_cast<SwitchEnumInst>(predBB->getTerminator())) {
+      Operand *incomingOper = SEI->getAllOperands()[0];
+      assert(incomingOper->get() == bbArg->getSingleIncomingValue());
+      storage.setComposedOperand(incomingOper);
+      return;
+    }
+  }
   // BlockArgumentStorageOptimizer computes the incoming values of a basic block
   // argument that can share storage with the block argument. The algorithm
   // processes all incoming values at once, so it is is run when visiting the
@@ -773,6 +785,9 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg,
   // priority. Then we determine if the block argument itself can share storage
   // with one of its users, given that it may already has projections to
   // incoming values.
+  //
+  // The single-incoming value case will be immediately pruned--it will always
+  // be a projection of its block argument.
   auto argStorageResult =
       BlockArgumentStorageOptimizer(bbArg).computeArgumentProjections();
 
@@ -1112,6 +1127,12 @@ SILValue AddressMaterialization::materializeProjection(Operand *operand) {
     return B.createStructElementAddr(
         structInst->getLoc(), structAddr, *fieldIter,
         operand->get()->getType().getAddressType());
+  }
+  case SILInstructionKind::SwitchEnumInst: {
+    auto *SEI = cast<SwitchEnumInst>(user);
+    SILValue enumAddr = materializeAddress(SEI->getOperand());
+    return B.createUncheckedTakeEnumDataAddr(SEI->getLoc(), enumAddr,
+                                             SEI->getElement());
   }
   case SILInstructionKind::TupleInst: {
     auto *tupleInst = cast<TupleInst>(user);
@@ -1826,8 +1847,54 @@ protected:
     llvm::report_fatal_error("Unimplemented SelectValue use.");
   }
 
-  void visitSwitchEnum(SwitchEnumInst *switchEnumInst) {
-    llvm::report_fatal_error("Unimplemented SwitchEnum use.");
+  void visitSwitchEnum(SwitchEnumInst *SEI) {
+    // The switch_enum should be rewritten to a switch_enum_addr here, but
+    // because it's a terminator, it cannot be rewritten until its block
+    // arguments are removed.
+
+    // Set this operand to Undef. Dead block arguments are removed after
+    // rewriting.
+    currOper->set(
+        SILUndef::get(currOper->get()->getType(), pass.F->getModule()));
+
+    for (unsigned caseIdx : range(switchEnumInst->getNumCases())) {
+      EnumElementDecl *caseDecl;
+      SILBasicBlock *caseBlock;
+      std::tie(caseDecl, caseBlock) = switchEnumInst->getCase(caseIdx);
+      if (caseBlock->getArguments().size() == 0)
+        continue;
+      if (caseDecl->hasAssociatedValues()) {
+        assert(caseBlock->getPHIArguments().size() == 1);
+        SILPHIArgument *caseArg = caseBlock->getPHIArguments()[0];
+
+        auto eltAddr = addrMat.materializeAddress(caseArg);
+        
+        SILBuilder B(caseBlock->begin());
+        B.setSILConventions(
+          SILModuleConventions::getLoweredAddressConventions());
+        auto *loadElt = B.createLoad(SEI->getLoc(), , branchArgs);
+        
+          SILType eltArgTy = uTy.getEnumElementType(elt, F.getModule());
+          SILType bbArgTy = dest->getArguments()[0]->getType();
+          require(eltArgTy == bbArgTy,
+                  "switch_enum destination bbarg must match case arg type");
+          require(!dest->getArguments()[0]->getType().isAddress(),
+                  "switch_enum destination bbarg type must not be an address");
+        }
+
+      }
+    }
+
+    // Rewrite any non-opaque cases now since we won't visit their defs.
+    auto *DefaultBB = SEI->hasDefault() ? SEI->getDefaultBB() : nullptr;
+    for (unsigned i : indices(SEI->getNumCases())
+      if (EdgeIdx != i)
+        Cases.push_back(S->getCase(i));
+      else
+        Cases.push_back(std::make_pair(S->getCase(i).first, NewDest));
+    if (EdgeIdx == S->getNumCases())
+      DefaultBB = NewDest;
+
   }
 
   void visitStoreInst(StoreInst *storeInst) {
@@ -2112,6 +2179,21 @@ static void filterDeadArgs(OperandValueArrayRef origArgs,
   assert(nextDeadArgI == deadArgIndices.end());
 }
 
+// Rewrite a BranchInst omitting dead arguments.
+static void removeBranchArgs(BranchInst *BI,
+                             SmallVectorImpl<unsigned> &deadArgIndices,
+                             AddressLoweringState &pass) {
+
+  llvm::SmallVector<SILValue, 4> branchArgs;
+  filterDeadArgs(BI->getArgs(), deadArgIndices, branchArgs);
+
+  SILBuilder B(BI);
+  B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
+  B.createBranch(BI->getLoc(), BI->getDestBB(), branchArgs);
+
+  BI->eraseFromParent();
+}
+
 // Rewrite a CondBranchInst omitting dead arguments.
 static void removeCondBranchArgs(CondBranchInst *CBI, SILBasicBlock *targetBB,
                                  ArrayRef<unsigned> deadArgIndices,
@@ -2139,10 +2221,16 @@ static void removeCondBranchArgs(CondBranchInst *CBI, SILBasicBlock *targetBB,
   llvm_unreachable("Untested"); //!!!
 }
 
-// Rewrite a BranchInst omitting dead arguments.
-static void removeBranchArgs(BranchInst *BI,
-                             SmallVectorImpl<unsigned> &deadArgIndices,
-                             AddressLoweringState &pass) {
+// Rewrite a SwitchEnumInst omitting dead arguments.
+//
+// Note: switch_enum should be rewriten by AddressOnlyUseRewriter. However, it
+// is an odd instruction that combines an operation on a data value with control
+// flow. Consequently, we can't rewrite the instruction until all normal
+// rewrites have taken place. Otherwise block arguments would be in an
+// inconsistent state.
+static void removeSwitchEnumArgs(SwitchEnumInst *SEI,
+                                 SmallVectorImpl<unsigned> &deadArgIndices,
+                                 AddressLoweringState &pass) {
 
   llvm::SmallVector<SILValue, 4> branchArgs;
   filterDeadArgs(BI->getArgs(), deadArgIndices, branchArgs);
@@ -2151,7 +2239,13 @@ static void removeBranchArgs(BranchInst *BI,
   B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
   B.createBranch(BI->getLoc(), BI->getDestBB(), branchArgs);
 
-  BI->eraseFromParent();
+  EnumElementDecl *caseDecl;
+  SILBasicBlock *caseBlock;
+  for (unsigned caseIdx : range(switchEnumInst->getNumCases())) {
+    std::tie(caseDecl, caseBlock) = switchEnumInst->getCase(caseIdx);
+  }
+  B.createSwitchEnumAddr(SEI->getLoc(), SEI->getOperand(), DefaultBB, Cases);
+  SEI->eraseFromParent();
 }
 
 // Remove all opaque block arguments. Their inputs have already been substituted
@@ -2174,13 +2268,21 @@ static void removeOpaqueBBArgs(SILBasicBlock *bb, AddressLoweringState &pass) {
   for (auto predI = bb->pred_begin(), nextI = predI, predE = bb->pred_end();
        predI != predE; predI = nextI) {
     ++nextI;
-    auto *predBB = *predI;
-    if (auto *CBI = dyn_cast<CondBranchInst>(predBB->getTerminator())) {
-      removeCondBranchArgs(cast<CondBranchInst>(predBB->getTerminator()), bb,
-                           deadArgIndices, pass);
-    } else {
-      removeBranchArgs(cast<BranchInst>(predBB->getTerminator()),
-                       deadArgIndices, pass);
+    auto *predTerm = predI->getTerminator();
+    switch (predTerm->getTermKind()) {
+    default:
+      llvm_unreachable("Unexpected block terminator.");
+
+    case TermKind::BranchInst:
+      removeBranchArgs(cast<BranchInst>(predTerm), deadArgIndices, pass);
+    
+    case TermKind::CondBranchInst:
+      removeCondBranchArgs(cast<CondBranchInst>(predTerm), bb, deadArgIndices,
+                           pass);
+    
+    case TermKind::SwitchEnumInst:
+      removeSwitchEnumArgs(cast<SwitchEnumInst>(predTerm), bb, deadArgIndices,
+                           pass);
     }
   }
   for (unsigned deadArgIdx : deadArgIndices)
