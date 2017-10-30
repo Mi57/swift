@@ -631,40 +631,41 @@ sil @takeIn : $@convention(thin) <T> (@in T) -> ()
 sil @getOut : $@convention(thin) <T> () -> @out T
 
 // No projection from incoming values. No interference.
-// CHECK-LABAL: sil @f180_testBBArgSelect : $@convention(thin) <T> (@in T, @in T) -> @out T {
-// CHECK: bb0(%0 : $*T, %1 : $*T, %2 : $*T):
+// CHECK-LABEL: sil @f180_testBBArgSelect : $@convention(thin) <T> () -> @out T {
+// CHECK: bb0(%0 : $*T):
+// CHECK:   [[F:%.*]] = function_ref @getOut : $@convention(thin) <τ_0_0> () -> @out τ_0_0
 // CHECK:   cond_br undef, bb2, bb1
 // CHECK: bb1:
-// CHECK:   copy_addr [take] %1 to [initialization] %0 : $*T
+// CHECK:   [[GET0:%.*]] = apply [[F]]<T>(%0) : $@convention(thin) <τ_0_0> () -> @out τ_0_0
 // CHECK:   br bb3
 // CHECK: bb2:
-// CHECK:   copy_addr [take] %2 to [initialization] %0 : $*T
+// CHECK:   [[GET1:%.*]] = apply [[F]]<T>(%0) : $@convention(thin) <τ_0_0> () -> @out τ_0_0
 // CHECK:   br bb3
 // CHECK: bb3:
-// CHECK:   [[TAKEF:%.*]] = function_ref @takeIn : $@convention(thin) <τ_0_0> (@in τ_0_0) -> ()
 // CHECK:   %{{.*}} = tuple ()
-// CHECK:   %{{.*}} = apply [[TAKEF]]<T>(%2) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> ()
 // CHECK:   return %{{.*}} : $()
 // CHECK-LABEL: } // end sil function 'f180_testBBArgSelect'
-sil @f180_testBBArgSelect : $@convention(thin) <T> (@in T, @in T) -> @out T {
-bb0(%0 : $T, %1 : $T):
+sil @f180_testBBArgSelect : $@convention(thin) <T> () -> @out T {
+bb0:
+  %get = function_ref @getOut : $@convention(thin) <τ_0_0>() -> @out τ_0_0
   cond_br undef, bb1, bb2
 
 bb1:
-  br bb3(%1 : $T)
+  %get0 = apply %get<T>() : $@convention(thin) <τ_0_0>() -> @out τ_0_0
+  br bb3(%get0 : $T)
 
 bb2:
-  br bb3(%0 : $T)
+  %get1 = apply %get<T>() : $@convention(thin) <τ_0_0>() -> @out τ_0_0
+  br bb3(%get1 : $T)
 
 // %15
 bb3(%15 : $T):
-  %take = function_ref @takeIn : $@convention(thin) <τ_0_0>(@in τ_0_0) -> ()
-  %call = apply %take<T>(%1) : $@convention(thin) <τ_0_0>(@in τ_0_0) -> ()
   return %15 : $T
 }
 
 // One projection from incoming values. One interference.
-// CHECK-LABEL: sil @f190_testBBArgProject : $@convention(thin) <T> () -> @out T {
+// One projection from incoming values. One interference.
+// CHECK-LABEL: sil @f190_testBBArgProjectOne : $@convention(thin) <T> () -> @out T {
 // CHECK: bb0(%0 : $*T):
 // CHECK:   [[ALLOC:%.*]] = alloc_stack $T
 // CHECK:   [[GETF:%.*]] = function_ref @getOut : $@convention(thin) <τ_0_0> () -> @out τ_0_0
@@ -682,8 +683,8 @@ bb3(%15 : $T):
 // CHECK:   %{{.*}} = apply [[TAKEF]]<T>(%1) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> ()
 // CHECK:   dealloc_stack [[ALLOC]] : $*T
 // CHECK:   return %{{.*}} : $()
-// CHECK-LABEL: } // end sil function 'f190_testBBArgProject'
-sil @f190_testBBArgProject : $@convention(thin) <T> () -> @out T {
+// CHECK-LABEL: } // end sil function 'f190_testBBArgProjectOne'
+sil @f190_testBBArgProjectOne : $@convention(thin) <T> () -> @out T {
 bb0:
   %get = function_ref @getOut : $@convention(thin) <τ_0_0>() -> @out τ_0_0
   %get0 = apply %get<T>() : $@convention(thin) <τ_0_0>() -> @out τ_0_0
@@ -700,5 +701,38 @@ bb2:
 bb3(%15 : $T):
   %take = function_ref @takeIn : $@convention(thin) <τ_0_0>(@in τ_0_0) -> ()
   %call = apply %take<T>(%get1) : $@convention(thin) <τ_0_0>(@in τ_0_0) -> ()
+  return %15 : $T
+}
+
+// Projection from incoming values. No interference.
+// CHECK-LABEL: sil @f200_testBBArgProjectIn : $@convention(thin) <T> (@in T, @in T) -> @out T {
+// CHECK: bb0(%0 : $*T, %1 : $*T, %2 : $*T):
+// CHECK:   cond_br undef, bb2, bb1
+// CHECK: bb1:
+// CHECK:   copy_addr [take] %1 to [initialization] %0 : $*T
+// CHECK:   br bb3
+// CHECK: bb2:
+// CHECK:   copy_addr [take] %2 to [initialization] %0 : $*T
+// CHECK:   br bb3
+// CHECK: bb3:
+// CHECK:   [[TAKEF:%.*]] = function_ref @takeIn : $@convention(thin) <τ_0_0> (@in τ_0_0) -> ()
+// CHECK:   %{{.*}} = tuple ()
+// CHECK:   %{{.*}} = apply [[TAKEF]]<T>(%2) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> ()
+// CHECK:   return %{{.*}} : $()
+// CHECK-LABEL: } // end sil function 'f200_testBBArgProjectIn'
+sil @f200_testBBArgProjectIn : $@convention(thin) <T> (@in T, @in T) -> @out T {
+bb0(%0 : $T, %1 : $T):
+  cond_br undef, bb1, bb2
+
+bb1:
+  br bb3(%1 : $T)
+
+bb2:
+  br bb3(%0 : $T)
+
+// %15
+bb3(%15 : $T):
+  %take = function_ref @takeIn : $@convention(thin) <τ_0_0>(@in τ_0_0) -> ()
+  %call = apply %take<T>(%1) : $@convention(thin) <τ_0_0>(@in τ_0_0) -> ()
   return %15 : $T
 }
