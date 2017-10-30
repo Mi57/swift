@@ -1649,7 +1649,7 @@ protected:
 #ifndef NDEBUG
     I->dump();
 #endif
-    llvm_unreachable("Unimplemented?!");
+    llvm_unreachable("Unimplemented opaque use.");
   }
 
   // Opaque call argument.
@@ -1681,7 +1681,7 @@ protected:
   // Opaque checked cast source.
   void visitCheckedCastValueBranchInst(
       CheckedCastValueBranchInst *checkedBranchInst) {
-    llvm::report_fatal_error("Unimplemented");
+    llvm::report_fatal_error("Unimplemented CheckCastValueBranch use.");
   }
 
   // Copy from an opaque source operand.
@@ -1745,7 +1745,7 @@ protected:
 
   void visitDeinitExistentialValueInst(
       DeinitExistentialValueInst *deinitExistential) {
-    llvm::report_fatal_error("Unimplemented");
+    llvm::report_fatal_error("Unimplemented DeinitExsitentialValue use.");
   }
 
   void visitDestroyValueInst(DestroyValueInst *destroyInst) {
@@ -1790,7 +1790,7 @@ protected:
 
   void visitOpenExistentialBoxValueInst(
       OpenExistentialBoxValueInst *openExistentialBox) {
-    llvm::report_fatal_error("Unimplemented");
+    llvm::report_fatal_error("Unimplemented OpenExistentialBox use.");
   }
 
   void visitReleaseValueInst(ReleaseValueInst *releaseInst) {
@@ -1823,11 +1823,11 @@ protected:
   }
 
   void visitSelectValueInst(SelectValueInst *selectInst) {
-    llvm::report_fatal_error("Unimplemented");
+    llvm::report_fatal_error("Unimplemented SelectValue use.");
   }
 
   void visitSwitchEnum(SwitchEnumInst *switchEnumInst) {
-    llvm::report_fatal_error("Unimplemented");
+    llvm::report_fatal_error("Unimplemented SwitchEnum use.");
   }
 
   void visitStoreInst(StoreInst *storeInst) {
@@ -1904,17 +1904,17 @@ protected:
 
     // TODO: generate tuple_element_addr.
     // generate copy_addr if we can't project.
-    llvm::report_fatal_error("Unimplemented.");
+    llvm::report_fatal_error("Unimplemented TupleExtract use.");
   }
 
   void visitUncheckedBitwiseCast(UncheckedBitwiseCastInst *uncheckedCastInst) {
-    llvm::report_fatal_error("Unimplemented.");
+    llvm::report_fatal_error("Unimplemented UncheckedBitwiseCast use.");
   }
 
   void visitUnconditionalCheckedCastValueInst(
       UnconditionalCheckedCastValueInst *checkedCastInst) {
 
-    llvm::report_fatal_error("Unimplemented.");
+    llvm::report_fatal_error("Unimplemented UnconditionalCheckedCast use.");
   }
 };
 } // end anonymous namespace
@@ -1971,7 +1971,7 @@ protected:
 #ifndef NDEBUG
     I->dump();
 #endif
-    llvm_unreachable("Unimplemented?!");
+    llvm_unreachable("Unimplemented opaque def.");
   }
 
   // Call returning a single opaque value.
@@ -2030,7 +2030,7 @@ protected:
   // Project an opaque value out of a box-type existential.
   void visitOpenExistentialBoxValueInst(
       OpenExistentialBoxValueInst *openExistentialBox) {
-    llvm::report_fatal_error("Unimplemented");
+    llvm::report_fatal_error("Unimplemented OpenExistentialBoxValue def.");
   }
 
   // Load an opaque value.
