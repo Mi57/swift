@@ -353,21 +353,25 @@ void OpaqueValueVisitor::mapValueStorage() {
 /// Populate `indirectApplies` and insert this apply in `valueStorageMap` if
 /// the call's non-tuple result is returned indirectly.
 void OpaqueValueVisitor::visitApply(ApplySite applySite) {
+  // try_applies are explicitly rewritten during terminator rewriting. So
+  // there's no need to track them.
+  if (isa<TryApplyInst>(applySite))
+    return;
+
   auto calleeConv = applySite.getSubstCalleeConv();
   unsigned calleeArgIdx = applySite.getCalleeArgIndexOfFirstAppliedArg();
   for (Operand &operand : applySite.getArgumentOperands()) {
     if (operand.get()->getType().isObject()) {
       auto argConv = calleeConv.getSILArgumentConvention(calleeArgIdx);
-      if (argConv.isIndirectConvention()) {
+      if (argConv.isIndirectConvention())
         pass.indirectApplies.insert(applySite);
-      }
     }
     ++calleeArgIdx;
   }
 
   if (applySite.getSubstCalleeType()->hasIndirectFormalResults()) {
     pass.indirectApplies.insert(applySite);
-    if (!applySite.getType().is<TupleType>())
+    if (isa<ApplyInst>(applySite) && !applySite.getType().is<TupleType>())
       pass.valueStorageMap.insertValue(cast<ApplyInst>(applySite));
 
     return;
@@ -766,14 +770,17 @@ BlockArgumentStorageOptimizer::computeArgumentProjections() && {
 // incoming values to determine whether any are also candidates for projection.
 void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg,
                                                ValueStorage &storage) {
-  // SwitchEnum arguments are different than normal phi-like arguments. The
-  // incoming value uses its own storage, and the block argument is always a
-  // projection of that storage.
+  // SwitchEnum and TryApply arguments are different than normal phi-like
+  // arguments. The incoming value uses its own storage, and the block argument
+  // is always a projection of that storage.
   if (auto *predBB = bbArg->getParent()->getSinglePredecessorBlock()) {
     if (auto *SEI = dyn_cast<SwitchEnumInst>(predBB->getTerminator())) {
       Operand *incomingOper = &SEI->getAllOperands()[0];
       assert(incomingOper->get() == bbArg->getSingleIncomingValue());
       storage.setComposedOperand(incomingOper);
+      return;
+    }
+    if (auto *TAI = dyn_cast<TryApplyInst>(predBB->getTerminator())) {
       return;
     }
   }
@@ -812,8 +819,6 @@ static Operand *getBorrowedStorageOperand(SILValue value) {
   case ValueKind::TupleExtractInst:
     // TupleExtract from an apply are handled specially until we have
     // multi-result calls. Force them to allocate storage.
-    //
-    // FIXME: Remove this case. We should be able reuse storage for out args.
     if (auto *TEI = dyn_cast<TupleExtractInst>(value)) {
       if (ApplySite::isa(TEI->getOperand())) {
         return nullptr;
@@ -934,13 +939,14 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
   // TODO: multi-result calls.
   // FIXME: Remove this case. We should be able reuse storage for out args (see
   // also canProjectTo).
+#if 0 // !!!
   if (auto *TEI = dyn_cast<TupleExtractInst>(value)) {
     if (ApplySite::isa(TEI->getOperand())) {
       storage.storageAddress = createStackAllocation(value, storage);
       return;
     }
   }
-
+#endif
   // Values that borrow their operand inherit storage from that operand.
   if (auto *storageOper = getBorrowedStorageOperand(value)) {
     storage.setComposedOperand(storageOper);
@@ -1968,6 +1974,11 @@ protected:
     // elements are composed.
   }
 
+  // Opaque call argument.
+  void visitTryApplyInst(TryApplyInst *tryApplyInst) {
+    ApplyRewriter(applyInst, pass).rewriteIndirectParameter(currOper);
+  }
+
   // Opaque tuple element.
   void visitTupleInst(TupleInst *tupleInst) {
     // Tuples are rewritten on the def-side, where both direct and indirect
@@ -2279,7 +2290,8 @@ static void rewriteFunction(AddressLoweringState &pass) {
 
   // Rewrite any remaining (loadable) indirect parameters.
   for (ApplySite apply : pass.indirectApplies) {
-    // Calls with indirect formal results have already been rewritten.
+    // Calls with indirect formal results have already been rewritten, unless
+    // the result is unused.
     if (apply.getSubstCalleeType()->hasIndirectFormalResults()) {
       bool isRewritten = false;
       visitCallResults(apply, [&](SILValue result) {
