@@ -1077,18 +1077,19 @@ SILValue AddressMaterialization::materializeAddress(SILValue origValue) {
   Operand *composedOper = storage.getComposedOperand();
 
   // Handle values that are composed by a user (struct/tuple/enum).
-  if (composedOper->getUser() == origValue->getDefiningInstruction())
+  if (composedOper->get() == origValue)
     storage.storageAddress = materializeProjectionFromUse(composedOper);
+
+  else if (composedOper->getUser() == origValue->getDefiningInstruction())
+    // Anything else must be a value that is extracted from an aggregate.
+    storage.storageAddress = materializeProjectionFromDef(composedOper);
 
   // SwitchEnum is special because the composed operand isn't actually an
   // operand of origValue, which is itself a block argument.
-  else if (auto *SEI = dyn_cast<SwitchEnumInst>(composedOper->getUser())) {
+  else {
+    auto *SEI = cast<SwitchEnumInst>(composedOper->getUser());
     auto *parentBB = cast<SILPHIArgument>(origValue)->getParent();
     storage.storageAddress = materializeProjectionFromSwitch(SEI, parentBB);
-
-  } else {
-    // Anything else must be a value that is extracted from an aggregate.
-    storage.storageAddress = materializeProjectionFromDef(composedOper);
   }
   return storage.storageAddress;
 }
@@ -2227,12 +2228,13 @@ static void rewriteSwitchEnums(AddressLoweringState &pass) {
           SILModuleConventions::getLoweredAddressConventions());
       AddressMaterialization addrMat(pass, argBuilder);
 
-      auto eltAddr = addrMat.materializeAddress(caseArg);
-
       if (caseArg->getType().isAddressOnly(pass.F->getModule())) {
+        assert(pass.valueStorageMap.getStorage(caseArg).isRewritten());
         caseArg->replaceAllUsesWith(
             SILUndef::get(caseArg->getType(), pass.F->getModule()));
       } else {
+        SILValue eltAddr = addrMat.materializeProjectionFromSwitch(SEI, caseBB);
+
         // Rewrite any non-opaque cases now since we don't visit their defs.
         auto *loadElt = argBuilder.createLoad(
             SEI->getLoc(), eltAddr, LoadOwnershipQualifier::Unqualified);

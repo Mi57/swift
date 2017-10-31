@@ -77,13 +77,10 @@ bb0(%0 : $T):
 // CHECK-LABEL: sil @f031_unusedIndirect : $@convention(thin) <T> (@in T) -> @out T {
 // CHECK: bb0(%0 : $*T, %1 : $*T):
 // CHECK:   %[[OUT1:.*]] = alloc_stack $T
-// CHECK:   %[[OUT2:.*]] = alloc_stack $T
 // CHECK:   // function_ref f030_returnPair
 // CHECK:   %[[F:.*]] = function_ref @f030_returnPair : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0)
-// CHECK:   %[[R0:.*]] = apply %[[F]]<T>(%[[OUT1]], %[[OUT2]], %1) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0)
+// CHECK:   %[[R0:.*]] = apply %[[F]]<T>(%[[OUT1]], %0, %1) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0)
 // CHECK:   destroy_addr %[[OUT1]] : $*T
-// CHECK:   copy_addr [take] %[[OUT2]] to [initialization] %0 : $*T
-// CHECK:   dealloc_stack %[[OUT2]] : $*T
 // CHECK:   dealloc_stack %[[OUT1]] : $*T
 // CHECK:   return %{{.*}} : $()
 // CHECK-LABEL: } // end sil function 'f031_unusedIndirect'
@@ -231,16 +228,13 @@ bb0(%0 : $T, %1 : $C):
 
 // CHECK-LABEL: sil @f072_callMixedResult1 : $@convention(thin) <T> (@in T, @owned C) -> (@out T, @owned C) {
 // CHECK: bb0(%0 : $*T, %1 : $*T, %2 : $C):
-// CHECK:   %[[OUT:.*]] = alloc_stack $T
 // CHECK:   // function_ref f070_mixedResult1
 // CHECK:   %[[F:.*]] = function_ref @f070_mixedResult1 : $@convention(thin) <τ_0_0> (@in τ_0_0, @owned C) -> (@out τ_0_0, @owned C)
 // CHECK:   retain_value_addr %1 : $*T
 // CHECK:   strong_retain %2 : $C
-// CHECK:   %[[R:.*]] = apply %[[F]]<T>(%[[OUT]], %1, %2) : $@convention(thin) <τ_0_0> (@in τ_0_0, @owned C) -> (@out τ_0_0, @owned C)
+// CHECK:   %[[R:.*]] = apply %[[F]]<T>(%0, %1, %2) : $@convention(thin) <τ_0_0> (@in τ_0_0, @owned C) -> (@out τ_0_0, @owned C)
 // CHECK:   strong_release %2 : $C
 // CHECK:   destroy_addr %1 : $*T
-// CHECK:   copy_addr [take] %[[OUT]] to [initialization] %0 : $*T
-// CHECK:   dealloc_stack %[[OUT]] : $*T
 // CHECK:   return %[[R]] : $C
 // CHECK-LABEL: } // end sil function 'f072_callMixedResult1'
 sil @f072_callMixedResult1 : $@convention(thin) <T> (@in T, @owned C) -> (@out T, @owned C) {
@@ -262,21 +256,15 @@ bb0(%0 : $T, %1 : $C):
 
 // CHECK-LABEL: sil @f073_callMixedResult2 : $@convention(thin) <T> (@in T, @owned C) -> (@out T, @out T, @owned C, @owned C) {
 // CHECK: bb0(%0 : $*T, %1 : $*T, %2 : $*T, %3 : $C):
-// CHECK:   %[[OUT1:.*]] = alloc_stack $T
-// CHECK:   %[[OUT2:.*]] = alloc_stack $T
 // CHECK:   %[[F:.*]] = function_ref @f071_mixedResult2 : $@convention(thin) <τ_0_0> (@in τ_0_0, @owned C) -> (@out τ_0_0, @out τ_0_0, @owned C, @owned C)
 // CHECK:   retain_value_addr %2 : $*T
 // CHECK:   strong_retain %3 : $C
-// CHECK:   %[[R:.*]] = apply %[[F]]<T>(%[[OUT1]], %[[OUT2]], %2, %3) : $@convention(thin) <τ_0_0> (@in τ_0_0, @owned C) -> (@out τ_0_0, @out τ_0_0, @owned C, @owned C)
+// CHECK:   %[[R:.*]] = apply %[[F]]<T>(%0, %1, %2, %3) : $@convention(thin) <τ_0_0> (@in τ_0_0, @owned C) -> (@out τ_0_0, @out τ_0_0, @owned C, @owned C)
 // CHECK:   %[[T2:.*]] = tuple_extract %[[R]] : $(C, C), 1
 // CHECK:   %[[T1:.*]] = tuple_extract %[[R]] : $(C, C), 0
 // CHECK:   strong_release %3 : $C
 // CHECK:   destroy_addr %2 : $*T
-// CHECK:   copy_addr [take] %[[OUT1]] to [initialization] %0 : $*T
-// CHECK:   copy_addr [take] %[[OUT2]] to [initialization] %1 : $*T
 // CHECK:   %[[T:.*]] = tuple (%[[T1]] : $C, %[[T2]] : $C)
-// CHECK:   dealloc_stack %[[OUT2]] : $*T
-// CHECK:   dealloc_stack %[[OUT1]] : $*T
 // CHECK:   return %[[T]] : $(C, C)
 // CHECK-LABEL: } // end sil function 'f073_callMixedResult2'
 sil @f073_callMixedResult2 : $@convention(thin) <T> (@in T, @owned C) -> (@out T, @out T, @owned C, @owned C) {
@@ -735,4 +723,85 @@ bb3(%15 : $T):
   %take = function_ref @takeIn : $@convention(thin) <τ_0_0>(@in τ_0_0) -> ()
   %call = apply %take<T>(%1) : $@convention(thin) <τ_0_0>(@in τ_0_0) -> ()
   return %15 : $T
+}
+
+// Test switching on a single opaque value.
+// CHECK-LABEL: sil @f210_testSwitchEnum : $@convention(method) <T> (@in Optional<T>, @inout T) -> () {
+// CHECK: bb0(%0 : $*Optional<T>, %1 : $*T):
+// CHECK:   switch_enum_addr %0 : $*Optional<T>, case #Optional.some!enumelt.1: [[SOMEBB:bb[0-9]+]], case #Optional.none!enumelt: [[NONEBB:bb[0-9]+]]
+// CHECK: [[NONEBB]]:
+// CHECK:   br [[RETBB:bb[0-9]+]]
+// CHECK: [[SOMEBB]]:
+// CHECK:   [[CAST:%.*]] = unchecked_take_enum_data_addr %0 : $*Optional<T>, #Optional.some!enumelt.1
+// CHECK:   copy_addr [take] [[CAST]] to [initialization] %1 : $*T
+// CHECK:   br [[RETBB]]
+// CHECK: [[RETBB]]:
+// CHECK:   %{{.*}} = tuple ()
+// CHECK:   return %{{.*}} : $()
+// CHECK-LABEL: } // end sil function 'f210_testSwitchEnum'
+sil @f210_testSwitchEnum : $@convention(method) <T> (@in Optional<T>, @inout T) -> () {
+bb0(%0 : $Optional<T>, %1 : $*T):
+  switch_enum %0 : $Optional<T>, case #Optional.some!enumelt.1: bb2, case #Optional.none!enumelt: bb1
+
+bb1:
+  br bb3
+
+bb2(%14 : $T):
+  store %14 to %1 : $*T
+  br bb3
+
+bb3:
+  %31 = tuple ()
+  return %31 : $()
+}
+
+enum Mixed<T> {
+  case i(Int)
+  case t(T)
+  case o(AnyObject)
+};
+
+// f220_testSwitchMixed
+// CHECK-LABEL: sil @f220_testSwitchMixed : $@convention(method) <T> (@in Mixed<T>, @inout Builtin.Int64, @inout T) -> () {
+// CHECK: bb0(%0 : $*Mixed<T>, %1 : $*Builtin.Int64, %2 : $*T):
+// CHECK:   retain_value_addr %0 : $*Mixed<T>
+// CHECK:   switch_enum_addr %0 : $*Mixed<T>, case #Mixed.i!enumelt.1: [[IBB:bb[0-9]+]], case #Mixed.t!enumelt.1: [[TBB:bb[0-9]+]], default [[DBB:bb[0-9]+]]
+// CHECK: [[DBB]]:
+// CHECK:   br [[RBB:bb[0-9]+]]
+// CHECK: [[TBB]]:
+// CHECK:   [[CAST:%.*]] = unchecked_take_enum_data_addr %0 : $*Mixed<T>, #Mixed.t!enumelt.1
+// CHECK:   copy_addr [take] [[CAST]] to [initialization] %2 : $*T
+// CHECK:   destroy_addr [[CAST]] : $*T
+// CHECK:   br [[RBB]]
+// CHECK: [[IBB]]:
+// CHECK:   [[CAST:%.*]] = unchecked_take_enum_data_addr %0 : $*Mixed<T>, #Mixed.i!enumelt.1
+// CHECK:   [[VAL:%.*]] = load [[CAST]] : $*Builtin.Int64
+// CHECK:   store [[VAL]] to %1 : $*Builtin.Int64
+// CHECK:   br [[RBB]]
+// CHECK: [[RBB]]:
+// CHECK:   destroy_addr %0 : $*Mixed<T>
+// CHECK:   %{{.*}} = tuple ()
+// CHECK:   return %{{.*}} : $()
+// CHECK-LABEL: } // end sil function 'f220_testSwitchMixed'
+sil @f220_testSwitchMixed : $@convention(method) <T> (@in Mixed<T>, @inout Int, @inout T) -> () {
+bb0(%0 : $Mixed<T>, %1 : $*Int, %2 : $*T):
+  retain_value %0 : $Mixed<T>
+  switch_enum %0 : $Mixed<T>, case #Mixed.i!enumelt.1: bb1, case #Mixed.t!enumelt.1: bb2, default bb3
+
+bb1(%13 : $Int):
+  store %13 to %1 : $*Int
+  br bb4
+
+bb2(%14 : $T):
+  store %14 to %2 : $*T
+  release_value %14 : $T
+  br bb4
+
+bb3:
+  br bb4
+
+bb4:
+  release_value %0 : $Mixed<T>
+  %31 = tuple ()
+  return %31 : $()
 }
