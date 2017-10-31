@@ -90,6 +90,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "address-lowering"
+#include "swift/Basic/Range.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/PrettyStackTrace.h"
@@ -459,7 +460,7 @@ void OpaqueStorageAllocation::allocateOpaqueStorage() {
 /// address-typed argument by inserting a temporary load instruction.
 void OpaqueStorageAllocation::convertIndirectFunctionArgs() {
   // Insert temporary argument loads at the top of the function.
-  SILBuilder argBuilder(pass.F->getEntryBlock()->begin());
+  SILBuilderWithScope argBuilder(pass.F->getEntryBlock()->begin());
   argBuilder.setSILConventions(
       SILModuleConventions::getLoweredAddressConventions());
   argBuilder.setOpenedArchetypesTracker(&pass.openedArchetypesTracker);
@@ -770,7 +771,7 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg,
   // projection of that storage.
   if (auto *predBB = bbArg->getParent()->getSinglePredecessorBlock()) {
     if (auto *SEI = dyn_cast<SwitchEnumInst>(predBB->getTerminator())) {
-      Operand *incomingOper = SEI->getAllOperands()[0];
+      Operand *incomingOper = &SEI->getAllOperands()[0];
       assert(incomingOper->get() == bbArg->getSingleIncomingValue());
       storage.setComposedOperand(incomingOper);
       return;
@@ -964,7 +965,7 @@ OpaqueStorageAllocation::createStackAllocation(SILValue value,
 
   auto createAllocStack = [&](SILInstruction *allocPoint,
                               ArrayRef<SILInstruction *> deallocPoints) {
-    SILBuilder allocBuilder(allocPoint);
+    SILBuilderWithScope allocBuilder(allocPoint);
     allocBuilder.setSILConventions(
         SILModuleConventions::getLoweredAddressConventions());
     allocBuilder.setOpenedArchetypesTracker(&pass.openedArchetypesTracker);
@@ -973,7 +974,7 @@ OpaqueStorageAllocation::createStackAllocation(SILValue value,
         allocBuilder.createAllocStack(value.getLoc(), allocTy);
 
     for (SILInstruction *deallocPoint : deallocPoints) {
-      SILBuilder B(deallocPoint);
+      SILBuilderWithScope B(deallocPoint);
       B.createDeallocStack(value.getLoc(), allocInstr);
     }
     return allocInstr;
@@ -1027,12 +1028,21 @@ public:
 
   SILValue materializeAddress(SILValue origValue);
 
-protected:
-  SILValue materializeProjection(Operand *operand);
+  // Return the instruction that defines storage for this extract inst.
+  SILValue getStorageDef(SingleValueInstruction *extractInst) {
+    auto &storage = pass.valueStorageMap.getStorage(extractInst);
+    return storage.getComposedOperand()->get();
+  }
+
+  SILValue materializeProjectionFromSwitch(SwitchEnumInst *SEI,
+                                           SILBasicBlock *destBB);
+  SILValue materializeProjectionFromDef(Operand *operand);
+  SILValue materializeProjectionFromUse(Operand *operand);
 };
 } // anonymous namespace
 
-// Materialize an address pointing to initialized memory for this operand,
+// Given the operand of an aggregate instruction (struct, tuple, enum),
+// materialize an address pointing to initialized memory for this operand,
 // generating a projection and copy if needed.
 SILValue AddressMaterialization::initializeOperandMem(Operand *operand) {
   SILValue def = operand->get();
@@ -1044,12 +1054,12 @@ SILValue AddressMaterialization::initializeOperandMem(Operand *operand) {
     if (storage.isProjection() && storage.getComposedOperand() == operand)
       destAddr = storage.storageAddress;
     else {
-      destAddr = materializeProjection(operand);
+      destAddr = materializeProjectionFromUse(operand);
       B.createCopyAddr(operand->getUser()->getLoc(), storage.storageAddress,
                        destAddr, IsTake, IsInitialization);
     }
   } else {
-    destAddr = materializeProjection(operand);
+    destAddr = materializeProjectionFromUse(operand);
     B.createStore(operand->getUser()->getLoc(), operand->get(), destAddr,
                   StoreOwnershipQualifier::Unqualified);
   }
@@ -1061,14 +1071,69 @@ SILValue AddressMaterialization::initializeOperandMem(Operand *operand) {
 SILValue AddressMaterialization::materializeAddress(SILValue origValue) {
   ValueStorage &storage = pass.valueStorageMap.getStorage(origValue);
 
-  if (!storage.storageAddress)
-    storage.storageAddress =
-        materializeProjection(storage.getComposedOperand());
+  if (storage.storageAddress)
+    return storage.storageAddress;
 
+  Operand *composedOper = storage.getComposedOperand();
+
+  // Handle values that are composed by a user (struct/tuple/enum).
+  if (composedOper->getUser() == origValue->getDefiningInstruction())
+    storage.storageAddress = materializeProjectionFromUse(composedOper);
+
+  // SwitchEnum is special because the composed operand isn't actually an
+  // operand of origValue, which is itself a block argument.
+  else if (auto *SEI = dyn_cast<SwitchEnumInst>(composedOper->getUser())) {
+    auto *parentBB = cast<SILPHIArgument>(origValue)->getParent();
+    storage.storageAddress = materializeProjectionFromSwitch(SEI, parentBB);
+
+  } else {
+    // Anything else must be a value that is extracted from an aggregate.
+    storage.storageAddress = materializeProjectionFromDef(composedOper);
+  }
   return storage.storageAddress;
 }
 
-SILValue AddressMaterialization::materializeProjection(Operand *operand) {
+SILValue
+AddressMaterialization::materializeProjectionFromSwitch(SwitchEnumInst *SEI,
+                                                        SILBasicBlock *destBB) {
+  SILValue enumAddr =
+      pass.valueStorageMap.getStorage(SEI->getOperand()).storageAddress;
+  auto eltDecl = SEI->getUniqueCaseForDestination(destBB);
+  assert(eltDecl && "No unique case found for destination block");
+  return B.createUncheckedTakeEnumDataAddr(SEI->getLoc(), enumAddr,
+                                           eltDecl.get());
+}
+
+SILValue
+AddressMaterialization::materializeProjectionFromDef(Operand *operand) {
+  SILInstruction *user = operand->getUser();
+  switch (user->getKind()) {
+  default:
+    llvm_unreachable("Unexpected projection from def.");
+  case SILInstructionKind::StructExtractInst: {
+    auto *extractInst = cast<StructExtractInst>(user);
+    SILValue srcAddr = materializeAddress(extractInst->getOperand());
+
+    return B.createStructElementAddr(extractInst->getLoc(), srcAddr,
+                                     extractInst->getField(),
+                                     extractInst->getType().getAddressType());
+  }
+  case SILInstructionKind::TupleExtractInst: {
+    auto *extractInst = cast<TupleExtractInst>(user);
+    SILValue srcAddr = materializeAddress(extractInst->getOperand());
+
+    return B.createTupleElementAddr(extractInst->getLoc(), srcAddr,
+                                    extractInst->getFieldNo(),
+                                    extractInst->getType().getAddressType());
+  }
+  case SILInstructionKind::UncheckedEnumDataInst: {
+    llvm_unreachable("unchecked_enum_data unimplemented"); //!!!
+  }
+  }
+}
+
+SILValue
+AddressMaterialization::materializeProjectionFromUse(Operand *operand) {
   SILInstruction *user = operand->getUser();
 
   switch (user->getKind()) {
@@ -1076,7 +1141,7 @@ SILValue AddressMaterialization::materializeProjection(Operand *operand) {
 #ifndef NDEBUG
     user->dump();
 #endif
-    llvm_unreachable("Unexpected subobject composition.");
+    llvm_unreachable("Unexpected projection from use.");
   case SILInstructionKind::BranchInst: {
     auto *BI = cast<BranchInst>(user);
     unsigned bbArgIdx = BI->getArgIndexOfOperand(operand->getOperandNumber());
@@ -1128,12 +1193,6 @@ SILValue AddressMaterialization::materializeProjection(Operand *operand) {
         structInst->getLoc(), structAddr, *fieldIter,
         operand->get()->getType().getAddressType());
   }
-  case SILInstructionKind::SwitchEnumInst: {
-    auto *SEI = cast<SwitchEnumInst>(user);
-    SILValue enumAddr = materializeAddress(SEI->getOperand());
-    return B.createUncheckedTakeEnumDataAddr(SEI->getLoc(), enumAddr,
-                                             SEI->getElement());
-  }
   case SILInstructionKind::TupleInst: {
     auto *tupleInst = cast<TupleInst>(user);
     // Function return values.
@@ -1168,7 +1227,7 @@ namespace {
 class ApplyRewriter {
   AddressLoweringState &pass;
   ApplySite apply;
-  SILBuilder argBuilder;
+  SILBuilderWithScope argBuilder;
   AddressMaterialization addrMat;
 
   /// For now, we assume that the apply site is a normal apply.
@@ -1223,7 +1282,7 @@ static void insertStackDeallocationAtCall(AllocStackInst *allocInst,
 
   switch (applyInst->getKind()) {
   case SILInstructionKind::ApplyInst: {
-    SILBuilder deallocBuilder(&*std::next(lastUse->getIterator()));
+    SILBuilderWithScope deallocBuilder(&*std::next(lastUse->getIterator()));
     deallocBuilder.setSILConventions(
         SILModuleConventions::getLoweredAddressConventions());
     deallocBuilder.createDeallocStack(allocInst->getLoc(), allocInst);
@@ -1292,14 +1351,15 @@ void ApplyRewriter::canonicalizeResults(
     for (unsigned resultIdx : indices(directResultValues)) {
       SingleValueInstruction *result = directResultValues[resultIdx];
       if (!result) {
-        SILBuilder resultBuilder(std::next(SILBasicBlock::iterator(applyInst)));
+        SILBuilderWithScope resultBuilder(
+            std::next(SILBasicBlock::iterator(applyInst)));
         resultBuilder.setSILConventions(
             SILModuleConventions::getLoweredAddressConventions());
         result = resultBuilder.createTupleExtract(applyInst->getLoc(),
                                                   applyInst, resultIdx);
         directResultValues[resultIdx] = result;
       }
-      SILBuilder B(releaseInst);
+      SILBuilderWithScope B(releaseInst);
       B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
       B.emitDestroyValueOperation(releaseInst->getLoc(), result);
     }
@@ -1330,7 +1390,8 @@ SILValue ApplyRewriter::materializeIndirectResultAddress(
   if (origDirectResultVal) {
     // TODO: Find the try_apply's result block.
     // Build results outside-in to next stack allocations.
-    SILBuilder resultBuilder(std::next(SILBasicBlock::iterator(origCallInst)));
+    SILBuilderWithScope resultBuilder(
+        std::next(SILBasicBlock::iterator(origCallInst)));
     resultBuilder.setSILConventions(
         SILModuleConventions::getLoweredAddressConventions());
     // This is a formally indirect argument, but is loadable.
@@ -1380,7 +1441,7 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
 
   // Prepare to emit a new call instruction.
   SILLocation loc = origCallInst->getLoc();
-  SILBuilder callBuilder(origCallInst);
+  SILBuilderWithScope callBuilder(origCallInst);
   callBuilder.setSILConventions(
       SILModuleConventions::getLoweredAddressConventions());
 
@@ -1456,8 +1517,8 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
   // Replace all unmapped uses of the original call with uses of the new call.
   // 
   // TODO: handle bbargs from try_apply.
-  SILBuilder resultBuilder(
-    std::next(SILBasicBlock::iterator(origCallInst)));
+  SILBuilderWithScope resultBuilder(
+      std::next(SILBasicBlock::iterator(origCallInst)));
   resultBuilder.setSILConventions(
       SILModuleConventions::getLoweredAddressConventions());
 
@@ -1533,7 +1594,7 @@ void ReturnRewriter::rewriteReturn(ReturnInst *returnInst) {
     if (!isa<DeallocStackInst>(*insertPt))
       break;
   }
-  SILBuilder B(insertPt);
+  SILBuilderWithScope B(insertPt);
   B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
 
   // Gather direct function results.
@@ -1754,7 +1815,7 @@ protected:
 
     ValueStorage &storage = pass.valueStorageMap.getStorage(currOper->get());
     currOper->set(storage.storageAddress);
-    llvm::report_fatal_error("Untested.");
+    llvm::report_fatal_error("Untested."); //!!!
   }
 
   void visitDebugValueInst(DebugValueInst *debugInst) {
@@ -1847,54 +1908,11 @@ protected:
     llvm::report_fatal_error("Unimplemented SelectValue use.");
   }
 
-  void visitSwitchEnum(SwitchEnumInst *SEI) {
+  // Opaque enum operand to a switch_enum.
+  void visitSwitchEnumInst(SwitchEnumInst *SEI) {
     // The switch_enum should be rewritten to a switch_enum_addr here, but
     // because it's a terminator, it cannot be rewritten until its block
     // arguments are removed.
-
-    // Set this operand to Undef. Dead block arguments are removed after
-    // rewriting.
-    currOper->set(
-        SILUndef::get(currOper->get()->getType(), pass.F->getModule()));
-
-    for (unsigned caseIdx : range(switchEnumInst->getNumCases())) {
-      EnumElementDecl *caseDecl;
-      SILBasicBlock *caseBlock;
-      std::tie(caseDecl, caseBlock) = switchEnumInst->getCase(caseIdx);
-      if (caseBlock->getArguments().size() == 0)
-        continue;
-      if (caseDecl->hasAssociatedValues()) {
-        assert(caseBlock->getPHIArguments().size() == 1);
-        SILPHIArgument *caseArg = caseBlock->getPHIArguments()[0];
-
-        auto eltAddr = addrMat.materializeAddress(caseArg);
-        
-        SILBuilder B(caseBlock->begin());
-        B.setSILConventions(
-          SILModuleConventions::getLoweredAddressConventions());
-        auto *loadElt = B.createLoad(SEI->getLoc(), , branchArgs);
-        
-          SILType eltArgTy = uTy.getEnumElementType(elt, F.getModule());
-          SILType bbArgTy = dest->getArguments()[0]->getType();
-          require(eltArgTy == bbArgTy,
-                  "switch_enum destination bbarg must match case arg type");
-          require(!dest->getArguments()[0]->getType().isAddress(),
-                  "switch_enum destination bbarg type must not be an address");
-        }
-
-      }
-    }
-
-    // Rewrite any non-opaque cases now since we won't visit their defs.
-    auto *DefaultBB = SEI->hasDefault() ? SEI->getDefaultBB() : nullptr;
-    for (unsigned i : indices(SEI->getNumCases())
-      if (EdgeIdx != i)
-        Cases.push_back(S->getCase(i));
-      else
-        Cases.push_back(std::make_pair(S->getCase(i).first, NewDest));
-    if (EdgeIdx == S->getNumCases())
-      DefaultBB = NewDest;
-
   }
 
   void visitStoreInst(StoreInst *storeInst) {
@@ -1929,22 +1947,14 @@ protected:
 
   // Extract from an opaque struct.
   void visitStructExtractInst(StructExtractInst *extractInst) {
-    assert(!pass.valueStorageMap.contains(extractInst)
-           || extractInst->getOperand()
-                  == pass.valueStorageMap.getStorage(extractInst)
-                         .getComposedOperand()
-                         ->get());
-    SILValue srcAddr =
-        pass.valueStorageMap.getStorage(extractInst->getOperand())
-            .storageAddress;
-
-    auto *SEA = B.createStructElementAddr(
-        extractInst->getLoc(), srcAddr, extractInst->getField(),
-        extractInst->getType().getAddressType());
-    if (extractInst->getType().isAddressOnly(pass.F->getModule()))
-      markRewritten(extractInst, SEA);
-    else {
-      LoadInst *loadElement = B.createLoad(extractInst->getLoc(), SEA,
+    SILValue extractAddr =
+        addrMat.materializeProjectionFromDef(&extractInst->getOperandRef());
+    if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
+      assert(extractInst->getOperand() == addrMat.getStorageDef(extractInst));
+      markRewritten(extractInst, extractAddr);
+    } else {
+      assert(!pass.valueStorageMap.contains(extractInst));
+      LoadInst *loadElement = B.createLoad(extractInst->getLoc(), extractAddr,
                                            LoadOwnershipQualifier::Unqualified);
       extractInst->replaceAllUsesWith(loadElement);
       pass.markDead(extractInst);
@@ -1969,19 +1979,29 @@ protected:
     if (ApplySite::isa(currOper->get()))
       return;
 
-    // TODO: generate tuple_element_addr.
-    // generate copy_addr if we can't project.
-    llvm::report_fatal_error("Unimplemented TupleExtract use.");
+    SILValue extractAddr =
+        addrMat.materializeProjectionFromDef(&extractInst->getOperandRef());
+    if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
+      assert(extractInst->getOperand() == addrMat.getStorageDef(extractInst));
+      markRewritten(extractInst, extractAddr);
+    } else {
+      assert(!pass.valueStorageMap.contains(extractInst));
+      LoadInst *loadElement = B.createLoad(extractInst->getLoc(), extractAddr,
+                                           LoadOwnershipQualifier::Unqualified);
+      extractInst->replaceAllUsesWith(loadElement);
+      pass.markDead(extractInst);
+    }
+    llvm_unreachable("Untested."); //!!!
   }
 
   void visitUncheckedBitwiseCast(UncheckedBitwiseCastInst *uncheckedCastInst) {
-    llvm::report_fatal_error("Unimplemented UncheckedBitwiseCast use.");
+    llvm_unreachable("Unimplemented UncheckedBitwiseCast use.");
   }
 
   void visitUnconditionalCheckedCastValueInst(
       UnconditionalCheckedCastValueInst *checkedCastInst) {
 
-    llvm::report_fatal_error("Unimplemented UnconditionalCheckedCast use.");
+    llvm_unreachable("Unimplemented UnconditionalCheckedCast use.");
   }
 };
 } // end anonymous namespace
@@ -2014,6 +2034,9 @@ public:
   // Set the storage address for am opaque block arg and mark it rewritten.
   // Opaque block args are only removed after all instructions are rewritten.
   void rewriteBBArg(SILPHIArgument *bbArg) {
+    B.setInsertionPoint(bbArg->getParent()->begin());
+    // TODO: No debug scope for arguments?
+
     auto &storage = pass.valueStorageMap.getStorage(bbArg);
     assert(!storage.isRewritten());
     storage.storageAddress = addrMat.materializeAddress(bbArg);
@@ -2163,130 +2186,75 @@ protected:
 };
 } // end anonymous namespace
 
-// Given an array of terminator operand values, produce an array of
-// operands with those corresponding to deadArgIndices stripped out.
-static void filterDeadArgs(OperandValueArrayRef origArgs,
-                           ArrayRef<unsigned> deadArgIndices,
-                           SmallVectorImpl<SILValue> &newArgs) {
-  auto nextDeadArgI = deadArgIndices.begin();
-  for (unsigned i : indices(origArgs)) {
-    if (i == *nextDeadArgI) {
-      ++nextDeadArgI;
+// Rewrite switch_enum to switch_enum_addr. This can only happen after all
+// associated block arguments are removed.
+static void rewriteSwitchEnums(AddressLoweringState &pass) {
+  for (auto &bb : *pass.F) {
+    auto *SEI = dyn_cast<SwitchEnumInst>(bb.getTerminator());
+    if (!SEI)
       continue;
+
+    SILValue enumVal = SEI->getOperand();
+    auto &storage = pass.valueStorageMap.getStorage(enumVal);
+    assert(storage.isRewritten());
+    SILValue enumAddr = storage.storageAddress;
+
+    // TODO: We should be able to avoid locally copying the case pointers here.
+    SmallVector<std::pair<EnumElementDecl *, SILBasicBlock *>, 8> cases;
+    SmallVector<ProfileCounter, 8> caseCounters;
+
+    // Collect switch cases for rewriting and remove block arguments.
+    for (unsigned caseIdx : range(SEI->getNumCases())) {
+      EnumElementDecl *caseDecl;
+      SILBasicBlock *caseBB;
+      auto caseRecord = SEI->getCase(caseIdx);
+      std::tie(caseDecl, caseBB) = caseRecord;
+
+      cases.push_back(caseRecord);
+      caseCounters.push_back(SEI->getCaseCount(caseIdx));
+
+      if (caseBB->getArguments().size() == 0)
+        continue;
+
+      if (!caseDecl->hasAssociatedValues())
+        continue;
+
+      assert(caseBB->getPHIArguments().size() == 1);
+      SILPHIArgument *caseArg = caseBB->getPHIArguments()[0];
+
+      SILBuilderWithScope argBuilder(caseBB->begin());
+      argBuilder.setSILConventions(
+          SILModuleConventions::getLoweredAddressConventions());
+      AddressMaterialization addrMat(pass, argBuilder);
+
+      auto eltAddr = addrMat.materializeAddress(caseArg);
+
+      if (caseArg->getType().isAddressOnly(pass.F->getModule())) {
+        caseArg->replaceAllUsesWith(
+            SILUndef::get(caseArg->getType(), pass.F->getModule()));
+      } else {
+        // Rewrite any non-opaque cases now since we don't visit their defs.
+        auto *loadElt = argBuilder.createLoad(
+            SEI->getLoc(), eltAddr, LoadOwnershipQualifier::Unqualified);
+
+        caseArg->replaceAllUsesWith(loadElt);
+      }
+      caseBB->eraseArgument(0);
     }
-    newArgs.push_back(origArgs[i]);
+    auto *defaultBB = SEI->hasDefault() ? SEI->getDefaultBB() : nullptr;
+    auto defaultCounter =
+        SEI->hasDefault() ? SEI->getDefaultCount() : ProfileCounter();
+
+    SILBuilderWithScope B(SEI);
+    B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
+    B.createSwitchEnumAddr(SEI->getLoc(), enumAddr, defaultBB, cases,
+                           ArrayRef<ProfileCounter>(caseCounters),
+                           defaultCounter);
+    SEI->eraseFromParent();
+
+    if (auto *unusedI = enumVal->getDefiningInstruction())
+      pass.markDead(unusedI);
   }
-  assert(nextDeadArgI == deadArgIndices.end());
-}
-
-// Rewrite a BranchInst omitting dead arguments.
-static void removeBranchArgs(BranchInst *BI,
-                             SmallVectorImpl<unsigned> &deadArgIndices,
-                             AddressLoweringState &pass) {
-
-  llvm::SmallVector<SILValue, 4> branchArgs;
-  filterDeadArgs(BI->getArgs(), deadArgIndices, branchArgs);
-
-  SILBuilder B(BI);
-  B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
-  B.createBranch(BI->getLoc(), BI->getDestBB(), branchArgs);
-
-  BI->eraseFromParent();
-}
-
-// Rewrite a CondBranchInst omitting dead arguments.
-static void removeCondBranchArgs(CondBranchInst *CBI, SILBasicBlock *targetBB,
-                                 ArrayRef<unsigned> deadArgIndices,
-                                 AddressLoweringState &pass) {
-  SmallVector<SILValue, 8> trueArgs;
-  SmallVector<SILValue, 8> falseArgs;
-
-  if (targetBB == CBI->getTrueBB())
-    filterDeadArgs(CBI->getTrueArgs(), deadArgIndices, trueArgs);
-  else
-    trueArgs.append(CBI->getTrueArgs().begin(), CBI->getTrueArgs().end());
-
-  if (targetBB == CBI->getFalseBB())
-    filterDeadArgs(CBI->getFalseArgs(), deadArgIndices, falseArgs);
-  else
-    falseArgs.append(CBI->getFalseArgs().begin(), CBI->getFalseArgs().end());
-
-  SILBuilder B(CBI);
-  B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
-  B.createCondBranch(CBI->getLoc(), CBI->getCondition(), CBI->getTrueBB(),
-                     trueArgs, CBI->getFalseBB(), falseArgs,
-                     CBI->getTrueBBCount(), CBI->getFalseBBCount());
-  CBI->eraseFromParent();
-
-  llvm_unreachable("Untested"); //!!!
-}
-
-// Rewrite a SwitchEnumInst omitting dead arguments.
-//
-// Note: switch_enum should be rewriten by AddressOnlyUseRewriter. However, it
-// is an odd instruction that combines an operation on a data value with control
-// flow. Consequently, we can't rewrite the instruction until all normal
-// rewrites have taken place. Otherwise block arguments would be in an
-// inconsistent state.
-static void removeSwitchEnumArgs(SwitchEnumInst *SEI,
-                                 SmallVectorImpl<unsigned> &deadArgIndices,
-                                 AddressLoweringState &pass) {
-
-  llvm::SmallVector<SILValue, 4> branchArgs;
-  filterDeadArgs(BI->getArgs(), deadArgIndices, branchArgs);
-
-  SILBuilder B(BI);
-  B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
-  B.createBranch(BI->getLoc(), BI->getDestBB(), branchArgs);
-
-  EnumElementDecl *caseDecl;
-  SILBasicBlock *caseBlock;
-  for (unsigned caseIdx : range(switchEnumInst->getNumCases())) {
-    std::tie(caseDecl, caseBlock) = switchEnumInst->getCase(caseIdx);
-  }
-  B.createSwitchEnumAddr(SEI->getLoc(), SEI->getOperand(), DefaultBB, Cases);
-  SEI->eraseFromParent();
-}
-
-// Remove all opaque block arguments. Their inputs have already been substituted
-// with Undef.
-//
-// FIXME: Generalize to other terminator.
-static void removeOpaqueBBArgs(SILBasicBlock *bb, AddressLoweringState &pass) {
-  if (bb->isEntry())
-    return;
-
-  SmallVector<unsigned, 16> deadArgIndices;
-  for (auto *bbArg : bb->getArguments()) {
-    if (bbArg->getType().isAddressOnly(pass.F->getModule()))
-      deadArgIndices.push_back(bbArg->getIndex());
-  }
-  if (deadArgIndices.empty())
-    return;
-
-  // Iterate while modifying the predecessor's terminators.
-  for (auto predI = bb->pred_begin(), nextI = predI, predE = bb->pred_end();
-       predI != predE; predI = nextI) {
-    ++nextI;
-    auto *predTerm = predI->getTerminator();
-    switch (predTerm->getTermKind()) {
-    default:
-      llvm_unreachable("Unexpected block terminator.");
-
-    case TermKind::BranchInst:
-      removeBranchArgs(cast<BranchInst>(predTerm), deadArgIndices, pass);
-    
-    case TermKind::CondBranchInst:
-      removeCondBranchArgs(cast<CondBranchInst>(predTerm), bb, deadArgIndices,
-                           pass);
-    
-    case TermKind::SwitchEnumInst:
-      removeSwitchEnumArgs(cast<SwitchEnumInst>(predTerm), bb, deadArgIndices,
-                           pass);
-    }
-  }
-  for (unsigned deadArgIdx : deadArgIndices)
-    bb->eraseArgument(deadArgIdx);
 }
 
 static void rewriteFunction(AddressLoweringState &pass) {
@@ -2331,6 +2299,110 @@ static void rewriteFunction(AddressLoweringState &pass) {
   }
   if (pass.F->getLoweredFunctionType()->hasIndirectFormalResults())
     ReturnRewriter(pass).rewriteReturns();
+
+  // swift_enum's are left in tact until all their arguments are rewritten.
+  // Now they can be rewritten as switch_enum_addr.
+  rewriteSwitchEnums(pass);
+}
+
+// Given an array of terminator operand values, produce an array of
+// operands with those corresponding to deadArgIndices stripped out.
+static void filterDeadArgs(OperandValueArrayRef origArgs,
+                           ArrayRef<unsigned> deadArgIndices,
+                           SmallVectorImpl<SILValue> &newArgs) {
+  auto nextDeadArgI = deadArgIndices.begin();
+  for (unsigned i : indices(origArgs)) {
+    if (i == *nextDeadArgI) {
+      ++nextDeadArgI;
+      continue;
+    }
+    newArgs.push_back(origArgs[i]);
+  }
+  assert(nextDeadArgI == deadArgIndices.end());
+}
+
+// Rewrite a BranchInst omitting dead arguments.
+static void removeBranchArgs(BranchInst *BI,
+                             SmallVectorImpl<unsigned> &deadArgIndices,
+                             AddressLoweringState &pass) {
+
+  llvm::SmallVector<SILValue, 4> branchArgs;
+  filterDeadArgs(BI->getArgs(), deadArgIndices, branchArgs);
+
+  SILBuilderWithScope B(BI);
+  B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
+  B.createBranch(BI->getLoc(), BI->getDestBB(), branchArgs);
+
+  BI->eraseFromParent();
+}
+
+// Rewrite a CondBranchInst omitting dead arguments.
+static void removeCondBranchArgs(CondBranchInst *CBI, SILBasicBlock *targetBB,
+                                 ArrayRef<unsigned> deadArgIndices,
+                                 AddressLoweringState &pass) {
+  SmallVector<SILValue, 8> trueArgs;
+  SmallVector<SILValue, 8> falseArgs;
+
+  if (targetBB == CBI->getTrueBB())
+    filterDeadArgs(CBI->getTrueArgs(), deadArgIndices, trueArgs);
+  else
+    trueArgs.append(CBI->getTrueArgs().begin(), CBI->getTrueArgs().end());
+
+  if (targetBB == CBI->getFalseBB())
+    filterDeadArgs(CBI->getFalseArgs(), deadArgIndices, falseArgs);
+  else
+    falseArgs.append(CBI->getFalseArgs().begin(), CBI->getFalseArgs().end());
+
+  SILBuilderWithScope B(CBI);
+  B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
+  B.createCondBranch(CBI->getLoc(), CBI->getCondition(), CBI->getTrueBB(),
+                     trueArgs, CBI->getFalseBB(), falseArgs,
+                     CBI->getTrueBBCount(), CBI->getFalseBBCount());
+  CBI->eraseFromParent();
+
+  llvm_unreachable("Untested"); //!!!
+}
+
+// Remove all opaque block arguments. Their inputs have already been substituted
+// with Undef.
+//
+// FIXME: Generalize to other terminator.
+static void removeOpaqueBBArgs(SILBasicBlock *bb, AddressLoweringState &pass) {
+  if (bb->isEntry())
+    return;
+
+  SmallVector<unsigned, 16> deadArgIndices;
+  for (auto *bbArg : bb->getArguments()) {
+    if (bbArg->getType().isAddressOnly(pass.F->getModule()))
+      deadArgIndices.push_back(bbArg->getIndex());
+  }
+  if (deadArgIndices.empty())
+    return;
+
+  // Iterate while modifying the predecessor's terminators.
+  for (auto predI = bb->pred_begin(), nextI = predI, predE = bb->pred_end();
+       predI != predE; predI = nextI) {
+    ++nextI;
+    auto *predTerm = (*predI)->getTerminator();
+    switch (predTerm->getTermKind()) {
+    default:
+      llvm_unreachable("Unexpected block terminator.");
+
+    case TermKind::BranchInst:
+      removeBranchArgs(cast<BranchInst>(predTerm), deadArgIndices, pass);
+      break;
+    case TermKind::CondBranchInst:
+      removeCondBranchArgs(cast<CondBranchInst>(predTerm), bb, deadArgIndices,
+                           pass);
+      break;
+    case TermKind::SwitchEnumInst:
+      llvm_unreachable("switch_enum arguments are removed when the terminator "
+                       "is rewritten.");
+      break;
+    }
+  }
+  for (unsigned deadArgIdx : deadArgIndices)
+    bb->eraseArgument(deadArgIdx);
 }
 
 //===----------------------------------------------------------------------===//
