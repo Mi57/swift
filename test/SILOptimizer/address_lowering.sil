@@ -805,3 +805,65 @@ bb4:
   %31 = tuple ()
   return %31 : $()
 }
+
+sil @throwsError : $@convention(thin) <T> (@in T) -> (@out T, @error Error)
+sil @returnInt : $@convention(thin) <T> (@in T) -> (Int, @error Error)
+sil @returnIntOut : $@convention(thin) <T> (@in T) -> (@out Int, @error Error)
+sil @returnTuple : $@convention(thin) <T> (@in T) -> (@out T, Int, @out Int, @out T, @error Error)
+
+//!!!
+sil @testTryApply : $@convention(thin) <T> (@in T) -> (@out T, @error Error) {
+bb0(%0 : $T):
+  %3 = function_ref @throwsError : $@convention(thin) <T> (@in T) -> (@out T, @error Error)
+  try_apply %3<T>(%0) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @error Error), normal bb1, error bb2
+
+bb1(%5 : $T):
+  return %5 : $T
+
+bb2(%7 : $Error):
+  throw %7 : $Error
+}
+
+//!!!
+sil @testTryApplyDirect : $@convention(thin) <T> (@in T) -> (Int, @error Error) {
+bb0(%0 : $T):
+  %3 = function_ref @returnInt : $@convention(thin) <T> (@in T) -> (Int, @error Error)
+  try_apply %3<T>(%0) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (Int, @error Error), normal bb1, error bb2
+
+bb1(%5 : $Int):
+  return %5 : $Int
+
+bb2(%7 : $Error):
+  throw %7 : $Error
+}
+
+//!!!
+sil @testTryApplyIndirect : $@convention(thin) <T> (@in T) -> (Int, @error Error) {
+bb0(%0 : $T):
+  %3 = function_ref @returnIntOut : $@convention(thin) <T> (@in T) -> (@out Int, @error Error)
+  try_apply %3<T>(%0) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out Int, @error Error), normal bb1, error bb2
+
+bb1(%5 : $Int):
+  return %5 : $Int
+
+bb2(%7 : $Error):
+  throw %7 : $Error
+}
+
+//!!!
+sil @testTryApplyTuple : $@convention(thin) <T> (@in T) -> (@out T, @error Error) {
+bb0(%0 : $T):
+  %1 = function_ref @returnTuple : $@convention(thin) <T> (@in T) -> (@out T, Int, @out Int, @out T, @error Error)
+  try_apply %1<T>(%0) : $@convention(thin) <T> (@in T) -> (@out T, Int, @out Int, @out T, @error Error), normal bb1, error bb2
+
+bb1(%3 : $(T, Int, Int, T)):
+  %4 = tuple_extract %3 : $(T, Int, Int, T), 0
+  %5 = tuple_extract %3 : $(T, Int, Int, T), 1
+  %6 = tuple_extract %3 : $(T, Int, Int, T), 2
+  %7 = tuple_extract %3 : $(T, Int, Int, T), 3
+  release_value %4 : $T
+  return %7 : $T
+
+bb2(%9 : $Error):
+  throw %9 : $Error
+}
