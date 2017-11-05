@@ -1182,7 +1182,8 @@ SILInstruction *ValueLifetimeAnalysis:: findLastUserInBlock(SILBasicBlock *BB) {
 }
 
 bool ValueLifetimeAnalysis::computeFrontier(Frontier &Fr, Mode mode,
-                                            DeadEndBlocks *DEBlocks) {
+                                            DeadEndBlocks *DEBlocks,
+                                            DominanceInfo *DT) {
   assert(!isAliveAtBeginOfBlock(DefValue->getFunction()->getEntryBlock()) &&
          "Can't compute frontier for def which does not dominate all uses");
 
@@ -1275,7 +1276,7 @@ bool ValueLifetimeAnalysis::computeFrontier(Frontier &Fr, Mode mode,
       if (UnhandledFrontierBlocks.count(SuccBlocks[i])) {
         assert(mode == AllowToModifyCFG);
         assert(isCriticalEdge(T, i) && "actually not a critical edge?");
-        SILBasicBlock *NewBlock = splitEdge(T, i);
+        SILBasicBlock *NewBlock = splitEdge(T, i, DT);
         // The single terminator instruction is part of the frontier.
         Fr.push_back(&*NewBlock->begin());
         NoCriticalEdges = false;
