@@ -23,8 +23,8 @@
 // storage reuse optimization, which is not currently implemented. Note: We
 // probably won't need to implement the [REUSE] optimizations at all. The
 // currently implemented SSA-based on-the-fly optimization and
-// BasicBlockOptimier already record storage projections and are doing a good
-// job. LLVM should handle the stack coloring aspect.
+// BlockArgumentStorageOptimizer already record storage projections and are
+// doing a good job. LLVM should handle the stack coloring aspect.
 //
 // ## State
 //
@@ -44,6 +44,13 @@
 //  projection of.
 //
 // - The storage address for this subobject.
+//
+// Note: During all steps below, the values referenced in the valueStorageMap
+// must remain valid. Each storage map entry refers to a valid value, with the
+// same number of operands. Storage map entries that refer to function arguments
+// or block arguments may be replaced with loads without violating this
+// invariant. After the final step, all original address-only values are
+// deleted.
 //
 // ## Step #1: Map opaque values
 //
@@ -204,79 +211,90 @@ static bool isPseudoCallResult(SILValue value) {
          && bbArg->getType().is<TupleType>();
 }
 
+/// Return the SILValue that reprents the "user" of the given operand. When the
+/// operand's use is a SingleValueInstruction, the value is the user
+/// itself. When the operand's use is a block terminator, it is the
+/// corresponding block argument that represents the operand's value.
+///
+/// For multi-value instructions, return an invalid SILValue. The caller will
+/// need to deal with those.
+///
+/// TODO: Make this a utility or at least add
+/// CondBranchInst::getBlockArgForOperand?
+SILValue getUsingValue(Operand *operand) {
+  SILInstruction *user = operand->getUser();
+  auto *singleVal = dyn_cast<SingleValueInstruction>(user);
+  if (singleVal)
+    return singleVal;
+
+  // The caller needs to handle multi-value instructions.
+  if (!isa<TermInst>(user))
+    return SILValue();
+
+  switch (user->getKind()) {
+  default:
+#ifndef NDEBUG
+    user->dump();
+#endif
+    llvm_unreachable("Unexpected block terminator with address-only operand.");
+
+  case SILInstructionKind::BranchInst: {
+    auto *BI = cast<BranchInst>(user);
+    unsigned bbArgIdx = BI->getArgIndexOfOperand(operand->getOperandNumber());
+    return BI->getDestBB()->getArgument(bbArgIdx);
+  }
+  case SILInstructionKind::CondBranchInst: {
+    auto *CBI = cast<CondBranchInst>(user);
+    unsigned opIdx = operand->getOperandNumber();
+    unsigned bbArgIdx;
+    if (CBI->isTrueOperandIndex(opIdx)) {
+      bbArgIdx = opIdx - CBI->getTrueOperands()[0].getOperandNumber();
+      return CBI->getTrueBB()->getArgument(bbArgIdx);
+    } else {
+      assert(CBI->isFalseOperandIndex(opIdx));
+      bbArgIdx = opIdx - CBI->getFalseOperands()[0].getOperandNumber();
+      return CBI->getFalseBB()->getArgument(bbArgIdx);
+    }
+  }
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // ValueStorageMap: Map Opaque/Resilient SILValues to abstract storage units.
 //===----------------------------------------------------------------------===//
 
 namespace {
+// Avoid storing operand references in case some def-use rewritting occurs
+// before formal rewritting.
 struct ValueStorage {
-  enum {
-    IsUseProjectionMask = 0x1,
-    IsDefProjectionMask = 0x2,
-    IsRewrittenMask = 0x4
-  };
-  PointerIntPair<Operand *, 3, unsigned> projectionAndFlags;
-
   /// The final address of this storage unit after rewriting the SIL.
   /// For values linked to their own storage, this is set during storage
   /// allocation. For projections, it is only set after instruction rewriting.
   SILValue storageAddress;
+  uint32_t projectedStorageID;
+  uint16_t projectedUseOperandNum;
+  unsigned isUseProjection : 1;
+  unsigned isDefProjection : 1;
+  unsigned isRewritten : 1;
 
-  bool isProjection() const {
-    return projectionAndFlags.getInt()
-           & (IsUseProjectionMask | IsDefProjectionMask);
-  }
-  bool isUseProjection() const {
-    return projectionAndFlags.getInt() & IsUseProjectionMask;
-  }
-  bool isDefProjection() const {
-    return projectionAndFlags.getInt() & IsDefProjectionMask;
-  }
-  /// Return the operand that composes an aggregate from this value; this value
-  /// is the operand def.
-  Operand *getComposedUseOperand() const {
-    assert(isUseProjection() && !isRewritten());
-
-    return projectionAndFlags.getPointer();
-  }
-  /// Return the operand that borrows this value; this value is either the
-  /// operand's use or it is a block argument corresponding to the operand block
-  /// terminator use.
-  Operand *getExtractedDefOperand() const {
-    assert(isDefProjection() && !isRewritten());
-
-    return projectionAndFlags.getPointer();
-  }
-  void setComposedUseOperand(Operand *oper) {
-    assert(!isRewritten());
-
-    projectionAndFlags.setPointer(oper);
-    projectionAndFlags.setInt(projectionAndFlags.getInt()
-                              | IsUseProjectionMask);
-  }
-  void setExtractedDefOperand(Operand *oper) {
-    assert(!isRewritten());
-
-    projectionAndFlags.setPointer(oper);
-    projectionAndFlags.setInt(projectionAndFlags.getInt()
-                              | IsDefProjectionMask);
-  }
-
-  bool isRewritten() const {
-    if (projectionAndFlags.getInt() & IsRewrittenMask) {
-      assert(storageAddress);
-      return true;
-    }
-    return false;
-  }
-  void markRewritten() {
-    projectionAndFlags.setInt(projectionAndFlags.getInt() | IsRewrittenMask);
-  }
+  ValueStorage() { clear(); }
 
   void clear() {
-    projectionAndFlags.setPointer(nullptr);
-    projectionAndFlags.setInt(0);
     storageAddress = nullptr;
+    projectedStorageID = ~0;
+    projectedUseOperandNum = ~0;
+    isUseProjection = false;
+    isDefProjection = false;
+    isRewritten = false;
+  }
+
+  bool isAllocated() const {
+    return isRewritten || isUseProjection || isDefProjection;
+  }
+
+  void markRewritten() {
+    assert(storageAddress);
+    isRewritten = true;
   }
 };
 
@@ -287,7 +305,11 @@ struct ValueStorage {
 /// This doesn't have an eraseValue because it values are expected to be created
 /// at once in RPO order so that instructions are succesfully deleted later.
 class ValueStorageMap {
-  typedef std::vector<std::pair<SILValue, ValueStorage>> ValueVector;
+  struct ValueStoragePair {
+    SILValue value;
+    ValueStorage storage;
+  };
+  typedef std::vector<ValueStoragePair> ValueVector;
   // Hash of values to ValueVector indices.
   typedef llvm::DenseMap<SILValue, unsigned> ValueHashMap;
 
@@ -324,7 +346,7 @@ public:
   }
 
   ValueStorage &getStorage(SILValue value) {
-    return valueVector[getOrdinal(value)].second;
+    return valueVector[getOrdinal(value)].storage;
   }
 
   // This must be called in RPO order.
@@ -336,7 +358,7 @@ public:
 
     valueVector.emplace_back(value, ValueStorage());
 
-    return valueVector.back().second;
+    return valueVector.back().storage;
   }
 
   void replaceValue(SILValue oldValue, SILValue newValue) {
@@ -350,21 +372,38 @@ public:
     assert(hashResult.second && "SILValue already mapped");
   }
 
+  // Follow one level of storage projection. The returned storage may also be a
+  // projection.
+  ValueStoragePair &getProjectedStorage(ValueStorage &storage) {
+    assert(storage.isUseProjection || storage.isDefProjection);
+    return valueVector[storage.projectedStorageID];
+  }
+
+  // Record a storage projection from the given single value instruction operand
+  // into the given ValueStorage.
+  void setComposedUseProjection(Operand *oper) {
+    auto &storage = getStorage(oper->get());
+    storage.projectedStorageID =
+        getOrdinal(cast<SingleValueInstruction>(oper->getUser()));
+    storage.isUseProjection = true;
+  }
+
 #ifndef NDEBUG
   void dump() {
     llvm::dbgs() << "ValueStorageMap:\n";
-    for (auto &valStoragePair : valueVector) {
+    for (unsigned ordinal : indices(valueVector)) {
+      auto &valStoragePair = valueVector[ordinal];
       llvm::dbgs() << "value: ";
-      valStoragePair.first->dump();
-      auto &storage = valStoragePair.second;
-      if (storage.isUseProjection()) {
+      valStoragePair.value->dump();
+      auto &storage = valStoragePair.storage;
+      if (storage.isUseProjection) {
         llvm::dbgs() << "  use projection: ";
-        if (!storage.isRewritten())
-          storage.getComposedUseOperand()->getUser()->dump();
-      } else if (storage.isDefProjection()) {
+        if (!storage.isRewritten)
+          valueVector[storage.projectedStorageID].value->dump();
+      } else if (storage.isDefProjection) {
         llvm::dbgs() << "  def projection: ";
-        if (!storage.isRewritten())
-          storage.getExtractedDefOperand()->get()->dump();
+        if (!storage.isRewritten)
+          valueVector[storage.projectedStorageID].value->dump();
       }
       if (storage.storageAddress) {
         llvm::dbgs() << "  storage: ";
@@ -703,12 +742,10 @@ protected:
   unsigned insertIndirectReturnArgs();
   bool canProjectFrom(std::function<bool(SILValue)> checkDom,
                       SILInstruction *composingUse);
-  template <typename C>
-  bool setProjectionFromUser(C innerVals, SILValue value,
-                             ValueStorage &storage);
-  void allocateForBBArg(SILPHIArgument *bbArg, ValueStorage &storage);
-  void allocateForValue(SILValue value, ValueStorage &storage);
-  AllocStackInst *createStackAllocation(SILValue value, ValueStorage &storage);
+  template <typename C> bool setProjectionFromUser(C innerVals, SILValue value);
+  void allocateForBBArg(SILPHIArgument *bbArg);
+  void allocateForValue(SILValue value);
+  AllocStackInst *createStackAllocation(SILValue value);
 };
 } // end anonymous namespace
 
@@ -728,12 +765,11 @@ void OpaqueStorageAllocation::allocateOpaqueStorage() {
   // 
   // WARNING: This may split critical edges (in ValueLifetimeAnalysis).
   for (auto &valueStorageI : reversed(pass.valueStorageMap)) {
-    SILValue value = valueStorageI.first;
-    ValueStorage &storage = valueStorageI.second;
+    SILValue value = valueStorageI.value;
     if (auto *bbArg = dyn_cast<SILPHIArgument>(value))
-      allocateForBBArg(bbArg, storage);
+      allocateForBBArg(bbArg);
     else
-      allocateForValue(value, valueStorageI.second);
+      allocateForValue(value);
   }
 }
 
@@ -804,6 +840,9 @@ unsigned OpaqueStorageAllocation::insertIndirectReturnArgs() {
 //
 // \param checkDom Function that checks if the specified storage definition
 // dominates all necessary uses.
+//
+// This does not allow projections from terminators. That is handled by
+// BlockStorageOptimizer.
 bool OpaqueStorageAllocation::canProjectFrom(
     std::function<bool(SILValue)> checkDom, SILInstruction *composingUse) {
   if (!OptimizeOpaqueAddressLowering)
@@ -849,17 +888,19 @@ bool OpaqueStorageAllocation::canProjectFrom(
     if (isa<SILFunctionArgument>(addr)) {
       return true;
     }
-  } else if (storage.isUseProjection())
-    return canProjectFrom(checkDom, storage.getComposedUseOperand()->getUser());
-
+  } else if (storage.isUseProjection) {
+    SILValue projVal = pass.valueStorageMap.getProjectedStorage(storage).value;
+    return canProjectFrom(checkDom, projVal);
+  }
   return false;
 }
 
 /// Find a use of this value that can provide storage for this value.
-// `C` is a Range of SILValues. e.g. ArrayRef<SILValue>.
+// \param C is a Range of SILValues. e.g. ArrayRef<SILValue>.
+// \param storage is the given value's storage.
 template <typename C>
-bool OpaqueStorageAllocation::setProjectionFromUser(C innerVals, SILValue value,
-                                                    ValueStorage &storage) {
+bool OpaqueStorageAllocation::setProjectionFromUser(C innerVals,
+                                                    SILValue value) {
 
   auto checkDom = [&](SILValue storageDef) {
     for (SILValue innerVal : innerVals) {
@@ -883,7 +924,7 @@ bool OpaqueStorageAllocation::setProjectionFromUser(C innerVals, SILValue value,
     if (canProjectFrom(checkDom, use->getUser())) {
       DEBUG(llvm::dbgs() << "  PROJECT "; use->getUser()->dump();
             llvm::dbgs() << "  into "; value->dump());
-      storage.setComposedUseOperand(use);
+      pass.valueStorageMap.setComposedUseProjection(use);
       return true;
     }
   }
@@ -892,8 +933,7 @@ bool OpaqueStorageAllocation::setProjectionFromUser(C innerVals, SILValue value,
 
 // Allocate storage for a BB arg. Unlike normal values, this checks all the
 // incoming values to determine whether any are also candidates for projection.
-void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg,
-                                               ValueStorage &storage) {
+void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
   if (auto *predBB = bbArg->getParent()->getSinglePredecessorBlock()) {
     // switch_enum arguments are different than normal phi-like arguments. The
     // incoming value uses its own storage, and the block argument is always a
@@ -910,8 +950,8 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg,
     if (isa<TryApplyInst>(predBB->getTerminator())) {
       // FIXME: multi-result calls.
       if (!bbArg->getType().is<TupleType>()) {
-        if (!setProjectionFromUser(ArrayRef<SILValue>(bbArg), bbArg, storage))
-          storage.storageAddress = createStackAllocation(bbArg, storage);
+        if (!setProjectionFromUser(ArrayRef<SILValue>(bbArg), bbArg))
+          storage.storageAddress = createStackAllocation(bbArg);
       }
       return;
     }
@@ -923,7 +963,7 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg,
   //
   // The incoming value projections are computed first to give them
   // priority. Then we determine if the block argument itself can share storage
-  // with one of its users, given that it may already has projections to
+  // with one of its users, given that it may already have projections to
   // incoming values.
   //
   // The single-incoming value case (including try_apply results) will be
@@ -931,17 +971,14 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg,
   auto argStorageResult =
       BlockArgumentStorageOptimizer(bbArg).computeArgumentProjections();
 
-  if (!setProjectionFromUser(argStorageResult.getIncomingValueRange(), bbArg,
-                             storage)) {
-    storage.storageAddress = createStackAllocation(bbArg, storage);
+  if (!setProjectionFromUser(argStorageResult.getIncomingValueRange(), bbArg)) {
+    storage.storageAddress = createStackAllocation(bbArg);
   }
 
   // Regardless of whether we projected from a user or allocated storage,
   // provide this storage to all the incoming values that can reuse it.
-  for (Operand *argOper : argStorageResult.getArgumentProjections()) {
-    auto &storage = pass.valueStorageMap.getStorage(argOper->get());
-    storage.setComposedUseOperand(argOper);
-  }
+  for (Operand *argOper : argStorageResult.getArgumentProjections())
+    pass.valueStorageMap.setComposedUseProjection(argOper);
 }
 
 static Operand *getBorrowedStorageOperand(SILValue value) {
@@ -985,17 +1022,6 @@ static bool canProjectTo(SILValue value, ValueStorage &storage) {
     }
   }
 
-  // TupleExtract from an apply are handled specially until we have multi-result
-  // calls. Force them to allocate storage.
-  //
-  // FIXME: Remove this case. We should be able reuse storage for out args.
-#if 0 //!!!
-  if (auto *TEI = dyn_cast<TupleExtractInst>(value)) {
-    if (ApplySite::isa(TEI->getOperand())) {
-      return false;
-    }
-  }
-#endif
   // Values that borrow their operand inherit storage from that operand, not
   // their use.
   if (getBorrowedStorageOperand(value))
@@ -1005,23 +1031,24 @@ static bool canProjectTo(SILValue value, ValueStorage &storage) {
 }
 
 /// Allocate storage for a single opaque/resilient value.
-void OpaqueStorageAllocation::allocateForValue(SILValue value,
-                                               ValueStorage &storage) {
+void OpaqueStorageAllocation::allocateForValue(SILValue value) {
   // Function args are not inserted in valuestorageMap. Instead, a
   // proxy load instruction is inserted.
   assert(!isa<SILFunctionArgument>(value));
+
+  auto &storage = pass.valueStorageMap.getStorage(value);
 
   // Function and argument loads already have a storage address before
   // allocating value storage.
   //
   // Inputs to block arguments may have already projected storage from the block
   // arguments.
-  if (storage.storageAddress || storage.isProjection())
+  if (storage.isAllocated())
     return;
 
   // Attempt to reuse a user's storage.
   if (canProjectTo(value, storage)
-      && setProjectionFromUser(ArrayRef<SILValue>(value), value, storage)) {
+      && setProjectionFromUser(ArrayRef<SILValue>(value), value)) {
     return;
   }
   // Temporary special case. Result tuples will be canonicalized during apply
@@ -1039,16 +1066,14 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
     return;
   }
 
-  storage.storageAddress = createStackAllocation(value, storage);
+  storage.storageAddress = createStackAllocation(value);
 }
 
 // Create alloc_stack and jointly-postdominating dealloc_stack instructions.
 // Nesting will be fixed later.
 // 
 // This may split critical edges. If so, it updates pass.domInfo.
-AllocStackInst *
-OpaqueStorageAllocation::createStackAllocation(SILValue value,
-                                               ValueStorage &storage) {
+AllocStackInst *OpaqueStorageAllocation::createStackAllocation(SILValue value) {
   SILType allocTy = value->getType();
   auto *defInst = value->getDefiningInstruction();
 
@@ -1235,36 +1260,16 @@ SILValue
 AddressMaterialization::materializeProjectionFromUse(Operand *operand) {
   SILInstruction *user = operand->getUser();
 
-  switch (user->getKind()) {
-  default:
+  // Recurse through block arguments.
+  if (isa<TermInst>(user))
+    return materializeAddress(getUsingValue(operand))
+
+        switch (user->getKind()) {
+    default:
 #ifndef NDEBUG
     user->dump();
 #endif
     llvm_unreachable("Unexpected projection from use.");
-  case SILInstructionKind::BranchInst: {
-    // Materialize the address of the projected block argument corresponding to
-    // this branch operand.
-    auto *BI = cast<BranchInst>(user);
-    unsigned bbArgIdx = BI->getArgIndexOfOperand(operand->getOperandNumber());
-    return materializeAddress(BI->getDestBB()->getArgument(bbArgIdx));
-  }
-  case SILInstructionKind::CondBranchInst: {
-    // Materialize the address of the projected block argument corresponding to
-    // this branch operand.
-    // 
-    // TODO: Add CondBranchInst::getBlockArgForOperand?
-    auto *CBI = cast<CondBranchInst>(user);
-    unsigned opIdx = operand->getOperandNumber();
-    unsigned bbArgIdx;
-    if (CBI->isTrueOperandIndex(opIdx)) {
-      bbArgIdx = opIdx - CBI->getTrueOperands()[0].getOperandNumber();
-      return materializeAddress(CBI->getTrueBB()->getArgument(bbArgIdx));
-    } else {
-      assert(CBI->isFalseOperandIndex(opIdx));
-      bbArgIdx = opIdx - CBI->getFalseOperands()[0].getOperandNumber();
-      return materializeAddress(CBI->getFalseBB()->getArgument(bbArgIdx));
-    }
-  }
   case SILInstructionKind::EnumInst: {
     auto *enumInst = cast<EnumInst>(user);
     SILValue enumAddr = materializeAddress(enumInst);
@@ -2038,7 +2043,6 @@ protected:
   }
 
   void visitDestroyValueInst(DestroyValueInst *destroyInst) {
-    // FIXME!!! Don't expect to see these any more.
     llvm_unreachable("Unexpected destroy_value");
   }
 
@@ -2506,7 +2510,7 @@ static void rewriteFunction(AddressLoweringState &pass) {
 
   // For each opaque value, rewrite its users and its defining instruction.
   for (auto &valueStorageI : pass.valueStorageMap) {
-    SILValue valueDef = valueStorageI.first;
+    SILValue valueDef = valueStorageI.value;
 
     // TODO: MultiValueInstruction: ApplyInst
     if (auto *inst = dyn_cast<SingleValueInstruction>(valueDef))
@@ -2662,7 +2666,7 @@ static void deleteRewrittenInstructions(AddressLoweringState &pass) {
   // Add the rest of the instructions to the dead list in post order.
   // FIXME: make sure we cleaned up address-only BB arguments.
   for (auto &valueStorageI : reversed(pass.valueStorageMap)) {
-    SILValue val = valueStorageI.first;
+    SILValue val = valueStorageI.value;
     // If the storage was explicitly erased, skip it. (e.g. replaced bb args).
     if (!pass.valueStorageMap.contains(val))
       continue;
