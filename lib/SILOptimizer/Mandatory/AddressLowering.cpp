@@ -401,8 +401,12 @@ struct AddressLoweringState {
   // already be dead (no remaining users) before being added to this set.
   SmallSetVector<SILInstruction *, 16> instsToDelete;
 
+#ifndef NDEBUG
   // Calls are removed after everything else.
+  // FIXME: MultiValue. Until calls are deleted like all other values, they need
+  // to be carefully orchestrated w.r.t. their tuple values.
   SmallSetVector<ApplyInst *, 16> callsToDelete;
+#endif
 
   AddressLoweringState(SILFunction *F, DominanceInfo *domInfo)
       : F(F),
@@ -1116,21 +1120,24 @@ public:
 
   SILValue materializeAddress(SILValue origValue);
 
-  // Return the instruction that defines storage for this extract inst.
+#ifndef NDEBUG
+  /// Return the instruction that defines storage for this extract inst.
+  /// This should match the extract instruction's operand.
   SILValue getStorageDef(SingleValueInstruction *extractInst) {
     auto &storage = pass.valueStorageMap.getStorage(extractInst);
     return storage.getExtractedDefOperand()->get();
   }
+#endif
 
   SILValue materializeProjectionFromDef(Operand *operand, SILValue origValue);
   SILValue materializeProjectionFromUse(Operand *operand);
 };
 } // anonymous namespace
 
-// Given the operand of an aggregate instruction (struct, tuple, enum),
-// materialize an address pointing to memory for this operand and ensure that
-// this memory is initialized with the subobject. Generates the address
-// projection and copy if needed.
+/// Given the operand of an aggregate instruction (struct, tuple, enum),
+/// materialize an address pointing to memory for this operand and ensure that
+/// this memory is initialized with the subobject. Generates the address
+/// projection and copy if needed.
 SILValue AddressMaterialization::initializeOperandMem(Operand *operand) {
   SILValue def = operand->get();
   SILValue destAddr;
@@ -1175,7 +1182,7 @@ SILValue AddressMaterialization::materializeAddress(SILValue origValue) {
 }
 
 /// Materialize the address of a subobject extracted from this operand by this
-/// operand's user. origValue will be the value associated with the
+/// operand's user. origValue is be the value associated with the subobject
 /// storage. Normally it will be the operand's user, except when it is a block
 /// argument for a switch_enum.
 SILValue
@@ -1234,13 +1241,18 @@ AddressMaterialization::materializeProjectionFromUse(Operand *operand) {
 #endif
     llvm_unreachable("Unexpected projection from use.");
   case SILInstructionKind::BranchInst: {
+    // Materialize the address of the projected block argument corresponding to
+    // this branch operand.
     auto *BI = cast<BranchInst>(user);
     unsigned bbArgIdx = BI->getArgIndexOfOperand(operand->getOperandNumber());
     return materializeAddress(BI->getDestBB()->getArgument(bbArgIdx));
   }
   case SILInstructionKind::CondBranchInst: {
-    auto *CBI = cast<CondBranchInst>(user);
+    // Materialize the address of the projected block argument corresponding to
+    // this branch operand.
+    // 
     // TODO: Add CondBranchInst::getBlockArgForOperand?
+    auto *CBI = cast<CondBranchInst>(user);
     unsigned opIdx = operand->getOperandNumber();
     unsigned bbArgIdx;
     if (CBI->isTrueOperandIndex(opIdx)) {
@@ -1733,21 +1745,34 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
     extractInst->replaceAllUsesWith(newResultVal);
     extractInst->eraseFromParent();
   }
-
+  
   // If this call won't be visited as an opaque value def, mark it deleted.
-  // Because it's a call, it needs to be explicitly marked for deletion even
-  // though it may still have tuple_extract uses, which are also marked deleted.
-  //
-  // FIXME!!! when will non-address only original calls be deleted?
-  if (origCallInst) {
-    auto *AI = dyn_cast<ApplyInst>(origCallInst);
-    /*!!!
-    if (!AI->getType().isAddressOnly(pass.F->getModule()))
-      pass.markDead(AI);
-    else
-    */
-    pass.callsToDelete.insert(AI);
+  if (!origCallInst)
+    return;
+
+  auto *AI = dyn_cast<ApplyInst>(origCallInst);
+  if (!AI)
+    return;
+  
+  if (pass.valueStorageMap.contains(AI))
+    return;
+  
+  if (AI->use_empty()) {
+    pass.markDead(AI);
+    return;
   }
+  // Since this call does not have storage, it cannot produce a single
+  // address-only value. That means all of its uses must be tuple_extract,
+  // and all of those must be either marked dead or have storage.
+  assert(all_of(AI->getUses(),
+                [&](Operand *op) -> bool {
+                  auto *user = op->getUser();
+                  return pass.valueStorageMap.contains(cast<TupleInst>(user))
+                    || pass.isDead(user);
+                }));
+#ifndef NDEBUG
+  pass.callsToDelete.insert(AI);
+#endif
 }
 
 //===----------------------------------------------------------------------===//
@@ -1957,22 +1982,7 @@ protected:
 
   // Copy from an opaque source operand.
   void visitCopyValueInst(CopyValueInst *copyInst) {
-    // FIXME!!! Don't expect to see these any more.
     llvm_unreachable("Unexpected copy_value");
-#if 0 // !!!
-    ValueStorage &storage = pass.valueStorageMap.getStorage(copyInst);
-    // Fold a copy into a store.
-    if (storage.isProjection()
-        && isa<StoreInst>(storage.getComposedOperand()->getUser())) {
-      return;
-    }
-    SILValue srcVal = copyInst->getOperand();
-    SILValue srcAddr = pass.valueStorageMap.getStorage(srcVal).storageAddress;
-    SILValue destAddr = addrMat.materializeAddress(copyInst);
-    B.createCopyAddr(copyInst->getLoc(), srcAddr, destAddr, IsNotTake,
-                     IsInitialization);
-    markRewritten(copyInst, destAddr);
-#endif
   }
 
   // Opaque conditional branch argument.
@@ -2026,12 +2036,6 @@ protected:
   void visitDestroyValueInst(DestroyValueInst *destroyInst) {
     // FIXME!!! Don't expect to see these any more.
     llvm_unreachable("Unexpected destroy_value");
-#if 0 // !!!
-    SILValue srcVal = destroyInst->getOperand();
-    SILValue srcAddr = pass.valueStorageMap.getStorage(srcVal).storageAddress;
-    B.createDestroyAddr(destroyInst->getLoc(), srcAddr);
-    pass.markDead(destroyInst);
-#endif
   }
 
   // Opaque enum payload. Handle EnumInst on the def side to handle both opaque
@@ -2120,18 +2124,6 @@ protected:
     assert(storeInst->getOwnershipQualifier()
            == StoreOwnershipQualifier::Unqualified);
 
-    // FIXME: Try not to special-case CopyValue.
-#if 0
-    if (storage.isProjection()) {
-      assert(!srcAddr);
-      auto *copyInst = cast<CopyValueInst>(srcVal);
-      ValueStorage &srcStorage =
-          pass.valueStorageMap.getStorage(copyInst->getOperand());
-      assert(!srcStorage.isProjection());
-      srcAddr = srcStorage.storageAddress;
-      isTakeFlag = IsNotTake;
-    }
-#endif
     // Bitwise copy the value. Two locations now share ownership. This is
     // modeled as a take-init.
     B.createCopyAddr(storeInst->getLoc(), srcAddr, storeInst->getDest(),
@@ -2612,7 +2604,7 @@ static void removeCondBranchArgs(CondBranchInst *CBI, SILBasicBlock *targetBB,
 // Remove all opaque block arguments. Their inputs have already been substituted
 // with Undef.
 //
-// FIXME: Generalize to other terminator.
+// FIXME: Generalize to other terminators.
 static void removeOpaqueBBArgs(SILBasicBlock *bb, AddressLoweringState &pass) {
   if (bb->isEntry())
     return;
@@ -2725,8 +2717,25 @@ void AddressLowering::runOnFunction(SILFunction *F) {
         assert(pass.instsToDelete.count(operand->getUser()));
 #endif
     pass.instsToDelete.insert(deadInst);
-  }
 
+    // FIXME: MultiValue. Insert non-value calls into the dead instruction list
+    // if all of their results have been deleted.
+    auto *callResult = dyn_cast<TupleExtractInst>(deadInst);
+    if (callResult) {
+      auto *applyInst = dyn_cast<ApplyInst>(callResult->getOperand());
+      if (applyInst) {
+        if (all_of(applyInst->getUses(),
+                   [&](Operand *op) -> bool {
+                     return pass.instsToDelete.count(op->getUser());
+                   })) {
+          pass.instsToDelete.insert(applyInst);
+          assert(pass.callsToDelete.remove(applyInst));
+        }
+      }
+    }
+  }
+  assert(pass.callsToDelete.empty());
+  
   pass.valueStorageMap.clear();
 
   // Delete instructions in postorder

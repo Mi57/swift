@@ -562,10 +562,10 @@ bb0(%0 : $P):
   retain_value %0 : $P
   store %0 to %2 : $*P
   %8 = open_existential_value %0 : $P to $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P
-  %9 = witness_method $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P, #P.foo!1 : <Self where Self : P> (Self) -> () -> (), %8 : $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P : $@convention(witness_method) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
+  %9 = witness_method $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P, #P.foo!1 : <Self where Self : P> (Self) -> () -> (), %8 : $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
   // Test that we can handle owned value of type opened archetype.
   retain_value %8 : $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P
-  %11 = apply %9<@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P>(%8) : $@convention(witness_method) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
+  %11 = apply %9<@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P>(%8) : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
   destroy_addr %2 : $*P
   dealloc_stack %2 : $*P
   release_value %0 : $P
@@ -594,11 +594,11 @@ bb0(%0 : $P):
 // CHECK-LABEL: } // end sil function 'f170_compare'
 sil @f170_compare : $@convention(thin) <T where T : Comparable> (@in T, @in T) -> @out T {
 bb0(%0 : $T, %1 : $T):
-  %4 = witness_method $T, #Comparable."<"!1 : <Self where Self : Comparable> (Self.Type) -> (Self, Self) -> Bool : $@convention(witness_method) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
+  %4 = witness_method $T, #Comparable."<"!1 : <Self where Self : Comparable> (Self.Type) -> (Self, Self) -> Bool : $@convention(witness_method: Comparable) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
   %5 = metatype $@thick T.Type
   retain_value %1 : $T
   retain_value %0 : $T
-  %8 = apply %4<T>(%1, %0, %5) : $@convention(witness_method) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
+  %8 = apply %4<T>(%1, %0, %5) : $@convention(witness_method: Comparable) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
   %9 = struct_extract %8 : $Bool, #Bool._value
   cond_br %9, bb1, bb2
 
