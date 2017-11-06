@@ -1145,9 +1145,10 @@ SILValue AddressMaterialization::initializeOperandMem(Operand *operand) {
     ValueStorage &storage = pass.valueStorageMap.getStorage(def);
     // Source value should already be rewritten.
     assert(storage.isRewritten());
-    if (storage.isUseProjection())
+    if (storage.isUseProjection()
+        && storage.getComposedUseOperand() == operand) {
       destAddr = storage.storageAddress;
-    else {
+    } else {
       destAddr = materializeProjectionFromUse(operand);
       B.createCopyAddr(operand->getUser()->getLoc(), storage.storageAddress,
                        destAddr, IsTake, IsInitialization);
@@ -1756,23 +1757,26 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
   
   if (pass.valueStorageMap.contains(AI))
     return;
-  
-  if (AI->use_empty()) {
-    pass.markDead(AI);
-    return;
-  }
-  // Since this call does not have storage, it cannot produce a single
-  // address-only value. That means all of its uses must be tuple_extract,
-  // and all of those must be either marked dead or have storage.
-  assert(all_of(AI->getUses(),
-                [&](Operand *op) -> bool {
-                  auto *user = op->getUser();
-                  return pass.valueStorageMap.contains(cast<TupleInst>(user))
-                    || pass.isDead(user);
-                }));
+
+  // This call has no storage. If it is used by an address_only tuple_extract,
+  // then it will be marked deleted only after that use is marked
+  // deleted. Otherwise all its uses must already be dead and it must be marked
+  // dead immediately.
+  // Note: Simply checking whether this call is address-only is insufficient,
+  // because the address-only use may be have been dead to begin with.
+  for (Operand *use : AI->getUses()) {
+    auto *extract = cast<TupleExtractInst>(use->getUser());
+    if (pass.valueStorageMap.contains(extract)) {
+    // At least one of the results has storage. The call cannot be marked dead
+    // until its results are marked dead.
 #ifndef NDEBUG
-  pass.callsToDelete.insert(AI);
+      pass.callsToDelete.insert(AI);
 #endif
+      return;
+    }
+    assert(pass.isDead(extract));
+  }
+  pass.markDead(AI);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2643,48 +2647,18 @@ static void removeOpaqueBBArgs(SILBasicBlock *bb, AddressLoweringState &pass) {
     bb->eraseArgument(deadArgIdx);
 }
 
-//===----------------------------------------------------------------------===//
-// AddressLowering: Top-Level Module Transform.
-//===----------------------------------------------------------------------===//
-
-namespace {
-// Note: the only reason this is not a FunctionTransform is to change the SIL
-// stage for all functions at once.
-class AddressLowering : public SILModuleTransform {
-  /// The entry point to this function transformation.
-  void run() override;
-
-  void runOnFunction(SILFunction *F);
-};
-} // end anonymous namespace
-
-void AddressLowering::runOnFunction(SILFunction *F) {
-  if (!F->isDefinition())
-    return;
-
-  PrettyStackTraceSILFunction FuncScope("address-lowering", F);
-
-  DEBUG(llvm::dbgs() << "Address Lowering: " << F->getName() << "\n");
-
-  auto *DA = PM->getAnalysis<DominanceAnalysis>();
-
-  AddressLoweringState pass(F, DA->get(F));
-
-  // Rewrite function args and insert alloc_stack/dealloc_stack.
-  // 
-  // WARNING: This may split critical edges in ValueLifetimeAnalysis.
-  OpaqueStorageAllocation allocator(pass);
-  allocator.allocateOpaqueStorage();
-
-  DEBUG(llvm::dbgs() << "Finished allocating storage.\n"; F->dump();
-        pass.valueStorageMap.dump());
-
-  // Rewrite instructions with address-only operands or results.
-  rewriteFunction(pass);
-
-  // Instructions that were explicitly marked dead should already have no
-  // users.
-  //
+// pass.instsToDelete now contains instructions that were explicitly marked
+// dead. These already have no users. The rest of the address-only definitions
+// will be removed bottom-up by visiting valuestorageMap.
+//
+// Calls are tricky because sometimes they are values, and sometimes they have
+// tuple_extracts representing their values. Either way, they still need to be
+// deleted in the correct use-def order.
+//
+// Address-only block arguments that are tied to terminators (switch_enum,
+// try_apply) have already been removed and replace with fake load. The phi-like
+// block arguments are removed here after all other instructions.
+static void deleteRewrittenInstructions(AddressLoweringState &pass) {
   // Add the rest of the instructions to the dead list in post order.
   // FIXME: make sure we cleaned up address-only BB arguments.
   for (auto &valueStorageI : reversed(pass.valueStorageMap)) {
@@ -2720,14 +2694,15 @@ void AddressLowering::runOnFunction(SILFunction *F) {
 
     // FIXME: MultiValue. Insert non-value calls into the dead instruction list
     // if all of their results have been deleted.
-    auto *callResult = dyn_cast<TupleExtractInst>(deadInst);
-    if (callResult) {
-      auto *applyInst = dyn_cast<ApplyInst>(callResult->getOperand());
+    auto *extract = dyn_cast<TupleExtractInst>(deadInst);
+    if (extract) {
+      auto *applyInst = dyn_cast<ApplyInst>(extract->getOperand());
       if (applyInst) {
         if (all_of(applyInst->getUses(),
                    [&](Operand *op) -> bool {
                      return pass.instsToDelete.count(op->getUser());
                    })) {
+          DEBUG(llvm::dbgs() << "DEAD "; applyInst->dump());
           pass.instsToDelete.insert(applyInst);
           assert(pass.callsToDelete.remove(applyInst));
         }
@@ -2743,8 +2718,50 @@ void AddressLowering::runOnFunction(SILFunction *F) {
                                              true);
 
   // Remove block args after removing all instructions that may use them.
-  for (auto &bb : *F)
+  for (auto &bb : *pass.F)
     removeOpaqueBBArgs(&bb, pass);
+}
+
+//===----------------------------------------------------------------------===//
+// AddressLowering: Top-Level Module Transform.
+//===----------------------------------------------------------------------===//
+
+namespace {
+// Note: the only reason this is not a FunctionTransform is to change the SIL
+// stage for all functions at once.
+class AddressLowering : public SILModuleTransform {
+  /// The entry point to this function transformation.
+  void run() override;
+
+  void runOnFunction(SILFunction *F);
+};
+} // end anonymous namespace
+
+void AddressLowering::runOnFunction(SILFunction *F) {
+  if (!F->isDefinition())
+    return;
+
+  PrettyStackTraceSILFunction FuncScope("address-lowering", F);
+
+  DEBUG(llvm::dbgs() << "Address Lowering: " << F->getName() << "\n");
+
+  auto *DA = PM->getAnalysis<DominanceAnalysis>();
+
+  AddressLoweringState pass(F, DA->get(F));
+
+  // Rewrite function args and insert alloc_stack/dealloc_stack.
+  //
+  // WARNING: This may split critical edges in ValueLifetimeAnalysis.
+  OpaqueStorageAllocation allocator(pass);
+  allocator.allocateOpaqueStorage();
+
+  DEBUG(llvm::dbgs() << "Finished allocating storage.\n"; F->dump();
+        pass.valueStorageMap.dump());
+
+  // Rewrite instructions with address-only operands or results.
+  rewriteFunction(pass);
+
+  deleteRewrittenInstructions(pass);
 
   StackNesting().correctStackNesting(F);
 
