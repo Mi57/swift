@@ -216,8 +216,10 @@ static bool isPseudoCallResult(SILValue value) {
 /// itself. If the operand's use is a block terminator, it is the
 /// corresponding block argument that represents the operand's value.
 ///
-/// For multi-value instructions, return an invalid SILValue. The caller will
-/// need to deal with those.
+/// If it is invalid to project storage from the operand's use then an invalid
+/// SILValue is returned. For example, multi-result instructions and switch_num
+/// instructions do not produce a single value that their operand can be
+/// projected from. The caller should check for and handle those cases specially.
 ///
 /// TODO: Make this a utility or at least add
 /// CondBranchInst::getBlockArgForOperand?
@@ -227,16 +229,12 @@ SILValue getValueOfOperandUse(Operand *operand) {
   if (singleVal)
     return singleVal;
 
-  // The caller needs to handle multi-value instructions.
-  // FIXME: MultiValue.
-  assert(isa<TermInst>(user));
-
   switch (user->getKind()) {
   default:
 #ifndef NDEBUG
     user->dump();
 #endif
-    llvm_unreachable("Unexpected block terminator with address-only operand.");
+    llvm_unreachable("Instruction cannot project storage through its operand.");
 
   case SILInstructionKind::BranchInst: {
     auto *BI = cast<BranchInst>(user);
