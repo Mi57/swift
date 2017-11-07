@@ -211,9 +211,9 @@ static bool isPseudoCallResult(SILValue value) {
          && bbArg->getType().is<TupleType>();
 }
 
-/// Return the SILValue that reprents the "user" of the given operand. When the
-/// operand's use is a SingleValueInstruction, the value is the user
-/// itself. When the operand's use is a block terminator, it is the
+/// Return the SILValue that represents the "user" of the given operand. If
+/// the operand's use is a SingleValueInstruction, the value is the user
+/// itself. If the operand's use is a block terminator, it is the
 /// corresponding block argument that represents the operand's value.
 ///
 /// For multi-value instructions, return an invalid SILValue. The caller will
@@ -221,15 +221,15 @@ static bool isPseudoCallResult(SILValue value) {
 ///
 /// TODO: Make this a utility or at least add
 /// CondBranchInst::getBlockArgForOperand?
-SILValue getUsingValue(Operand *operand) {
+SILValue getValueOfOperandUse(Operand *operand) {
   SILInstruction *user = operand->getUser();
   auto *singleVal = dyn_cast<SingleValueInstruction>(user);
   if (singleVal)
     return singleVal;
 
   // The caller needs to handle multi-value instructions.
-  if (!isa<TermInst>(user))
-    return SILValue();
+  // FIXME: MultiValue.
+  assert(isa<TermInst>(user));
 
   switch (user->getKind()) {
   default:
@@ -272,7 +272,7 @@ struct ValueStorage {
   /// allocation. For projections, it is only set after instruction rewriting.
   SILValue storageAddress;
   uint32_t projectedStorageID;
-  uint16_t projectedUseOperandNum;
+  uint16_t projectedOperandNum;
   unsigned isUseProjection : 1;
   unsigned isDefProjection : 1;
   unsigned isRewritten : 1;
@@ -280,16 +280,16 @@ struct ValueStorage {
   ValueStorage() { clear(); }
 
   void clear() {
-    storageAddress = nullptr;
+    storageAddress = SILValue();
     projectedStorageID = ~0;
-    projectedUseOperandNum = ~0;
+    projectedOperandNum = ~0;
     isUseProjection = false;
     isDefProjection = false;
     isRewritten = false;
   }
 
   bool isAllocated() const {
-    return isRewritten || isUseProjection || isDefProjection;
+    return storageAddress || isUseProjection || isDefProjection;
   }
 
   void markRewritten() {
@@ -308,6 +308,7 @@ class ValueStorageMap {
   struct ValueStoragePair {
     SILValue value;
     ValueStorage storage;
+    ValueStoragePair(SILValue v, ValueStorage s) : value(v), storage(s) {}
   };
   typedef std::vector<ValueStoragePair> ValueVector;
   // Hash of values to ValueVector indices.
@@ -339,13 +340,16 @@ public:
     return valueHashMap.find(value) != valueHashMap.end();
   }
 
-  unsigned getOrdinal(SILValue value) {
+  unsigned getOrdinal(SILValue value) const {
     auto hashIter = valueHashMap.find(value);
     assert(hashIter != valueHashMap.end() && "Missing SILValue");
     return hashIter->second;
   }
 
   ValueStorage &getStorage(SILValue value) {
+    return valueVector[getOrdinal(value)].storage;
+  }
+  const ValueStorage &getStorage(SILValue value) const {
     return valueVector[getOrdinal(value)].storage;
   }
 
@@ -370,22 +374,68 @@ public:
     auto hashResult = valueHashMap.insert(std::make_pair(newValue, ordinal));
     (void)hashResult;
     assert(hashResult.second && "SILValue already mapped");
+
+    valueVector[ordinal].value = newValue;
   }
 
-  // Follow one level of storage projection. The returned storage may also be a
-  // projection.
+  /// Follow one level of storage projection. The returned storage may also be a
+  /// projection.
   ValueStoragePair &getProjectedStorage(ValueStorage &storage) {
     assert(storage.isUseProjection || storage.isDefProjection);
     return valueVector[storage.projectedStorageID];
   }
 
-  // Record a storage projection from the given single value instruction operand
-  // into the given ValueStorage.
+  /// Record a storage projection from the use of the given operand
+  /// (e.g. struct, tuple, enum) into the operand's source.
   void setComposedUseProjection(Operand *oper) {
     auto &storage = getStorage(oper->get());
-    storage.projectedStorageID =
-        getOrdinal(cast<SingleValueInstruction>(oper->getUser()));
+    storage.projectedStorageID = getOrdinal(getValueOfOperandUse(oper));
+    storage.projectedOperandNum = oper->getOperandNumber();
     storage.isUseProjection = true;
+  }
+
+  /// Record a storage projection from the source of the given operand into its
+  /// use (e.g. struct_extract, tuple_extract).
+  void setExtractedDefOperand(Operand *oper) {
+    assert(isa<SingleValueInstruction>(oper->getUser()));
+    auto &storage = getStorage(oper->get());
+    storage.projectedStorageID = getOrdinal(oper->get());
+    storage.projectedOperandNum = oper->getOperandNumber();
+    storage.isDefProjection = true;
+  }
+
+  /// Return true if the given operand projects storage from its use into its
+  /// source.
+  bool isUseProjection(Operand *oper) const {
+    auto &srcStorage = getStorage(oper->get());
+    if (!srcStorage.isUseProjection)
+      return false;
+
+    return srcStorage.projectedOperandNum == oper->getOperandNumber();
+  }
+
+  // Given storage for a value, return the operand of the value's use
+  // (e.g. struct, tuple, enum) that projects storage from the use to the
+  // operand's source.
+  //
+  // Postcondition: valueStorageMap.getStorage(result->get()) == storage.
+  Operand *getUseProjectionOperand(ValueStorage &storage) {
+    assert(storage.isUseProjection);
+    SILValue useVal = getProjectedStorage(storage).value;
+    auto *useInst = useVal->getDefiningInstruction();
+    return &useInst->getAllOperands()[storage.projectedOperandNum];
+  }
+
+  // Given storage for a value (e.g. defined by struct_extract, tuple_extract),
+  // return the operand of the value's defining instruction that projects
+  // storage from the operands source value.
+  //
+  // Postcondition:
+  //   valueStorageMap.getStorage(getValueOfOperandUse(result)) == storage.
+  Operand *getDefProjectionOperand(SingleValueInstruction *extractInst) {
+    auto &storage = getStorage(extractInst);
+    assert(storage.isDefProjection);
+    return &extractInst->getAllOperands()[storage.projectedOperandNum];
   }
 
 #ifndef NDEBUG
@@ -746,6 +796,11 @@ protected:
   void allocateForBBArg(SILPHIArgument *bbArg);
   void allocateForValue(SILValue value);
   AllocStackInst *createStackAllocation(SILValue value);
+
+  void createStackAllocationStorage(SILValue value) {
+    pass.valueStorageMap.getStorage(value).storageAddress =
+        createStackAllocation(value);
+  }
 };
 } // end anonymous namespace
 
@@ -890,7 +945,7 @@ bool OpaqueStorageAllocation::canProjectFrom(
     }
   } else if (storage.isUseProjection) {
     SILValue projVal = pass.valueStorageMap.getProjectedStorage(storage).value;
-    return canProjectFrom(checkDom, projVal);
+    return canProjectFrom(checkDom, projVal->getDefiningInstruction());
   }
   return false;
 }
@@ -941,7 +996,7 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
     if (auto *SEI = dyn_cast<SwitchEnumInst>(predBB->getTerminator())) {
       Operand *incomingOper = &SEI->getAllOperands()[0];
       assert(incomingOper->get() == bbArg->getSingleIncomingValue());
-      storage.setExtractedDefOperand(incomingOper);
+      pass.valueStorageMap.setExtractedDefOperand(incomingOper);
       return;
     }
     // try_apply is handled differently. If it returns a tuple, then the bbarg
@@ -950,8 +1005,9 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
     if (isa<TryApplyInst>(predBB->getTerminator())) {
       // FIXME: multi-result calls.
       if (!bbArg->getType().is<TupleType>()) {
-        if (!setProjectionFromUser(ArrayRef<SILValue>(bbArg), bbArg))
-          storage.storageAddress = createStackAllocation(bbArg);
+        if (!setProjectionFromUser(ArrayRef<SILValue>(bbArg), bbArg)) {
+          createStackAllocationStorage(bbArg);
+        }
       }
       return;
     }
@@ -972,7 +1028,7 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
       BlockArgumentStorageOptimizer(bbArg).computeArgumentProjections();
 
   if (!setProjectionFromUser(argStorageResult.getIncomingValueRange(), bbArg)) {
-    storage.storageAddress = createStackAllocation(bbArg);
+    createStackAllocationStorage(bbArg);
   }
 
   // Regardless of whether we projected from a user or allocated storage,
@@ -1062,11 +1118,11 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value) {
   }
   // Values that borrow their operand inherit storage from that operand.
   if (auto *storageOper = getBorrowedStorageOperand(value)) {
-    storage.setExtractedDefOperand(storageOper);
+    pass.valueStorageMap.setExtractedDefOperand(storageOper);
     return;
   }
 
-  storage.storageAddress = createStackAllocation(value);
+  createStackAllocationStorage(value);
 }
 
 // Create alloc_stack and jointly-postdominating dealloc_stack instructions.
@@ -1145,15 +1201,6 @@ public:
 
   SILValue materializeAddress(SILValue origValue);
 
-#ifndef NDEBUG
-  /// Return the instruction that defines storage for this extract inst.
-  /// This should match the extract instruction's operand.
-  SILValue getStorageDef(SingleValueInstruction *extractInst) {
-    auto &storage = pass.valueStorageMap.getStorage(extractInst);
-    return storage.getExtractedDefOperand()->get();
-  }
-#endif
-
   SILValue materializeProjectionFromDef(Operand *operand, SILValue origValue);
   SILValue materializeProjectionFromUse(Operand *operand);
 };
@@ -1169,11 +1216,10 @@ SILValue AddressMaterialization::initializeOperandMem(Operand *operand) {
   if (operand->get()->getType().isAddressOnly(pass.F->getModule())) {
     ValueStorage &storage = pass.valueStorageMap.getStorage(def);
     // Source value should already be rewritten.
-    assert(storage.isRewritten());
-    if (storage.isUseProjection()
-        && storage.getComposedUseOperand() == operand) {
+    assert(storage.isRewritten);
+    if (pass.valueStorageMap.isUseProjection(operand))
       destAddr = storage.storageAddress;
-    } else {
+    else {
       destAddr = materializeProjectionFromUse(operand);
       B.createCopyAddr(operand->getUser()->getLoc(), storage.storageAddress,
                        destAddr, IsTake, IsInitialization);
@@ -1188,6 +1234,8 @@ SILValue AddressMaterialization::initializeOperandMem(Operand *operand) {
 
 /// Return the address of the storage for `origValue`. This may involve
 /// materializing projections.
+///
+/// As a side effect, record the materialized address as storage for origValue.
 SILValue AddressMaterialization::materializeAddress(SILValue origValue) {
   ValueStorage &storage = pass.valueStorageMap.getStorage(origValue);
 
@@ -1195,15 +1243,17 @@ SILValue AddressMaterialization::materializeAddress(SILValue origValue) {
     return storage.storageAddress;
 
   // Handle a value that is composed by a user (struct/tuple/enum).
-  if (storage.isUseProjection()) {
-    storage.storageAddress =
-        materializeProjectionFromUse(storage.getComposedUseOperand());
+  if (storage.isUseProjection) {
+    Operand *use = pass.valueStorageMap.getUseProjectionOperand(storage);
+    storage.storageAddress = materializeProjectionFromUse(use);
     return storage.storageAddress;
   }
   // Handle a value that is extracted from an aggregate.
-  assert(storage.isDefProjection());
-  storage.storageAddress =
-      materializeProjectionFromDef(storage.getExtractedDefOperand(), origValue);
+  assert(storage.isDefProjection);
+  auto *extractInst = cast<SingleValueInstruction>(origValue);
+  Operand *defOper =
+      &extractInst->getAllOperands()[storage.projectedOperandNum];
+  storage.storageAddress = materializeProjectionFromDef(defOper, origValue);
   return storage.storageAddress;
 }
 
@@ -1262,10 +1312,10 @@ AddressMaterialization::materializeProjectionFromUse(Operand *operand) {
 
   // Recurse through block arguments.
   if (isa<TermInst>(user))
-    return materializeAddress(getUsingValue(operand))
+    return materializeAddress(getValueOfOperandUse(operand));
 
-        switch (user->getKind()) {
-    default:
+  switch (user->getKind()) {
+  default:
 #ifndef NDEBUG
     user->dump();
 #endif
@@ -1439,7 +1489,7 @@ void ApplyRewriter::rewriteIndirectParameter(Operand *operand) {
   if (argValue->getType().isAddressOnly(pass.F->getModule())) {
     ValueStorage &storage = pass.valueStorageMap.getStorage(argValue);
     // Source value should already be rewritten.
-    assert(storage.isRewritten());
+    assert(storage.isRewritten);
     operand->set(storage.storageAddress);
     return;
   }
@@ -1688,7 +1738,7 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
 
       // Storage was materialized by materializeIndirectResultAddress above.
       auto &origStorage = pass.valueStorageMap.getStorage(resultArg);
-      assert(origStorage.isRewritten());
+      assert(origStorage.isRewritten);
 
       pass.valueStorageMap.replaceValue(resultArg, loadArg);
     }
@@ -1713,7 +1763,7 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
     auto *extractInst = dyn_cast<TupleExtractInst>(useInst);
     if (!extractInst) {
       assert(origFnConv.getNumDirectSILResults() == 1);
-      assert(pass.valueStorageMap.getStorage(origCallValue).isRewritten());
+      assert(pass.valueStorageMap.getStorage(origCallValue).isRewritten);
       continue;
     }
     unsigned origResultIdx = extractInst->getFieldNo();
@@ -1856,7 +1906,7 @@ void ReturnRewriter::rewriteReturn(ReturnInst *returnInst) {
           if (resultTy.isAddressOnly(pass.F->getModule())) {
             ValueStorage &storage =
                 pass.valueStorageMap.getStorage(origDirectResultVal);
-            assert(storage.isRewritten());
+            assert(storage.isRewritten);
             SILValue resultAddr = storage.storageAddress;
             if (resultAddr != resultArg) {
               // Copy the result from local storage into the result argument.
@@ -2061,8 +2111,7 @@ protected:
   void
   visitOpenExistentialValueInst(OpenExistentialValueInst *openExistential) {
     assert(currOper
-           == pass.valueStorageMap.getStorage(openExistential)
-                  .getExtractedDefOperand());
+           == pass.valueStorageMap.getDefProjectionOperand(openExistential));
     SILValue srcAddr =
         pass.valueStorageMap.getStorage(currOper->get()).storageAddress;
     // Mutable access is always by address.
@@ -2144,7 +2193,8 @@ protected:
     SILValue extractAddr = addrMat.materializeProjectionFromDef(
         &extractInst->getOperandRef(), extractInst);
     if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
-      assert(extractInst->getOperand() == addrMat.getStorageDef(extractInst));
+      assert(currOper
+             == pass.valueStorageMap.getDefProjectionOperand(extractInst));
       markRewritten(extractInst, extractAddr);
     } else {
       assert(!pass.valueStorageMap.contains(extractInst));
@@ -2181,7 +2231,8 @@ protected:
     SILValue extractAddr = addrMat.materializeProjectionFromDef(
         &extractInst->getOperandRef(), extractInst);
     if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
-      assert(extractInst->getOperand() == addrMat.getStorageDef(extractInst));
+      assert(currOper
+             == pass.valueStorageMap.getDefProjectionOperand(extractInst));
       markRewritten(extractInst, extractAddr);
     } else {
       assert(!pass.valueStorageMap.contains(extractInst));
@@ -2237,7 +2288,7 @@ public:
     // TODO: No debug scope for arguments?
 
     auto &storage = pass.valueStorageMap.getStorage(bbArg);
-    assert(!storage.isRewritten());
+    assert(!storage.isRewritten);
     storage.storageAddress = addrMat.materializeAddress(bbArg);
     storage.markRewritten();
   }
@@ -2267,7 +2318,7 @@ protected:
   void visitApplyInst(ApplyInst *applyInst) {
     assert(isa<SingleValueInstruction>(applyInst) &&
            "beforeVisit assumes that ApplyInst is an SVI");
-    assert(!storage->isRewritten());
+    assert(!storage->isRewritten);
     // Completely rewrite the apply instruction, handling any remaining
     // (loadable) indirect parameters, allocating memory for indirect
     // results, and generating a new apply instruction.
@@ -2278,7 +2329,7 @@ protected:
 
   // Copy into an opaque value.
   void visitCopyValueInst(CopyValueInst *copyInst) {
-    assert(storage->isRewritten());
+    assert(storage->isRewritten);
   }
 
   // Define an opaque enum value.
@@ -2313,7 +2364,7 @@ protected:
   void visitOpenExistentialValueInst(
       OpenExistentialValueInst *openExistentialValue) {
     // Rewritten on the use-side because storage is inherited from the source.
-    assert(storage->isRewritten());
+    assert(storage->isRewritten);
   }
 
   // Project an opaque value out of a box-type existential.
@@ -2349,8 +2400,10 @@ protected:
   // Define an opaque tuple.
   void visitTupleInst(TupleInst *tupleInst) {
     ValueStorage &storage = pass.valueStorageMap.getStorage(tupleInst);
-    if (storage.isUseProjection()
-        && isa<ReturnInst>(storage.getComposedUseOperand()->getUser())) {
+    if (storage.isUseProjection
+        && isa<ReturnInst>(
+               pass.valueStorageMap.getUseProjectionOperand(storage)
+                   ->getUser())) {
       // For indirectly returned values, each element has its own storage.
       return;
     }
@@ -2364,14 +2417,14 @@ protected:
 
   // Extract an opaque struct member.
   void visitStructExtractInst(StructExtractInst *extractInst) {
-    assert(storage->isRewritten());
+    assert(storage->isRewritten);
   }
 
   // Extract an opaque tuple element.
   void visitTupleExtractInst(TupleExtractInst *extractInst) {
     // If the source is an opaque tuple, as opposed to a call result, then the
     // extract is rewritten on the use-side.
-    if (storage->isRewritten())
+    if (storage->isRewritten)
       return;
 
     // This must be an indirect result for an apply that has not yet been
@@ -2381,7 +2434,7 @@ protected:
       // Go ahead and rewrite the apply that produces the tuple now since it was
       // effectively just skipped by the def rewriter.
       ApplyRewriter(AI, pass).convertApplyWithIndirectResults();
-      assert(storage->isRewritten());
+      assert(storage->isRewritten);
       return;
     }
     assert(isa<SILPHIArgument>(srcVal));
@@ -2402,7 +2455,7 @@ static void rewriteIndirectApply(ApplySite apply, AddressLoweringState &pass) {
     if (isa<ApplyInst>(apply)) {
       visitCallResults(apply, [&](SILValue result) {
         if (result->getType().isAddressOnly(pass.F->getModule())) {
-          assert(pass.valueStorageMap.getStorage(result).isRewritten());
+          assert(pass.valueStorageMap.getStorage(result).isRewritten);
           isRewritten = true;
           return false;
         }
@@ -2428,7 +2481,7 @@ static void rewriteIndirectApply(ApplySite apply, AddressLoweringState &pass) {
 static void rewriteSwitchEnum(SwitchEnumInst *SEI, AddressLoweringState &pass) {
   SILValue enumVal = SEI->getOperand();
   auto &storage = pass.valueStorageMap.getStorage(enumVal);
-  assert(storage.isRewritten());
+  assert(storage.isRewritten);
   SILValue enumAddr = storage.storageAddress;
 
   // TODO: We should be able to avoid locally copying the case pointers here.
@@ -2473,7 +2526,7 @@ static void rewriteSwitchEnum(SwitchEnumInst *SEI, AddressLoweringState &pass) {
       caseArg->replaceAllUsesWith(loadArg);
 
       auto &origStorage = pass.valueStorageMap.getStorage(caseArg);
-      assert(origStorage.isRewritten());
+      assert(origStorage.isRewritten);
 
       pass.valueStorageMap.replaceValue(caseArg, loadArg);
 
@@ -2675,9 +2728,9 @@ static void deleteRewrittenInstructions(AddressLoweringState &pass) {
     auto &storage = pass.valueStorageMap.getStorage(val);
     // Returned tuples and multi-result calls are currently values without
     // storage.  Everything else must have been rewritten.
-    assert(storage.isRewritten()
-           || (!storage.storageAddress
-               && (isa<TupleInst>(val)) || ApplySite::isa(val)));
+    assert(storage.isRewritten
+           || (!storage.storageAddress && (isa<TupleInst>(val))
+               || ApplySite::isa(val)));
 #endif
     // TODO: MultiValueInstruction: ApplyInst
     auto *deadInst = dyn_cast<SingleValueInstruction>(val);
