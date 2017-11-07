@@ -216,10 +216,10 @@ static bool isPseudoCallResult(SILValue value) {
 /// itself. If the operand's use is a block terminator, it is the
 /// corresponding block argument that represents the operand's value.
 ///
-/// If it is invalid to project storage from the operand's use then an invalid
-/// SILValue is returned. For example, multi-result instructions and switch_num
-/// instructions do not produce a single value that their operand can be
-/// projected from. The caller should check for and handle those cases specially.
+/// It must be possible to project storage from the operand's use. For example,
+/// multi-result instructions and switch_num instructions do not produce a
+/// single value that their operand can be projected from. These cases will
+/// assert here, so the caller should check for and handle them specially.
 ///
 /// TODO: Make this a utility or at least add
 /// CondBranchInst::getBlockArgForOperand?
@@ -257,18 +257,46 @@ SILValue getValueOfOperandUse(Operand *operand) {
   }
 }
 
+/// Return the given values defining instruction, handling block arguments (but
+/// not function arguments).
+SILInstruction *getDefiningInstructionForValue(SILValue value) {
+  if (auto *defInst = value->getDefiningInstruction())
+    return defInst;
+
+  auto *bbArg = cast<SILPHIArgument>(value);
+  auto *predBB = bbArg->getParent()->getSinglePredecessorBlock();
+  assert(predBB && "Critical edges are not allowed");
+  //!!!!!
+  
+}
+
 //===----------------------------------------------------------------------===//
 // ValueStorageMap: Map Opaque/Resilient SILValues to abstract storage units.
 //===----------------------------------------------------------------------===//
 
 namespace {
-// Avoid storing operand references in case some def-use rewritting occurs
-// before formal rewritting.
+/// Track a value's storage. After allocation, ValueStorage either has a valid
+/// storage address, or indicates that it is the projection of another value's
+/// storage. A projection may either be from the value's use (a use projection),
+/// or from an operand of the value's defining instruction (a def projection).
+///
+/// After rewriting, all ValueStorage entries have a valid storage address.
+///
+/// To express projections, ValueStorage refers to the storage of other
+/// values. Consequently, values that have storage cannot be removed from SIL or
+/// from the storage map until rewriting is complete. However, since we don't
+/// directly store references to any SIL entities, such as Operands or
+/// SILValues, mapped values can be replaced as long as the replacement values
+/// have the same number of Operands.
+///
+/// Avoid storing operand references in case some
+/// def-use rewritting occurs before formal rewritting.
 struct ValueStorage {
   /// The final address of this storage unit after rewriting the SIL.
   /// For values linked to their own storage, this is set during storage
   /// allocation. For projections, it is only set after instruction rewriting.
   SILValue storageAddress;
+
   uint32_t projectedStorageID;
   uint16_t projectedOperandNum;
   unsigned isUseProjection : 1;
@@ -363,7 +391,20 @@ public:
     return valueVector.back().storage;
   }
 
+  // Replace a value that is mapped to storage with another value. This allows
+  // limited rewritting of original address-only values. For example, block
+  // arguments can be replaced with fake loads in order to rewrite their
+  // corresponding terminator.
   void replaceValue(SILValue oldValue, SILValue newValue) {
+    // Currently, replacement is only allowed for values that originally have no
+    // defining instruction (block args), that avoids the problem in which other
+    // storage has a use projection from this storage identified by an operand
+    // number. In the case of block arguments, the corresponding terminating
+    // instruction can only be rewritten if it is impossible to project storage
+    // to any of its operands. (e.g. try_apply and switch_enum can be
+    // rewrittern, branch and cond_branch cannot).
+    assert(!oldValue->getDefiningInstruction());
+
     auto pos = valueHashMap.find(oldValue);
     assert(pos != valueHashMap.end());
     unsigned ordinal = pos->second;
@@ -383,9 +424,10 @@ public:
     return valueVector[storage.projectedStorageID];
   }
 
-  /// Record a storage projection from the use of the given operand
-  /// (e.g. struct, tuple, enum) into the operand's source.
-  void setComposedUseProjection(Operand *oper) {
+  /// Record a storage projection from the use of the given operand into the
+  /// operand's source. (e.g. Any value used by a struct, tuple, or enum may
+  /// project storage from its use).
+  void setComposingUseProjection(Operand *oper) {
     auto &storage = getStorage(oper->get());
     storage.projectedStorageID = getOrdinal(getValueOfOperandUse(oper));
     storage.projectedOperandNum = oper->getOperandNumber();
@@ -393,7 +435,7 @@ public:
   }
 
   /// Record a storage projection from the source of the given operand into its
-  /// use (e.g. struct_extract, tuple_extract).
+  /// use (e.g. struct_extract, tuple_extract project storage from their source).
   void setExtractedDefOperand(Operand *oper) {
     assert(isa<SingleValueInstruction>(oper->getUser()));
     auto &storage = getStorage(oper->get());
@@ -416,11 +458,14 @@ public:
   // (e.g. struct, tuple, enum) that projects storage from the use to the
   // operand's source.
   //
+  // Note that an aggregate may compose the same subobject
+  //
   // Postcondition: valueStorageMap.getStorage(result->get()) == storage.
   Operand *getUseProjectionOperand(ValueStorage &storage) {
     assert(storage.isUseProjection);
     SILValue useVal = getProjectedStorage(storage).value;
     auto *useInst = useVal->getDefiningInstruction();
+    //!!!!!
     return &useInst->getAllOperands()[storage.projectedOperandNum];
   }
 
@@ -977,7 +1022,7 @@ bool OpaqueStorageAllocation::setProjectionFromUser(C innerVals,
     if (canProjectFrom(checkDom, use->getUser())) {
       DEBUG(llvm::dbgs() << "  PROJECT "; use->getUser()->dump();
             llvm::dbgs() << "  into "; value->dump());
-      pass.valueStorageMap.setComposedUseProjection(use);
+      pass.valueStorageMap.setComposingUseProjection(use);
       return true;
     }
   }
@@ -1032,7 +1077,7 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
   // Regardless of whether we projected from a user or allocated storage,
   // provide this storage to all the incoming values that can reuse it.
   for (Operand *argOper : argStorageResult.getArgumentProjections())
-    pass.valueStorageMap.setComposedUseProjection(argOper);
+    pass.valueStorageMap.setComposingUseProjection(argOper);
 }
 
 static Operand *getBorrowedStorageOperand(SILValue value) {
@@ -2662,6 +2707,9 @@ static void removeCondBranchArgs(CondBranchInst *CBI, SILBasicBlock *targetBB,
 
 // Remove all opaque block arguments. Their inputs have already been substituted
 // with Undef.
+//
+// This can't be done while the valueStorageMap is still in use, because storage
+// may be a projection from a branch operand.
 //
 // FIXME: Generalize to other terminators.
 static void removeOpaqueBBArgs(SILBasicBlock *bb, AddressLoweringState &pass) {
