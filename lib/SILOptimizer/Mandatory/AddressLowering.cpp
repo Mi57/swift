@@ -757,7 +757,9 @@ struct AddressLoweringState {
   SmallSetVector<SILInstruction *, 16> instsToDelete;
 
 #ifndef NDEBUG
-  // Calls are removed after everything else.
+  // Calls are removed after everything else. This set contains all original
+  // calls with multiple results, where at least one result is indirect.
+  //
   // FIXME: MultiValue. Until calls are deleted like all other values, they need
   // to be carefully orchestrated w.r.t. their tuple values.
   SmallSetVector<ApplyInst *, 16> callsToDelete;
@@ -1778,25 +1780,19 @@ class ApplyRewriter {
   SILFunctionConventions origFnConv;
   SILFunctionConventions loweredFnConv;
   SILLocation callLoc;
-  
+
   // This apply site mutates when the new apply instruction is generated.
   ApplySite apply;
 
-  struct CallInfo {
-  };
-
 public:
   ApplyRewriter(ApplySite origCall, AddressLoweringState &pass)
-    : pass(pass),
-      argBuilder(origCall.getInstruction()),
-      resultBuilder(getCallResultInsertionPoint()),
-      addrMat(pass, argBuilder),
-      origFnConv(origCall.getSubstCalleeConv()),
-      loweredCalleeConv(origCall.getSubstCalleeType(),
-                        SILModuleConventions::getLoweredAddressConventions()),
-      callLoc(origCall.getLoc()),
-      apply(origCall)
-  {
+      : pass(pass), argBuilder(origCall.getInstruction()),
+        resultBuilder(getCallResultInsertionPoint()), addrMat(pass, argBuilder),
+        origFnConv(origCall.getSubstCalleeConv()),
+        loweredCalleeConv(origCall.getSubstCalleeType(),
+                          SILModuleConventions::getLoweredAddressConventions()),
+        callLoc(origCall.getLoc()), origResultStorage(nullptr),
+        apply(origCall) {
     argBuilder.setSILConventions(
         SILModuleConventions::getLoweredAddressConventions());
     resultBuilder.setSILConventions(
@@ -1824,14 +1820,17 @@ protected:
   void getNewCallArgsAndResults(SmallVector<SILValue> &newCallArgs,
                                 SmallVector<unsigned> &newDirectResultIndices);
 
-  void rewriteApply(ApplyInst *AI, ArrayRef<SILValue> newCallArgs);
-  void rewriteTryApply(TryApplyInst *TAI, ArrayRef<SILValue> newCallArgs);
-
-  void rewriteResults(SILInstruction *useInst,
-                      ArrayRef<unsigned> newDirectResultIndices);
-  
   SILValue materializeIndirectResultAddress(SILValue origDirectResultVal,
                                             SILType argTy);
+
+  ApplyInst *genApply(ApplyInst *AI, ArrayRef<SILValue> newCallArgs);
+  void rewriteTryApply(TryApplyInst *TAI, ArrayRef<SILValue> newCallArgs);
+
+  void rewriteResult(SILInstruction *useInst,
+                     ArrayRef<unsigned> newDirectResultIndices,
+                     SILValue origCallResult, SILValue newCallResult);
+
+  void removeCall(ApplyInst *AI);
 };
 } // end anonymous namespace
 
@@ -1853,18 +1852,38 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
     getUserRange(getCallPseudoResult(apply)));
 
   switch (apply.getInstruction()->getKind()) {
-  case SILInstructionKind::ApplyInst:
-    rewriteApply(cast<ApplyInst>(apply.getInstruction()), newCallArgs);
+  case SILInstructionKind::ApplyInst: {
+    auto *origCallInst = cast<ApplyInst>(apply.getInstruction());
+    ApplyInst *newCallInst = genApply(origCallInst, newCallArgs);
+
+    // Replace all unmapped uses of the original call with uses of the new call.
+    for (SILInstruction *useInst : origUsers) {
+      rewriteResult(useInst, newDirectResultIndices,
+                    getCallPseudoResult(origCallInst),
+                    getCallPseudoResult(newCallInst));
+    }
+    this->apply = ApplySite(newCallInst);
+    // If this call won't be visited as an opaque value def, mark it deleted.
+    // Note: Simply checking whether this call is address-only is insufficient,
+    // because the address-only use may be have been dead to begin with.
+    if (!pass.valueStorageMap.contains(origCallInst))
+      removeCall(origCallInst);
+
+    return;
+  }
+  case SILInstructionKind::TryApplyInst: {
+    // this->apply will be updated with the new try_apply instruction.
+    // The returned origResult is a placeHolder mapped to the original result
+    // storage.
+    SILValue origResult = rewriteTryApply(
+        cast<TryApplyInst>(apply.getInstruction()), newCallArgs);
+
     // Replace all unmapped uses of the original call with uses of the new call.
     for (SILInstruction *useInst : origUsers)
-      rewriteResult(useInst, newDirectResultIndices);
-    
-  case SILInstructionKind::TryApplyInst:
-    rewriteTryApply(cast<TryApplyInst>(apply.getInstruction()), newCallArgs);
-    // Replace all unmapped uses of the original call with uses of the new call.
-    for (SILInstruction *useInst : origUsers)
-      rewriteResult(useInst, newDirectResultIndices);
-    
+      rewriteResult(useInst, newDirectResultIndices, origResult,
+                    getCallPseudoResult(apply));
+    return;
+  }
   case SILInstructionKind::PartialApplyInst:
     llvm_unreachable("partial_apply cannot have indirect results.");
   default:
@@ -1990,115 +2009,6 @@ void ApplyRewriter::getNewCallArgsAndResults(
   }
 }
 
-void ApplyRewriter::rewriteApply(ApplyInst *AI, ArrayRef<SILValue> newCallArgs) {
-  newCallValue = argBuilder.createApply(
-    loc, apply.getCallee(), apply.getSubstitutions(), newCallArgs,
-    AI->isNonThrowing(), AI->getSpecializationInfo());
-
-  // Update this rewriter's apply, but leave origCallInst around until
-  // extracts have been rewritten below.
-  //
-  // If the call is address-only, don't delete it at all until dead code removal
-  // because its storage may be tracked.
-  this->apply = ApplySite(AI);
-}
-
-void ApplyRewriter::rewriteTryApply(TryApplyInst *TAI,
-                                    ArrayRef<SILValue> newCallArgs) {
-  auto *TAI = cast<TryApplyInst>(origCallInst);
-  auto *newCallInst = argBuilder.createTryApply(
-    loc, apply.getCallee(), apply.getSubstitutions(), newCallArgs,
-    TAI->getNormalBB(), TAI->getErrorBB(), TAI->getSpecializationInfo());
-
-  // Immediately delete the old try_apply (old applies hang around until
-  // dead code removal because they define values).
-  origCallInst->eraseFromParent();
-  origCallInst = nullptr;
-  this->apply = ApplySite(newCallInst);
-
-  // Maybe both results are direct.
-  if (origCallValue->getType() == loweredCalleeConv.getSILResultType()) {
-    newCallValue = origCallValue;
-    break;
-  }
-  auto *resultArg = cast<SILPHIArgument>(origCallValue);
-
-  // Rewriting the apply with a new result type requires erasing any opaque
-  // block arguments.  Create dummy loads to stand in for those block
-  // arguments until everything has been rewritten. Just load from undef
-  // since, for tuple results, there's no storage address to load from.
-  LoadInst *loadArg = resultBuilder.createLoad(
-    newCallInst->getLoc(),
-    SILUndef::get(resultArg->getType().getAddressType(),
-                  pass.F->getModule()),
-    LoadOwnershipQualifier::Unqualified);
-  
-  if (pass.valueStorageMap.contains(resultArg)) {
-    assert(!resultArg->getType().is<TupleType>());
-
-    // Storage was materialized by materializeIndirectResultAddress above.
-    auto &origStorage = pass.valueStorageMap.getStorage(resultArg);
-    assert(origStorage.isRewritten);
-    
-    pass.valueStorageMap.replaceValue(resultArg, loadArg);
-  }
-  resultArg->replaceAllUsesWith(loadArg);
-  assert(resultArg->getParent()->getNumArguments() == 1);
-  newCallValue = resultArg->getParent()->replacePHIArgument(
-    0, loweredCalleeConv.getSILResultType(),
-    origCallValue.getOwnershipKind(), resultArg->getDecl());
-
-  // After replacePHIArgument, origCallValue is no more.
-  origCallValue = loadArg;
-}
-
-void ApplyRewriter::rewriteResults(SILInstruction *useInst,
-                                   ArrayRef<unsigned> newDirectResultIndices) {
-  // Replace any unmapped use of the original calls single result, or
-  // pseudo-result with a use of the new call.
-  auto *extractInst = dyn_cast<TupleExtractInst>(useInst);
-  if (!extractInst) {
-    // Single results should be replaced when rewriting the call itself.
-    assert(origFnConv.getNumDirectSILResults() == 1);
-    assert(pass.valueStorageMap.getStorage(origCallValue).isRewritten);
-    return;
-  }
-  unsigned origResultIdx = extractInst->getFieldNo();
-  auto resultInfo = origFnConv.getResults()[origResultIdx];
-
-  if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
-    // Uses of indirect results will be rewritten by AddressOnlyUseRewriter.
-    assert(loweredCalleeConv.isSILIndirect(resultInfo));
-    // Mark the extract as rewritten now so we don't attempt to convert the
-    // call again.
-    pass.valueStorageMap.getStorage(extractInst).markRewritten();
-    // FIXME: do we need this? It should be placed on the dead list later.
-    if (extractInst->use_empty())
-      pass.markDead(extractInst);
-    continue;
-  }
-  if (loweredCalleeConv.isSILIndirect(resultInfo)) {
-    // This loadable indirect use should already be redirected to a load from
-    // the argument storage and marked dead.
-    assert(extractInst->use_empty() && pass.isDead(extractInst));
-    continue;
-  }
-  // Either the new call instruction has only a single direct result, or we
-  // map the original tuple field to the new tuple field.
-  SILValue newResultVal = newCallValue;
-  if (loweredCalleeConv.getNumDirectSILResults() > 1) {
-    assert(newCallValue->getType().is<TupleType>());
-    newResultVal = resultBuilder.createTupleExtract(
-      extractInst->getLoc(), newCallValue,
-      newDirectResultIndices[origResultIdx]);
-    }
-  // Since this is a loadable type, there's no associated storage, so
-  // erasing the instruction and rewriting is use operands doesn't invalidate
-  // any ValueStorage.
-  extractInst->replaceAllUsesWith(newResultVal);
-  extractInst->eraseFromParent();
-}
-
 /// Return the storage address for the indirect result corresponding to the
 /// given original result value. Allocate temporary argument storage for any
 /// indirect results that are unmapped because they are loadable or unused.
@@ -2141,234 +2051,108 @@ ApplyRewriter::materializeIndirectResultAddress(SILValue origDirectResultVal,
   return SILValue(allocInst);
 }
 
-/// Allocate storage for formally indirect results at the given call site.
-/// Create a new call instruction with indirect SIL arguments.
-void ApplyRewriter::convertApplyWithIndirectResults() {
-  assert(apply.getSubstCalleeType()->hasIndirectFormalResults());
+ApplyInst *ApplyRewriter::genApply(ApplyInst *AI,
+                                   ArrayRef<SILValue> newCallArgs) {
+  return argBuilder.createApply(
+      callLoc, apply.getCallee(), apply.getSubstitutions(), newCallArgs,
+      AI->isNonThrowing(), AI->getSpecializationInfo());
+}
 
-  auto *origCallInst = apply.getInstruction();
-  // FIXME: MultiValue calls.
-  SILValue origCallValue = getCallPseudoResult(apply);
+/// Replace the given try_apply with a new try_apply using the given
+/// newCallArgs. Return the value representing the original (address-only)
+/// result of the try_apply, which will now be replaced with a fake load.
+///
+/// Update this->apply with the new call instruction.
+SILValue ApplyRewriter::rewriteTryApply(TryApplyInst *TAI,
+                                        ArrayRef<SILValue> newCallArgs) {
 
-  // Gather the original direct return values.
-  // Canonicalize results so no user uses more than one result.
-  SmallVector<SILValue, 8> origDirectResultValues(
-      origFnConv.getNumDirectSILResults());
-  SmallVector<Operand *, 4> nonCanonicalUses;
-  if (origCallValue->getType().is<TupleType>()) {
-    for (Operand *operand : origCallValue->getUses()) {
-      if (auto *extract = dyn_cast<TupleExtractInst>(operand->getUser()))
-        origDirectResultValues[extract->getFieldNo()] = extract;
-      else
-        nonCanonicalUses.push_back(operand);
-    }
-    if (!nonCanonicalUses.empty())
-      canonicalizeResults(origDirectResultValues, nonCanonicalUses);
-  } else {
-    // This call has a single result. Convert it to an indirect
-    // result. (convertApplyWithIndirectResults is only invoked for calls with
-    // at least one indirect result). An unused result can remain
-    // unmapped. Temporary storage will be allocated later when fixing up the
-    // call's uses.
-    assert(origDirectResultValues.size() == 1);
-    origDirectResultValues[0] = origCallValue;
+  SILPHIArgument *resultArg = getTryApplyPseudoResult(TAI);
+  assert(resultArg->getParent()->getNumArguments() == 1);
+
+  auto *newCallInst = argBuilder.createTryApply(
+      callLoc, apply.getCallee(), apply.getSubstitutions(), newCallArgs,
+      TAI->getNormalBB(), TAI->getErrorBB(), TAI->getSpecializationInfo());
+
+  // Immediately delete the old try_apply (old applies hang around until
+  // dead code removal because they define values).
+  TAI->eraseFromParent();
+  this->apply = ApplySite(newCallInst);
+
+  // Rewriting the apply with a new result type requires erasing any opaque
+  // block arguments.  Create dummy loads to stand in for those block
+  // arguments until everything has been rewritten. Just load from undef
+  // since, for tuple results, there's no storage address to load from.
+  LoadInst *loadArg = resultBuilder.createLoad(
+      callLoc,
+      SILUndef::get(resultArg->getType().getAddressType(), pass.F->getModule()),
+      LoadOwnershipQualifier::Unqualified);
+
+  if (pass.valueStorageMap.contains(resultArg)) {
+    assert(!resultArg->getType().is<TupleType>());
+
+    // Storage was materialized by materializeIndirectResultAddress.
+    auto &origStorage = pass.valueStorageMap.getStorage(resultArg);
+    assert(origStorage.isRewritten);
+    (void)origStorage;
+
+    pass.valueStorageMap.replaceValue(resultArg, loadArg);
   }
+  resultArg->replaceAllUsesWith(loadArg);
 
-  // Prepare to emit a new call instruction.
-  SILLocation loc = origCallInst->getLoc();
+  return loadArg;
+}
 
-  // Use this->callBuilder for building incoming arguments and materializing
-  // addresses. Use resultBuilder for loading results.
-  SILBuilder resultBuilder(getCallResultInsertionPoint());
-  resultBuilder.setSILConventions(
-      SILModuleConventions::getLoweredAddressConventions());
-  resultBuilder.setCurrentDebugScope(origCallInst->getDebugScope());
-
-  // The new call instruction's SIL calling convention.
-  SILFunctionConventions loweredCalleeConv(
-      apply.getSubstCalleeType(),
-      SILModuleConventions::getLoweredAddressConventions());
-
-  // The new call instruction's SIL argument list.
-  SmallVector<SILValue, 8> newCallArgs(loweredCalleeConv.getNumSILArguments());
-
-  // Map the original result indices to new result indices.
-  SmallVector<unsigned, 8> newDirectResultIndices(
-    origFnConv.getNumDirectSILResults());
-  // Indices used to populate newDirectResultIndices.
-  unsigned oldDirectResultIdx = 0, newDirectResultIdx = 0;
-
-  // The index of the next indirect result argument.
-  unsigned newResultArgIdx =
-      loweredCalleeConv.getSILArgIndexOfFirstIndirectResult();
-
-  // Visit each result. Redirect results that are now indirect by calling
-  // materializeIndirectResultAddress. Results that remain direct will be
-  // redirected later. Populate newCallArgs and newDirectResultIndices.
-  for_each(
-      apply.getSubstCalleeType()->getResults(), origDirectResultValues,
-      [&](SILResultInfo resultInfo, SILValue origDirectResultVal) {
-        // Assume that all original results are direct in SIL.
-        assert(!origFnConv.isSILIndirect(resultInfo));
-
-        if (loweredCalleeConv.isSILIndirect(resultInfo)) {
-          SILValue indirectResultAddr = materializeIndirectResultAddress(
-              origDirectResultVal, loweredCalleeConv.getSILType(resultInfo));
-          // Record the new indirect call argument.
-          newCallArgs[newResultArgIdx++] = indirectResultAddr;
-          // Leave a placeholder for indirect results.
-          newDirectResultIndices[oldDirectResultIdx++] = ~0;
-        } else {
-          // Record the new direct result, and advance the direct result
-          // indices.
-          newDirectResultIndices[oldDirectResultIdx++] = newDirectResultIdx++;
-        }
-        // replaceAllUses will be called later to handle direct results that
-        // remain direct results of the new call instruction.
-      });
-
-  // Append the existing call arguments to the SIL argument list. They were
-  // already lowered to addresses by rewriteIncomingArgument.
-  assert(newResultArgIdx == loweredCalleeConv.getSILArgIndexOfFirstParam());
-  unsigned origArgIdx = apply.getSubstCalleeConv().getSILArgIndexOfFirstParam();
-  for (unsigned endIdx = newCallArgs.size(); newResultArgIdx < endIdx;
-       ++newResultArgIdx, ++origArgIdx) {
-    newCallArgs[newResultArgIdx] = apply.getArgument(origArgIdx);
-  }
-
-  // Collect the original uses before removing a bb arg.
-  SmallVector<SILInstruction *, 8> origUsers(getUserRange(origCallValue));
-
-  // Create a new call value to represent the remaining direct uses.
-  SILValue newCallValue;
-  switch (origCallInst->getKind()) {
-  case SILInstructionKind::ApplyInst: {
-    auto *AI = cast<ApplyInst>(origCallInst);
-    newCallValue = argBuilder.createApply(
-        loc, apply.getCallee(), apply.getSubstitutions(), newCallArgs,
-        AI->isNonThrowing(), AI->getSpecializationInfo());
-
-    // Update this rewriter's apply, but leave origCallInst around until
-    // extracts have been rewritten below. If it's not loadable don't delete it
-    // at all until dead code removal because its storage may be tracked.
-    this->apply = ApplySite(AI);
-    break;
-  }
-  case SILInstructionKind::TryApplyInst: {
-    auto *TAI = cast<TryApplyInst>(origCallInst);
-    auto *newCallInst = argBuilder.createTryApply(
-        loc, apply.getCallee(), apply.getSubstitutions(), newCallArgs,
-        TAI->getNormalBB(), TAI->getErrorBB(), TAI->getSpecializationInfo());
-
-    // Immediately delete the old try_apply (old applies hang around until
-    // dead code removal because they define values).
-    origCallInst->eraseFromParent();
-    origCallInst = nullptr;
-    this->apply = ApplySite(newCallInst);
-
-    // Maybe both results are direct.
-    if (origCallValue->getType() == loweredCalleeConv.getSILResultType()) {
-      newCallValue = origCallValue;
-      break;
-    }
-    auto *resultArg = cast<SILPHIArgument>(origCallValue);
-
-    // Rewriting the apply with a new result type requires erasing any opaque
-    // block arguments.  Create dummy loads to stand in for those block
-    // arguments until everything has been rewritten. Just load from undef
-    // since, for tuple results, there's no storage address to load from.
-    LoadInst *loadArg = resultBuilder.createLoad(
-        newCallInst->getLoc(),
-        SILUndef::get(resultArg->getType().getAddressType(),
-                      pass.F->getModule()),
-        LoadOwnershipQualifier::Unqualified);
-
-    if (pass.valueStorageMap.contains(resultArg)) {
-      assert(!resultArg->getType().is<TupleType>());
-
-      // Storage was materialized by materializeIndirectResultAddress above.
-      auto &origStorage = pass.valueStorageMap.getStorage(resultArg);
-      assert(origStorage.isRewritten);
-
-      pass.valueStorageMap.replaceValue(resultArg, loadArg);
-    }
-    resultArg->replaceAllUsesWith(loadArg);
-    assert(resultArg->getParent()->getNumArguments() == 1);
-    newCallValue = resultArg->getParent()->replacePHIArgument(
-        0, loweredCalleeConv.getSILResultType(),
-        origCallValue.getOwnershipKind(), resultArg->getDecl());
-
-    // After replacePHIArgument, origCallValue is no more.
-    origCallValue = loadArg;
-    break;
-  }
-  case SILInstructionKind::PartialApplyInst:
-    llvm_unreachable("partial_apply cannot have indirect results.");
-  default:
-    llvm_unreachable("unexpected apply kind.");
-  }
-
-  // Replace all unmapped uses of the original call with uses of the new call.
-  for (SILInstruction *useInst : origUsers) {
-    auto *extractInst = dyn_cast<TupleExtractInst>(useInst);
-    if (!extractInst) {
-      assert(origFnConv.getNumDirectSILResults() == 1);
-      assert(pass.valueStorageMap.getStorage(origCallValue).isRewritten);
-      continue;
-    }
-    unsigned origResultIdx = extractInst->getFieldNo();
-    auto resultInfo = origFnConv.getResults()[origResultIdx];
-
-    if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
-      // Uses of indirect results will be rewritten by AddressOnlyUseRewriter.
-      assert(loweredCalleeConv.isSILIndirect(resultInfo));
-      // Mark the extract as rewritten now so we don't attempt to convert the
-      // call again.
-      pass.valueStorageMap.getStorage(extractInst).markRewritten();
-      // FIXME: do we need this? It should be placed on the dead list later.
-      if (extractInst->use_empty())
-        pass.markDead(extractInst);
-      continue;
-    }
-    if (loweredCalleeConv.isSILIndirect(resultInfo)) {
-      // This loadable indirect use should already be redirected to a load from
-      // the argument storage and marked dead.
-      assert(extractInst->use_empty() && pass.isDead(extractInst));
-      continue;
-    }
-    // Either the new call instruction has only a single direct result, or we
-    // map the original tuple field to the new tuple field.
-    SILValue newResultVal = newCallValue;
-    if (loweredCalleeConv.getNumDirectSILResults() > 1) {
-      assert(newCallValue->getType().is<TupleType>());
-      newResultVal = resultBuilder.createTupleExtract(
-          extractInst->getLoc(), newCallValue,
-          newDirectResultIndices[origResultIdx]);
-    }
-    // Since this is a loadable type, there's no associated storage, so
-    // erasing the instruction and rewriting is use operands doesn't invalidate
-    // any ValueStorage.
-    extractInst->replaceAllUsesWith(newResultVal);
-    extractInst->eraseFromParent();
-  }
-  
-  // If this call won't be visited as an opaque value def, mark it deleted.
-  if (!origCallInst)
+// Replace any unmapped use of the original call's pseudo-result with a use of
+// the new call.
+void ApplyRewriter::rewriteResult(SILInstruction *useInst,
+                                  ArrayRef<unsigned> newDirectResultIndices,
+                                  SILValue origCallResult,
+                                  SILValue newCallResult) {
+  auto *extractInst = dyn_cast<TupleExtractInst>(useInst);
+  if (!extractInst) {
+    // If the original call produces a single result, it will be replaced when
+    // materializing the new call arguments.
+    assert(origFnConv.getNumDirectSILResults() == 1);
+    assert(pass.valueStorageMap.getStorage(origCallResult).isRewritten);
     return;
+  }
+  unsigned origResultIdx = extractInst->getFieldNo();
+  auto resultInfo = origFnConv.getResults()[origResultIdx];
 
-  auto *AI = dyn_cast<ApplyInst>(origCallInst);
-  if (!AI)
-    return;
-  
-  if (pass.valueStorageMap.contains(AI))
-    return;
+  if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
+    // Uses of indirect results will be rewritten by AddressOnlyUseRewriter.
+    assert(loweredCalleeConv.isSILIndirect(resultInfo));
+    // Mark the extract as rewritten now so we don't attempt to convert the
+    // call again.
+    pass.valueStorageMap.getStorage(extractInst).markRewritten();
+    continue;
+  }
+  if (loweredCalleeConv.isSILIndirect(resultInfo)) {
+    // This loadable indirect use should already be redirected to a load from
+    // the argument storage and marked dead.
+    assert(extractInst->use_empty() && pass.isDead(extractInst));
+    continue;
+  }
+  // Either the new call instruction has only a single direct result, or we
+  // map the original tuple field to the new tuple field.
+  if (loweredCalleeConv.getNumDirectSILResults() > 1) {
+    assert(newCallValue->getType().is<TupleType>());
+    newResultVal =
+        resultBuilder.createTupleExtract(extractInst->getLoc(), newCallResult,
+                                         newDirectResultIndices[origResultIdx]);
+  }
+  // Since this is a loadable type, there's no associated storage, so erasing
+  // the instruction and rewriting is use operands does not invalidate
+  // ValueStorage.
+  extractInst->replaceAllUsesWith(newCallResult);
+  extractInst->eraseFromParent();
+}
 
-  // This call has no storage. If it is used by an address_only tuple_extract,
-  // then it will be marked deleted only after that use is marked
-  // deleted. Otherwise all its uses must already be dead and it must be marked
-  // dead immediately.
-  // Note: Simply checking whether this call is address-only is insufficient,
-  // because the address-only use may be have been dead to begin with.
+// This call itself has no storage. If it is used by an address_only
+// tuple_extract, then it will be marked deleted only after that use is marked
+// deleted. Otherwise all its uses must already be dead and it must be marked
+// dead immediately.
+void ApplyRewriter::removeCall(ApplyInst *AI) {
   for (Operand *use : AI->getUses()) {
     auto *extract = cast<TupleExtractInst>(use->getUser());
     if (pass.valueStorageMap.contains(extract)) {
@@ -2821,6 +2605,8 @@ class AddressOnlyDefRewriter
   SILBuilder B;
   AddressMaterialization addrMat;
 
+  // This storage pointer is set before visiting a def for convenience, but if
+  // the valueStorageMap is mutated it is no longer valid.
   ValueStorage *storage = nullptr;
 
 public:
@@ -3283,15 +3069,13 @@ static void deleteRewrittenInstructions(AddressLoweringState &pass) {
     auto &storage = pass.valueStorageMap.getStorage(val);
     // Returned tuples and multi-result calls are currently values without
     // storage.  Everything else must have been rewritten.
-    assert(storage.isRewritten
-           || (!storage.storageAddress && (isa<TupleInst>(val))
-               || ApplySite::isa(val)));
+    assert(storage.isRewritten);
 #endif
     // TODO: MultiValueInstruction: ApplyInst
     auto *deadInst = dyn_cast<SingleValueInstruction>(val);
     if (!deadInst) {
       // Just skip block args. Remove all of a block's dead args in one pass to
-      // avoid rewriting all predecessors terminators multiple times :(.
+      // avoid rewriting all predecessors terminators multiple times.
       assert(isa<SILPHIArgument>(val));
       continue;
     }
