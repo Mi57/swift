@@ -152,10 +152,10 @@ getUserRange(SILValue val) {
                     llvm::map_iterator(val->use_end(), GetUser()));
 }
 
-// Visit all "actual" call results.
-// Stop when the visitor returns `false`.
-//
-// TODO: MultiValue. Remove this helper.
+/// Visit all "actual" call results.
+/// Stop when the visitor returns `false`.
+///
+/// TODO: MultiValue. Remove this helper.
 static void visitCallResults(ApplySite apply,
                              llvm::function_ref<bool(SILValue)> visitor) {
   // FIXME: this entire implementation only really works for ApplyInst.
@@ -170,31 +170,34 @@ static void visitCallResults(ApplySite apply,
     visitor(applyInst);
 }
 
-// Get the argument of a try_apply, or nullptr if it is unused.
-//
-// TODO: MultiValue: Only relevant for tuple pseudo results.
+/// Get the argument of a try_apply, or nullptr if it is unused.
+///
+/// TODO: MultiValue: Only relevant for tuple pseudo results.
 static SILPHIArgument *getTryApplyPseudoResult(TryApplyInst *TAI) {
   auto *argBB = TAI->getNormalBB();
   assert(argBB->getNumArguments() == 1);
   return argBB->getPHIArguments()[0];
 }
 
-// Get the tuple pseudo-value returned by the call.
-//
-// TODO: MultiValue: Only relevant for tuple pseudo results.
+/// Get the tuple pseudo-value returned by the call. It may be the call itself,
+/// a "fake" tuple without storage, or a block argument.
+///
+/// TODO: MultiValue: Only relevant for tuple pseudo results.
 SILValue getCallPseudoResult(ApplySite apply) {
   return isa<ApplyInst>(apply)
              ? SILValue(cast<SingleValueInstruction>(apply.getInstruction()))
              : SILValue(getTryApplyPseudoResult(cast<TryApplyInst>(apply)));
 }
 
-// TODO: MultiValue. Calls are SILValues, but when the result type is a tuple,
-// the call value does not represent a real value with storage. This is a
-// horrible situation for address lowering because there's no way to tell from
-// any given value whether its legal to assign storage to that
-// value. Consequently, the implementation of call lowering is a house of cards
-// that doesn't fall out naturally from the algorithm that lowers values to
-// storage.
+/// Return true if the given value is either a "fake" tuple that represents all
+/// of a call's results. This may be either a tuple_inst or a block argument.
+///
+/// TODO: MultiValue. Calls are SILValues, but when the result type is a tuple,
+/// the call value does not represent a real value with storage. This is a bad
+/// situation for address lowering because there's no way to tell from any given
+/// value whether its legal to assign storage to that value. As a result, the
+/// implementation of call lowering doesn't fall out naturally from the
+/// algorithm that lowers values to storage.
 static bool isPseudoCallResult(SILValue value) {
   if (isa<ApplyInst>(value))
     return value->getType().is<TupleType>();
@@ -211,63 +214,32 @@ static bool isPseudoCallResult(SILValue value) {
          && bbArg->getType().is<TupleType>();
 }
 
-/// Return the SILValue that represents the "user" of the given operand. If
-/// the operand's use is a SingleValueInstruction, the value is the user
-/// itself. If the operand's use is a block terminator, it is the
-/// corresponding block argument that represents the operand's value.
+/// Return the value associated with the user of a tuple element.
 ///
-/// It must be possible to project storage from the operand's use. For example,
-/// multi-result instructions and switch_num instructions do not produce a
-/// single value that their operand can be projected from. These cases will
-/// assert here, so the caller should check for and handle them specially.
-///
-/// TODO: Make this a utility or at least add
-/// CondBranchInst::getBlockArgForOperand?
-SILValue getValueOfOperandUse(Operand *operand) {
-  SILInstruction *user = operand->getUser();
-  auto *singleVal = dyn_cast<SingleValueInstruction>(user);
-  if (singleVal)
-    return singleVal;
-
-  switch (user->getKind()) {
-  default:
-#ifndef NDEBUG
-    user->dump();
-#endif
-    llvm_unreachable("Instruction cannot project storage through its operand.");
-
-  case SILInstructionKind::BranchInst: {
-    auto *BI = cast<BranchInst>(user);
-    unsigned bbArgIdx = BI->getArgIndexOfOperand(operand->getOperandNumber());
-    return BI->getDestBB()->getArgument(bbArgIdx);
+/// The given operand's user must be a TupleInst. For normal tuples, the value
+/// is the tuple itself. For returned tuples, the value is the indirect function
+/// argument. This requires indirect function arguments to be rewritten (see
+/// insertIndirectReturnArgs).
+static SILValue getTupleElementUserValue(Operand *oper) {
+  auto *TI = cast<TupleInst>(oper->getUser());
+  if (!tupleInst->hasOneUse()
+      || !isa<ReturnInst>(tupleInst->use_begin()->getUser())) {
+    return TI;
   }
-  case SILInstructionKind::CondBranchInst: {
-    auto *CBI = cast<CondBranchInst>(user);
-    unsigned opIdx = operand->getOperandNumber();
-    unsigned bbArgIdx;
-    if (CBI->isTrueOperandIndex(opIdx)) {
-      bbArgIdx = opIdx - CBI->getTrueOperands()[0].getOperandNumber();
-      return CBI->getTrueBB()->getArgument(bbArgIdx);
-    } else {
-      assert(CBI->isFalseOperandIndex(opIdx));
-      bbArgIdx = opIdx - CBI->getFalseOperands()[0].getOperandNumber();
-      return CBI->getFalseBB()->getArgument(bbArgIdx);
-    }
-  }
-  }
-}
+  unsigned opIdx = operand->getOperandNumber();
+  unsigned resultIdx = tupleInst->getElementIndex(operand);
 
-/// Return the given values defining instruction, handling block arguments (but
-/// not function arguments).
-SILInstruction *getDefiningInstructionForValue(SILValue value) {
-  if (auto *defInst = value->getDefiningInstruction())
-    return defInst;
+  SILFunction *F = TI->getFunction();
+  SILFunctionConventions loweredFnConv(
+      F->getLoweredFunctionType(),
+      SILModuleConventions::getLoweredAddressConventions());
 
-  auto *bbArg = cast<SILPHIArgument>(value);
-  auto *predBB = bbArg->getParent()->getSinglePredecessorBlock();
-  assert(predBB && "Critical edges are not allowed");
-  //!!!!!
-  
+  assert(resultIdx < pass.loweredFnConv.getNumIndirectSILResults());
+  (void)loweredFnConv;
+
+  // Cannot call getIndirectSILResults here because that API uses the
+  // function conventions before address lowering.
+  return F->getArguments()[resultIdx];
 }
 
 //===----------------------------------------------------------------------===//
@@ -286,19 +258,21 @@ namespace {
 /// values. Consequently, values that have storage cannot be removed from SIL or
 /// from the storage map until rewriting is complete. However, since we don't
 /// directly store references to any SIL entities, such as Operands or
-/// SILValues, mapped values can be replaced as long as the replacement values
-/// have the same number of Operands.
-///
-/// Avoid storing operand references in case some
-/// def-use rewritting occurs before formal rewritting.
+/// SILValues, mapped values can be replaced as long as the original value had
+/// no arguments (e.g. block arguments).
 struct ValueStorage {
   /// The final address of this storage unit after rewriting the SIL.
   /// For values linked to their own storage, this is set during storage
   /// allocation. For projections, it is only set after instruction rewriting.
   SILValue storageAddress;
 
+  /// Refer to another storage projection for isUseProjection ||
+  /// isDefProjection.
   uint32_t projectedStorageID;
-  uint16_t projectedOperandNum;
+  /// Identifies the operand index of a composed aggregate. Invalid for all
+  /// other kids of projections.
+  uint16_t projectedOperandOrPredNum;
+  /// Flags.
   unsigned isUseProjection : 1;
   unsigned isDefProjection : 1;
   unsigned isRewritten : 1;
@@ -424,18 +398,35 @@ public:
     return valueVector[storage.projectedStorageID];
   }
 
+  /// Return the non-projection storage after following all projections.
+  Storage &getNonProjectionStorage(ValueStorage &storage) {
+    if (storage.isDefProjection || storage.isUseProjection)
+      return getNonProjectionStorage(getProjectedStorage(storage).storage);
+
+    return storage;
+  }
+
   /// Record a storage projection from the use of the given operand into the
   /// operand's source. (e.g. Any value used by a struct, tuple, or enum may
   /// project storage from its use).
   void setComposingUseProjection(Operand *oper) {
     auto &storage = getStorage(oper->get());
+    //!!!! Make this specific to composed aggregates.
     storage.projectedStorageID = getOrdinal(getValueOfOperandUse(oper));
     storage.projectedOperandNum = oper->getOperandNumber();
     storage.isUseProjection = true;
   }
 
+  // The terminator argument can be deduced from the block argument that we
+  // project from.
+  void setBranchUseProjection(ValueStorage &storage, SILPHIArgument *bbArg) {
+    storage.projectedStorageID = getOrdinal(bbArg);
+    storage.isUseProjection = true;
+  }
+
   /// Record a storage projection from the source of the given operand into its
-  /// use (e.g. struct_extract, tuple_extract project storage from their source).
+  /// use (e.g. struct_extract, tuple_extract project storage from their
+  /// source).
   void setExtractedDefOperand(Operand *oper) {
     assert(isa<SingleValueInstruction>(oper->getUser()));
     auto &storage = getStorage(oper->get());
@@ -452,33 +443,6 @@ public:
       return false;
 
     return srcStorage.projectedOperandNum == oper->getOperandNumber();
-  }
-
-  // Given storage for a value, return the operand of the value's use
-  // (e.g. struct, tuple, enum) that projects storage from the use to the
-  // operand's source.
-  //
-  // Note that an aggregate may compose the same subobject
-  //
-  // Postcondition: valueStorageMap.getStorage(result->get()) == storage.
-  Operand *getUseProjectionOperand(ValueStorage &storage) {
-    assert(storage.isUseProjection);
-    SILValue useVal = getProjectedStorage(storage).value;
-    auto *useInst = useVal->getDefiningInstruction();
-    //!!!!!
-    return &useInst->getAllOperands()[storage.projectedOperandNum];
-  }
-
-  // Given storage for a value (e.g. defined by struct_extract, tuple_extract),
-  // return the operand of the value's defining instruction that projects
-  // storage from the operands source value.
-  //
-  // Postcondition:
-  //   valueStorageMap.getStorage(getValueOfOperandUse(result)) == storage.
-  Operand *getDefProjectionOperand(SingleValueInstruction *extractInst) {
-    auto &storage = getStorage(extractInst);
-    assert(storage.isDefProjection);
-    return &extractInst->getAllOperands()[storage.projectedOperandNum];
   }
 
 #ifndef NDEBUG
@@ -559,9 +523,357 @@ struct AddressLoweringState {
 };
 } // end anonymous namespace
 
+/// Def-projection oracle.
+///
+/// If this value is defined by an instruction that borrows storage from an
+/// operand, return that operand. Otherwise, return nullptr.
+///
+/// Invariant:
+///   `pass.valueStorageMap.getStorage(value).isDefProjection`
+/// If-and-only-if
+///   `getProjectedDefOperand(value) != nullptr`
+static Operand *getProjectedDefOperand(SILValue value) {
+  switch (value->getKind()) {
+  default:
+    return nullptr;
+
+  case ValueKind::TupleExtractInst:
+    // TupleExtract from an apply are handled specially until we have
+    // multi-result calls. Force them to allocate storage.
+    if (auto *TEI = dyn_cast<TupleExtractInst>(value)) {
+      if (ApplySite::isa(TEI->getOperand())
+          || isa<SILPHIArgument>(TEI->getOperand())) {
+        return nullptr;
+      }
+    }
+    LLVM_FALLTHROUGH;
+  case ValueKind::StructExtractInst:
+  case ValueKind::OpenExistentialValueInst:
+  case ValueKind::OpenExistentialBoxValueInst:
+    assert(value.getOwnershipKind() == ValueOwnershipKind::Guaranteed);
+    return &cast<SingleValueInstruction>(value)->getAllOperands()[0];
+  }
+}
+
+/// Use projection oracle (predicate).
+/// 
+/// Is this instruction an aggregate composed from a subobject, or does it
+/// forward the operand's value to storage defined elsewhere?
+///
+/// `getProjectedDefOperand(value) != nullptr`, then
+/// `pass.valueStorageMap.getStorage(value).isDefProjection`
+/// 
+/// Invariant: For all operands: def -> use
+/// If
+///   `pass.valueStorageMap.getStorage(def).isUseProjection`
+/// Then
+///   `canProjectUseFrom(use)`
+static bool canProjectUseFrom(SILInstruction *composedUser) {
+  switch (composingUse->getKind()) {
+  default:
+    return false;
+
+  // @in operands never need their own storage since they are non-mutating
+  // uses. They always reuse the storage allocated for their operand. So it
+  // wouldn't make sense to "project" out of the apply argument.
+  case SILInstructionKind::ApplyInst:
+  case SILInstructionKind::TryApplyInst:
+    return false;
+
+  // Return instructions can project from the caller's storage to the returned
+  // value.
+  case SILInstructionKind::ReturnInst:
+    return true;
+
+  // structs an enums are straightforward compositions.
+  case SILInstructionKind::StructInst:
+  case SILInstructionKind::EnumInst:
+    return true;
+
+  // A tuple is either a composition or forwards its element through a return
+  // through function argument storage. Either way, its element can be a
+  // use projection.
+  case SILInstructionKind::TupleInst:
+    return true;
+
+  // init_existential_value composes an existential value, but may depends on
+  // opened archetypes. The caller will need to check that storage dominates the
+  // opened types.
+  case SILInstructionKind::InitExistentialValueInst:
+    return true;
+
+  // Terminators that supply block arguments.
+  case SILInstructionKind::BranchInst:
+  case SILInstructionKind::CondBranchInst:
+  case SILInstructionKind::SwitchEnumInst:
+    return true;
+  }
+  // TODO: SwitchValueInst, CheckedCastValueBranchInst.
+}
+
+/// Def/use projection oracle (operand/value association).
+/// 
+/// Return the SILValue that may be associated with storage for the given
+/// operand's non-branch user.
+///
+/// If an no SILValues is returned, then there can be no storage projection
+/// from either the operand's source to its use (def projection), or from its
+/// use to its source (use projection).
+///
+/// Returning a valid SILValue does not indicate the existence of a projection;
+/// only that *if* there is use or def projection, then that can be determined
+/// be checking the returned value's storage.
+static SILValue getStorageValueForNonBranchUse(Operand *operand,
+                                               AddressLoweringState &pass) {
+  SILInstruction *user = operand->getUser();
+
+  // Tuples are special because they may represent returned values.
+  if (auto *TI = dyn_cast<TupleInst>(user))
+    return getTupleElementUserValue(operand);
+
+  if (auto *singleVal = dyn_cast<SingleValueInstruction>(user)) {
+    // Calls do not project storage onto their arguments.
+    if (ApplySite::isa(singleVal))
+      return SILValue();
+
+    return singleVal;
+  }
+
+  switch (user->getKind()) {
+  default:
+    return SILValue();
+
+  case SILInstruction::ReturnInst {
+    auto *RI = cast<ReturnInst>(user);
+
+    assert(pass.loweredFnConv.getNumIndirectSILResults() == 1);
+
+    // Cannot call getIndirectSILResults here because that API uses the
+    // function conventions before address lowering.
+    return pass.F->getArguments()[resultIdx];
+
+  case SILInstructionKind::TryApplyInst:
+  case SILInstructionKind::BranchInst:
+  case SILInstructionKind::CondBranchInst:
+  case SILInstructionKind::SwitchEnumInst:
+    // Projections through branches are intentionally ignored here.
+    return SILValue();
+  }
+}
+
+/// Def/use projection oracle (operand/value association).
+/// 
+/// Return the SILValues that may be associated with storage for the given
+/// operand's user in the `storageValues` vector.
+///
+/// If an no SILValues are returned, then there can be no storage projection
+/// from either the operand's source to its use (def projection), or from its
+/// use to its source (use projection).
+///
+/// Returning a valid SILValue does not indicate the existence of a projection;
+/// only that *if* there is use or def projection, then that can be determined
+/// be checking the returned value's storage.
+///
+/// In particular, for any operand: def -> use.
+/// If
+///   'valueStorageMap.getStorage(use).isDefProjection'
+/// Then
+///   'getStorageValuesForOperandUse(pass, operand) == {use}'
+/// 
+/// And If
+///   'valueStorageMap.getStorage(def).isUseProjection'
+/// Then
+///   'valueStorageMap.getProjectedStorage(valueStorageMap.getStorage(def))
+///      in valueStorageMap.getStorage(
+///           getStorageValuesForOperandUse(pass, operand))
+///
+/// This oracle reifies logic for getting from an operand to a set of storage
+/// values. All routines in this pass need to agree on it. This allows checking
+/// whether a value's use may have been coalesced with another value's storage,
+/// which then makes it possible to reason about storage liveness once in the
+/// presence of storage projections. i.e. it allows any code with access to a
+/// valueStorageMap to check if a value's storage is coalesced with a use.
+///
+/// If the operand's user is a SingleValueInstruction, the storage value is the
+/// user itself. If the operand's user is a block terminator, it is the
+/// corresponding block argument that represents the operand's value. If the
+/// operand's user is a return_inst, it is an outgoing function argument.
+///
+/// switch_enum returns a SILValue for each case because it is possible to
+/// project storage from any one of the switch_enum's cases.
+///
+/// No SIL value will be returned for instructions that neither extract a
+/// subobject nor can project storage into an operand.
+static void
+getStorageValuesForOperandUse(Operand *operand, AddressLoweringState &pass,
+                              SmallVectorImpl<SILValue> &storageValues) {
+  SILInstruction *user = operand->getUser();
+
+  auto pushResult() [&](SILValue v){ storageValues.push_back(v) }
+
+  if (SILValue useVal = getStorageValueForNonBranchUse(operand, pass))
+    return pushResult(useVal);
+
+  // Handle branches.
+  switch (user->getKind()) {
+  default:
+    return;
+
+  case SILInstructionKind::TryApplyInst {
+    // Calls do not project storage onto their arguments.
+    return;
+
+  } case SILInstructionKind::BranchInst: {
+    auto *BI = cast<BranchInst>(user);
+    unsigned bbArgIdx = BI->getArgIndexOfOperand(operand->getOperandNumber());
+    return pushResult(BI->getDestBB()->getArgument(bbArgIdx));
+  }
+
+  // TODO: Add a utility for CondBranchInst::getBlockArgForOperand?
+  case SILInstructionKind::CondBranchInst: {
+    auto *CBI = cast<CondBranchInst>(user);
+    unsigned opIdx = operand->getOperandNumber();
+    unsigned bbArgIdx;
+    if (CBI->isTrueOperandIndex(opIdx)) {
+      bbArgIdx = opIdx - CBI->getTrueOperands()[0].getOperandNumber();
+      return pushResult(CBI->getTrueBB()->getArgument(bbArgIdx));
+    } else {
+      assert(CBI->isFalseOperandIndex(opIdx));
+      bbArgIdx = opIdx - CBI->getFalseOperands()[0].getOperandNumber();
+      return pushResult(CBI->getFalseBB()->getArgument(bbArgIdx));
+    }
+  }
+
+  case SILInstructionKind::SwitchEnumInst {
+    // Collect switch cases for rewriting and remove block arguments.
+    for (unsigned caseIdx : range(SEI->getNumCases())) {
+      auto *caseBB = SEI->getCase(caseIdx).second;
+      if (caseBB->getArguments().size() == 0)
+        continue;
+
+      assert(caseBB->getPHIArguments().size() == 1);
+      pushResult(caseBB->getPHIArguments()[0]);
+    }
+    return;
+  }
+  // TODO: SwitchValueInst, CheckedCastValueBranchInst.
+  }
+}
+
+#if 0  //!!!
+/// Given storage for a value, return the operand of the value's use
+/// (e.g. struct, tuple, enum) that projects storage from the use to the
+/// operand's source.
+///
+/// The given storage must be a use projection. Returns one of:
+/// - the operand of a composed aggregate (struct, tuple, enum).
+/// - the operand of a terminator corresponding to a block argument.
+/// - the operand of a returned tuple_inst corresponding to a function result.
+Operand *ValueStorageMap::getUseProjectionOperand(ValueStorage &storage) {
+  assert(storage.isUseProjection);
+
+  SILValue useVal = getProjectedStorage(storage).value;
+  // The DefiningInstruction case handles both composed aggregates and returned
+  // tuples.
+  auto *useInst = useVal->getDefiningInstruction();
+  if (useInst)
+    return &useInst->getAllOperands()[storage.projectedOperandNum];
+
+  // Everything else is a block argument.
+  auto *bbArg = cast<SILArgument>(useVal);
+  auto *predBB = bbArg->getParent()->getSinglePredecessorBlock();
+  assert(predBB && "Critical edges are not allowed");
+  
+    
+}
+
+// Given storage for a value (e.g. defined by struct_extract, tuple_extract),
+// return the operand of the value's defining instruction that projects
+// storage from the operand's source value.
+//
+// Postcondition:
+//   valueStorageMap.getStorage(getValueOfOperandUse(result)) == storage.
+Operand *ValueStorageMap::
+getDefProjectionOperand(SingleValueInstruction *extractInst) {
+  auto &storage = getStorage(extractInst);
+  assert(storage.isDefProjection);
+  return &extractInst->getAllOperands()[storage.projectedOperandNum];
+}
+#endif // !!!
+
 //===----------------------------------------------------------------------===//
 // OpaqueValueVisitor: Map OpaqueValues to ValueStorage.
 //===----------------------------------------------------------------------===//
+
+/// Before populating the ValueStorageMap, replace each value-typed argument to
+/// the current function with an address-typed argument by inserting a temporary
+/// load instruction.
+static void convertIndirectFunctionArgs(AddressLoweringState &pass) {
+  // Insert temporary argument loads at the top of the function.
+  SILBuilderWithScope argBuilder(pass.F->getEntryBlock()->begin());
+  argBuilder.setSILConventions(
+      SILModuleConventions::getLoweredAddressConventions());
+  argBuilder.setOpenedArchetypesTracker(&pass.openedArchetypesTracker);
+
+  auto fnConv = pass.F->getConventions();
+  unsigned argIdx = fnConv.getSILArgIndexOfFirstParam();
+  for (SILParameterInfo param :
+       pass.F->getLoweredFunctionType()->getParameters()) {
+
+    if (param.isFormalIndirect() && !fnConv.isSILIndirect(param)) {
+      SILArgument *arg = pass.F->getArgument(argIdx);
+      SILType addrType = arg->getType().getAddressType();
+
+      LoadInst *loadArg = argBuilder.createLoad(
+          SILValue(arg).getLoc(), SILUndef::get(addrType, pass.F->getModule()),
+          LoadOwnershipQualifier::Unqualified);
+
+      arg->replaceAllUsesWith(loadArg);
+      assert(!pass.valueStorageMap.contains(arg));
+
+      arg = arg->getParent()->replaceFunctionArgument(
+          arg->getIndex(), addrType, ValueOwnershipKind::Trivial,
+          arg->getDecl());
+
+      loadArg->setOperand(arg);
+
+      if (addrType.isAddressOnly(pass.F->getModule()))
+        pass.valueStorageMap.insertValue(loadArg).storageAddress = arg;
+    }
+    ++argIdx;
+  }
+  assert(argIdx
+         == fnConv.getSILArgIndexOfFirstParam() + fnConv.getNumSILArguments());
+}
+
+/// Before populating the ValueStorageMap, insert function arguments for any
+/// @out result type. Return the number of indirect result arguments added.
+static unsigned insertIndirectReturnArgs() {
+  auto &ctx = pass.F->getModule().getASTContext();
+  unsigned argIdx = 0;
+  for (auto resultTy : pass.loweredFnConv.getIndirectSILResultTypes()) {
+    auto bodyResultTy = pass.F->mapTypeIntoContext(resultTy);
+    auto var = new (ctx)
+        ParamDecl(VarDecl::Specifier::InOut, SourceLoc(), SourceLoc(),
+                  ctx.getIdentifier("$return_value"), SourceLoc(),
+                  ctx.getIdentifier("$return_value"),
+                  bodyResultTy.getSwiftRValueType(), pass.F->getDeclContext());
+
+    SILFunctionArgument *funcArg = pass.F->begin()->insertFunctionArgument(
+        argIdx, bodyResultTy.getAddressType(), ValueOwnershipKind::Trivial,
+        var);
+    // Insert function results into valueStorageMap so that the caller storage
+    // can be projected onto values inside the function as use projections.
+    auto &storage = pass.valueStorageMap.insertValue(funcArg);
+    // This is the only case where a value defines its own storage.
+    storage.storageAddress = funcArg;
+    storage.isRewritten = true;
+      
+    ++argIdx;
+  }
+  assert(argIdx == pass.loweredFnConv.getNumIndirectSILResults());
+  return argIdx;
+}
 
 namespace {
 /// Collect all opaque/resilient values, inserting them in `valueStorageMap` in
@@ -641,7 +953,7 @@ void OpaqueValueVisitor::checkForIndirectApply(ApplySite applySite) {
     pass.indirectApplies.insert(applySite);
 }
 
-/// If `value` is address-only add it to the `valueStorageMap`.
+/// If `value` is address-only, add it to the `valueStorageMap`.
 void OpaqueValueVisitor::visitValue(SILValue value) {
   if (value->getType().isObject()
       && value->getType().isAddressOnly(pass.F->getModule())) {
@@ -653,6 +965,22 @@ void OpaqueValueVisitor::visitValue(SILValue value) {
     }
     pass.valueStorageMap.insertValue(value);
   }
+}
+
+/// Top-level entry point.
+///
+/// Prepare the SIL by rewriting function arguments and returns.
+/// Initialize the ValueStorageMap with an entry for each opaque value in the
+/// function.
+static prepareValueStorage(AddressLoweringState &pass) {
+  // Fixup this function's argument types with temporary loads.
+  convertIndirectFunctionArgs(pass);
+
+  // Create a new function argument for each indirect result.
+  insertIndirectReturnArgs();
+
+  // Populate valueStorageMap.
+  OpaqueValueVisitor(pass).mapValueStorage();
 }
 
 //===----------------------------------------------------------------------===//
@@ -687,6 +1015,11 @@ void OpaqueValueVisitor::visitValue(SILValue value) {
 //
 // In the end, we have a set of non-interfering incoming values that can reuse
 // the bbArg's storage.
+//
+// TODO: Implement strong-phi elimination to efficiently handle complex webs of
+// phis. This on-the-fly liveness approach is probably sufficient for simple
+// patterns, but we need to bail out if the recursion through coalesced users is
+// too deep.
 namespace {
 class BlockArgumentStorageOptimizer {
   class Result {
@@ -714,6 +1047,8 @@ class BlockArgumentStorageOptimizer {
     void clear() { projectedBBArgs.clear(); }
   };
 
+  AddressLoweringState &pass;
+
   SILPHIArgument *bbArg;
   Result result;
 
@@ -728,7 +1063,9 @@ class BlockArgumentStorageOptimizer {
   SmallVector<SILBasicBlock *, 16> liveBBWorklist;
 
 public:
-  BlockArgumentStorageOptimizer(SILPHIArgument *bbArg) : bbArg(bbArg) {}
+  BlockArgumentStorageOptimizer(AddressLoweringState &pass,
+                                SILPHIArgument *bbArg)
+      : pass(pass), bbArg(bbArg) {}
 
   Result &&computeArgumentProjections() &&;
 
@@ -771,6 +1108,16 @@ BlockArgumentStorageOptimizer::computeArgumentProjections() && {
   SmallVector<Operand *, 4> incomingOperands;
   bbArg->getIncomingOperands(incomingOperands);
 
+  assert(!pass.valueStorageMap.getStorage(bbArg).isDefProjection);
+
+  // If this block argument is already "coalesced", don't attempt to merge its
+  // live range with its incoming values.
+  // 
+  // TODO: recursively check liveness of use projections to allow use
+  // projections across block boundaries.
+  if (pass.valueStorageMap.getStorage(bbArg).isUseProjection)
+    return std::move(result);
+
   // Prune the single incoming value case.
   if (incomingOperands.size() == 1) {
     result.projectedBBArgs.push_back(incomingOperands[0]);
@@ -784,9 +1131,18 @@ BlockArgumentStorageOptimizer::computeArgumentProjections() && {
     blackBlocks.insert(predBB);
   }
 
+  SmallVector<SILValue, 2> storageValues;
+  
   for (auto *incomingOper : incomingOperands) {
     SILBasicBlock *incomingPred = incomingOper->getUser()->getParent();
     SILValue incomingVal = incomingOper->get();
+    
+    // TODO: handle incomingValues that project onto their operands by
+    // recursively finding the set of value definitions and their dominating
+    // defBB instead of incomingVal->getParentBlock().
+    if (pass.valueStorageMap.getStorage(incomingVal).isUseProjection) {
+      //!!!!!!!!!!
+    }
 
     bool erased = blackBlocks.erase(incomingPred);
     (void)erased;
@@ -794,8 +1150,10 @@ BlockArgumentStorageOptimizer::computeArgumentProjections() && {
 
     bool noInterference = true;
     // Continue marking live blocks even after detecting an interference so that
-    // the live set is complete when evaluating subsequent incoming vales.
+    // the live set is complete when evaluating subsequent incoming values.
     for (auto *use : incomingVal->getUses()) {
+      // TODO: recursively check liveness by following uses across use
+      // projections instead of just the immediate use.
       noInterference &=
           computeIncomingLiveness(use, incomingVal->getParentBlock());
     }
@@ -831,13 +1189,18 @@ public:
   void allocateOpaqueStorage();
 
 protected:
-  void convertIndirectFunctionArgs();
-  unsigned insertIndirectReturnArgs();
-  bool canProjectFrom(std::function<bool(SILValue)> checkDom,
-                      SILInstruction *composingUse);
-  template <typename C> bool setProjectionFromUser(C innerVals, SILValue value);
-  void allocateForBBArg(SILPHIArgument *bbArg);
   void allocateForValue(SILValue value);
+  bool findProjectionFromUser(SILValue value,
+                              ArrayRef<SILValue> incomingValues);
+
+  bool findProjectionFromUser(SILValue value) {
+    return findProjectionFromUser(value, ArrayRef<SILValue>(value));
+  }
+
+  bool checkStorageDominates(AllocStackInst *allocInst,
+                             ArrayRef<SILValue> incomingValues);
+
+  void allocateForBBArg(SILPHIArgument *bbArg);
   AllocStackInst *createStackAllocation(SILValue value);
 
   void createStackAllocationStorage(SILValue value) {
@@ -849,188 +1212,116 @@ protected:
 
 /// Top-level entry point: allocate storage for all opaque/resilient values.
 void OpaqueStorageAllocation::allocateOpaqueStorage() {
-  // Fixup this function's argument types with temporary loads.
-  convertIndirectFunctionArgs();
-
-  // Create a new function argument for each indirect result.
-  insertIndirectReturnArgs();
-
-  // Populate valueStorageMap.
-  OpaqueValueVisitor(pass).mapValueStorage();
-
   // Create an AllocStack for every opaque value defined in the function.  Visit
   // values in post-order to create storage for aggregates before subobjects.
   // 
   // WARNING: This may split critical edges (in ValueLifetimeAnalysis).
   for (auto &valueStorageI : reversed(pass.valueStorageMap)) {
     SILValue value = valueStorageI.value;
-    if (auto *bbArg = dyn_cast<SILPHIArgument>(value))
-      allocateForBBArg(bbArg);
-    else
+    if (!isa<SILArgument>(value))
       allocateForValue(value);
   }
+  // Only allocate block arguments after all SSA values have been
+  // allocated. allocatedForValue assumes SSA form without checking
+  // interference. At that point, multiple SILValues can share storage via
+  // projections, but the storage is still singly defined. However,
+  // allocateForBB may coalesce multiple values feeding a block argument, or
+  // even a single value across multiple loop iterations. The burden for
+  // checking inteference is entirely on allocateForBBArg.
+  for (auto &valueStorageI : reversed(pass.valueStorageMap)) {
+    SILValue value = valueStorageI.value;
+    auto *bbArg = dyn_cast<SILPHIArgument>(value);
+    if (!bbArg) {
+      assert(valueStorageI.storage.isAllocated());
+      continue;
+    }
+    allocateForBBArg(bbArg);
+  }
 }
 
-/// Replace each value-typed argument to the current function with an
-/// address-typed argument by inserting a temporary load instruction.
-void OpaqueStorageAllocation::convertIndirectFunctionArgs() {
-  // Insert temporary argument loads at the top of the function.
-  SILBuilderWithScope argBuilder(pass.F->getEntryBlock()->begin());
-  argBuilder.setSILConventions(
-      SILModuleConventions::getLoweredAddressConventions());
-  argBuilder.setOpenedArchetypesTracker(&pass.openedArchetypesTracker);
+/// Allocate storage for a single opaque/resilient value.
+void OpaqueStorageAllocation::allocateForValue(SILValue value) {
+  // Function arguments are preallocated. Block arguments must be deferred.
+  assert(!isa<SILArgument>(value));
 
-  auto fnConv = pass.F->getConventions();
-  unsigned argIdx = fnConv.getSILArgIndexOfFirstParam();
-  for (SILParameterInfo param :
-       pass.F->getLoweredFunctionType()->getParameters()) {
+  // Pseudo call results have no storage.
+  assert(!isPseudoCallResult(value));
 
-    if (param.isFormalIndirect() && !fnConv.isSILIndirect(param)) {
-      SILArgument *arg = pass.F->getArgument(argIdx);
-      SILType addrType = arg->getType().getAddressType();
+  auto &storage = pass.valueStorageMap.getStorage(value);
+  assert(!storage.isAllocated());
 
-      LoadInst *loadArg = argBuilder.createLoad(
-          SILValue(arg).getLoc(), SILUndef::get(addrType, pass.F->getModule()),
-          LoadOwnershipQualifier::Unqualified);
-
-      arg->replaceAllUsesWith(loadArg);
-      assert(!pass.valueStorageMap.contains(arg));
-
-      arg = arg->getParent()->replaceFunctionArgument(
-          arg->getIndex(), addrType, ValueOwnershipKind::Trivial,
-          arg->getDecl());
-
-      loadArg->setOperand(arg);
-
-      if (addrType.isAddressOnly(pass.F->getModule()))
-        pass.valueStorageMap.insertValue(loadArg).storageAddress = arg;
-    }
-    ++argIdx;
+  // Check for values the inherently project storage from their operand.
+  if (auto *storageOper = getProjectedDefOperand(value)) {
+    pass.valueStorageMap.setExtractedDefOperand(storageOper);
+    return;
   }
-  assert(argIdx
-         == fnConv.getSILArgIndexOfFirstParam() + fnConv.getNumSILArguments());
-}
+  // Attempt to reuse a user's storage.
+  if (findProjectionFromUser(value)
+    return;
 
-/// Insert function arguments for any @out result type. Return the number of
-/// indirect result arguments added.
-unsigned OpaqueStorageAllocation::insertIndirectReturnArgs() {
-  auto &ctx = pass.F->getModule().getASTContext();
-  unsigned argIdx = 0;
-  for (auto resultTy : pass.loweredFnConv.getIndirectSILResultTypes()) {
-    auto bodyResultTy = pass.F->mapTypeIntoContext(resultTy);
-    auto var = new (ctx)
-        ParamDecl(VarDecl::Specifier::InOut, SourceLoc(), SourceLoc(),
-                  ctx.getIdentifier("$return_value"), SourceLoc(),
-                  ctx.getIdentifier("$return_value"),
-                  bodyResultTy.getSwiftRValueType(), pass.F->getDeclContext());
-
-    pass.F->begin()->insertFunctionArgument(argIdx,
-                                            bodyResultTy.getAddressType(),
-                                            ValueOwnershipKind::Trivial, var);
-    ++argIdx;
-  }
-  assert(argIdx == pass.loweredFnConv.getNumIndirectSILResults());
-  return argIdx;
-}
-
-/// Is this operand composing an aggregate from a subobject, or simply
-/// forwarding the operand's value to storage defined elsewhere?
-//
-// \param checkDom Function that checks if the specified storage definition
-// dominates all necessary uses.
-//
-// This does not allow projections from terminators. That is handled by
-// BlockStorageOptimizer.
-bool OpaqueStorageAllocation::canProjectFrom(
-    std::function<bool(SILValue)> checkDom, SILInstruction *composingUse) {
-  if (!OptimizeOpaqueAddressLowering)
-    return false;
-
-  SILValue composingValue;
-  switch (composingUse->getKind()) {
-  default:
-    return false;
-  case SILInstructionKind::ApplyInst:
-    // @in operands never need their own storage since they are non-mutating
-    // uses. They simply reuse the storage allocated for their operand. So it
-    // wouldn't make sense to "project" out of the apply argument.
-    return false;
-  case SILInstructionKind::EnumInst:
-    composingValue = cast<EnumInst>(composingUse);
-    break;
-  case SILInstructionKind::InitExistentialValueInst: {
-    // Ensure that all opened archetypes are available at the inner value's
-    // definition.
-    auto *initExistential = cast<InitExistentialValueInst>(composingUse);
-    for (Operand &operand : initExistential->getTypeDependentOperands()) {
-      if (!checkDom(operand.get()))
-        return false;
-    }
-    composingValue = initExistential;
-    break;
-  }
-  case SILInstructionKind::ReturnInst:
-    return true;
-  case SILInstructionKind::StructInst:
-    composingValue = cast<StructInst>(composingUse);
-    break;
-  case SILInstructionKind::TupleInst:
-    composingValue = cast<TupleInst>(composingUse);
-    break;
-  }
-  ValueStorage &storage = pass.valueStorageMap.getStorage(composingValue);
-  if (SILValue addr = storage.storageAddress) {
-    if (auto *stackInst = dyn_cast<AllocStackInst>(addr))
-      return checkDom(stackInst);
-
-    if (isa<SILFunctionArgument>(addr)) {
-      return true;
-    }
-  } else if (storage.isUseProjection) {
-    SILValue projVal = pass.valueStorageMap.getProjectedStorage(storage).value;
-    return canProjectFrom(checkDom, projVal->getDefiningInstruction());
-  }
-  return false;
+  createStackAllocationStorage(value);
 }
 
 /// Find a use of this value that can provide storage for this value.
-// \param C is a Range of SILValues. e.g. ArrayRef<SILValue>.
-// \param storage is the given value's storage.
-template <typename C>
-bool OpaqueStorageAllocation::setProjectionFromUser(C innerVals,
-                                                    SILValue value) {
-
-  auto checkDom = [&](SILValue storageDef) {
-    for (SILValue innerVal : innerVals) {
-      if (auto *innerInst = innerVal->getDefiningInstruction()) {
-        if (!pass.domInfo->properlyDominates(storageDef, innerInst))
-          return false;
-      } else {
-        auto *bbArg = cast<SILPHIArgument>(innerVal);
-        // For block arguments, the storage def's block must structly dominate
-        // the argument's block.
-        if (!pass.domInfo->properlyDominates(innerVal,
-                                             &*bbArg->getParent()->begin())) {
-          return false;
-        }
-      }
-    }
-    return true;
-  };
+/// \param value is the value the needs storage.
+/// \param C is a Range of SILValues (e.g. ArrayRef<SILValue>), that all need
+/// the storage to be available in their scope.
+bool OpaqueStorageAllocation::
+findProjectionFromUser(SILValue value, ArrayRef<SILValue> incomingValues) {
+  // Def-projections take precedence.
+  assert(!getProjectedDefOperand(value));
 
   for (Operand *use : value->getUses()) {
-    if (canProjectFrom(checkDom, use->getUser())) {
-      DEBUG(llvm::dbgs() << "  PROJECT "; use->getUser()->dump();
-            llvm::dbgs() << "  into "; value->dump());
-      pass.valueStorageMap.setComposingUseProjection(use);
-      return true;
-    }
+    if (!canProjectFrom(use->getUser()))
+      continue;
+
+    // Get the user's value, whose storage we will project from.
+    SILValue userValue = getStorageValueForNonBranchUse(use, pass);
+
+    // Recurse through all storage projections to find the uniquely allocated
+    // storage.
+    auto &storage = pass.valueStorageMap.getNonProjectionStorage(userValue);
+
+    SILValue addr = storage.storageAddress;
+    if (auto *stackInst = dyn_cast<AllocStackInst>(addr)) {
+      if (!checkStorageDominates(stackInst, incomingValues))
+        continue;
+    } else
+      assert(isa<SILFunctionArgument>(addr));
+
+    DEBUG(llvm::dbgs() << "  PROJECT "; use->getUser()->dump();
+          llvm::dbgs() << "  into "; value->dump());
+
+    pass.valueStorageMap.setComposingUseProjection(use);
+    return true;
   }
   return false;
 }
 
+bool OpaqueStorageAllocation::
+checkStorageDominates(AllocStackInst *allocInst,
+                      ArrayRef<SILValue> incomingValues) {
+
+  for (SILValue incomingValue : incomingValues) {
+    if (auto *defInst = incomingValue->getDefiningInstruction()) {
+      if (!pass.domInfo->properlyDominates(allocInst, defInst))
+        return false;
+      continue;
+    }
+    auto *bbArg = cast<SILPHIArgument>(incomingValue);
+    // For block arguments, the storage def's block must structly dominate
+    // the argument's block.
+    if (!pass.domInfo->properlyDominates(incomingValue,
+                                         &*bbArg->getParent()->begin())) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Allocate storage for a BB arg. Unlike normal values, this checks all the
-// incoming values to determine whether any are also candidates for projection.
+// incoming values to determine whether any are also candidates for
+// projection.
 void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
   if (auto *predBB = bbArg->getParent()->getSinglePredecessorBlock()) {
     // switch_enum arguments are different than normal phi-like arguments. The
@@ -1043,36 +1334,41 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
       return;
     }
     // try_apply is handled differently. If it returns a tuple, then the bbarg
-    // has no storage. If it returns a single value then the bb arg has storage,
-    // but that storage isn't projected onto any incoming value.
+    // has no storage. If it returns a single value then the bb arg has
+    // storage, but that storage isn't projected onto any incoming value.
     if (isa<TryApplyInst>(predBB->getTerminator())) {
       // FIXME: multi-result calls.
       if (!bbArg->getType().is<TupleType>()) {
-        if (!setProjectionFromUser(ArrayRef<SILValue>(bbArg), bbArg)) {
+        if (!findProjectionFromUser(bbArg, bbArg)) {
           createStackAllocationStorage(bbArg);
         }
       }
       return;
     }
   }
-  // BlockArgumentStorageOptimizer computes the incoming values of a basic block
-  // argument that can share storage with the block argument. The algorithm
-  // processes all incoming values at once, so it is is run when visiting the
-  // block argument.
+  // BlockArgumentStorageOptimizer computes the incoming values of a basic
+  // block argument that can share storage with the block argument. The
+  // algorithm processes all incoming values at once, so it is is run when
+  // visiting the block argument.
   //
   // The incoming value projections are computed first to give them
-  // priority. Then we determine if the block argument itself can share storage
-  // with one of its users, given that it may already have projections to
-  // incoming values.
+  // priority. Then we determine if the block argument itself can share
+  // storage with one of its users, given that it may already have projections
+  // to incoming values.
   //
   // The single-incoming value case (including try_apply results) will be
   // immediately pruned--it will always be a projection of its block argument.
   auto argStorageResult =
-      BlockArgumentStorageOptimizer(bbArg).computeArgumentProjections();
+      BlockArgumentStorageOptimizer(pass, bbArg).computeArgumentProjections();
 
-  if (!setProjectionFromUser(argStorageResult.getIncomingValueRange(), bbArg)) {
+  SmallVector<SILValue, 4> incomingValues;
+  auto incomingValRange = argStorageResult.getIncomingValueRange();
+  incomingValues.resize(std::distance(incomingValRange));
+  for (SILValue val : incomingValRange)
+    incomingValues.push_back(val);
+  
+  if (!findProjectionFromUser(bbArg, incomingValues))
     createStackAllocationStorage(bbArg);
-  }
 
   // Regardless of whether we projected from a user or allocated storage,
   // provide this storage to all the incoming values that can reuse it.
@@ -1080,97 +1376,9 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
     pass.valueStorageMap.setComposingUseProjection(argOper);
 }
 
-static Operand *getBorrowedStorageOperand(SILValue value) {
-  switch (value->getKind()) {
-  default:
-    return nullptr;
-
-  case ValueKind::TupleExtractInst:
-    // TupleExtract from an apply are handled specially until we have
-    // multi-result calls. Force them to allocate storage.
-    if (auto *TEI = dyn_cast<TupleExtractInst>(value)) {
-      if (ApplySite::isa(TEI->getOperand())
-          || isa<SILPHIArgument>(TEI->getOperand())) {
-        return nullptr;
-      }
-    }
-    LLVM_FALLTHROUGH;
-  case ValueKind::StructExtractInst:
-  case ValueKind::OpenExistentialValueInst:
-  case ValueKind::OpenExistentialBoxValueInst:
-    assert(value.getOwnershipKind() == ValueOwnershipKind::Guaranteed);
-    return &cast<SingleValueInstruction>(value)->getAllOperands()[0];
-  }
-}
-
-// Return true if this value can reuse storage projected from one of its uses.
-// \param storage is the value's storage information.
-static bool canProjectTo(SILValue value, ValueStorage &storage) {
-  // Function arguments use caller storage. The proxy load will be mapped to an
-  // address-type SILFunctionArgument. Since storage is already mapped in that
-  // case, we shouldn't reach here.
-  assert(!storage.storageAddress);
-
-  // TODO: Remove this with multi-result calls.
-  if (auto apply = ApplySite::isa(value)) {
-    // Result tuples will be canonicalized during apply rewriting so the tuple
-    // itself is unused.
-    if (value->getType().is<TupleType>()) {
-      assert(apply.getSubstCalleeType()->getNumResults() > 1);
-      return false;
-    }
-  }
-
-  // Values that borrow their operand inherit storage from that operand, not
-  // their use.
-  if (getBorrowedStorageOperand(value))
-    return false;
-
-  return true;
-}
-
-/// Allocate storage for a single opaque/resilient value.
-void OpaqueStorageAllocation::allocateForValue(SILValue value) {
-  // Function args are not inserted in valuestorageMap. Instead, a
-  // proxy load instruction is inserted.
-  assert(!isa<SILFunctionArgument>(value));
-
-  auto &storage = pass.valueStorageMap.getStorage(value);
-
-  // Function and argument loads already have a storage address before
-  // allocating value storage.
-  //
-  // Inputs to block arguments may have already projected storage from the block
-  // arguments.
-  if (storage.isAllocated())
-    return;
-
-  // Attempt to reuse a user's storage.
-  if (canProjectTo(value, storage)
-      && setProjectionFromUser(ArrayRef<SILValue>(value), value)) {
-    return;
-  }
-  // Temporary special case. Result tuples will be canonicalized during apply
-  // rewriting so the tuple itself is unused.
-  // TODO: multi-result calls.
-  if (auto apply = ApplySite::isa(value)) {
-    if (value->getType().is<TupleType>()) {
-      assert(apply.getSubstCalleeType()->getNumResults() > 1);
-      return;
-    }
-  }
-  // Values that borrow their operand inherit storage from that operand.
-  if (auto *storageOper = getBorrowedStorageOperand(value)) {
-    pass.valueStorageMap.setExtractedDefOperand(storageOper);
-    return;
-  }
-
-  createStackAllocationStorage(value);
-}
-
 // Create alloc_stack and jointly-postdominating dealloc_stack instructions.
 // Nesting will be fixed later.
-// 
+//
 // This may split critical edges. If so, it updates pass.domInfo.
 AllocStackInst *OpaqueStorageAllocation::createStackAllocation(SILValue value) {
   SILType allocTy = value->getType();
@@ -1206,8 +1414,8 @@ AllocStackInst *OpaqueStorageAllocation::createStackAllocation(SILValue value) {
     // their operand's storage--so should never reach here.
     assert(!getOpenedArchetypeOf(def));
 
-    // For all other instructions, just allocate storage immediately before the
-    // value is defined.
+    // For all other instructions, just allocate storage immediately before
+    // the value is defined.
     DeadEndBlocks DEBlocks(pass.F);
     llvm::SmallVector<SILInstruction *, 8> UsePoints;
     ValueLifetimeAnalysis VLA(def);
@@ -1221,7 +1429,8 @@ AllocStackInst *OpaqueStorageAllocation::createStackAllocation(SILValue value) {
 }
 
 //===----------------------------------------------------------------------===//
-// AddressMaterialization - materialize storage addresses, generate projections.
+// AddressMaterialization - materialize storage addresses, generate
+// projections.
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -1278,14 +1487,15 @@ SILValue AddressMaterialization::initializeOperandMem(Operand *operand) {
 /// Return the address of the storage for `origValue`. This may involve
 /// materializing projections.
 ///
-/// As a side effect, record the materialized address as storage for origValue.
+/// As a side effect, record the materialized address as storage for
+/// origValue.
 SILValue AddressMaterialization::materializeAddress(SILValue origValue) {
   ValueStorage &storage = pass.valueStorageMap.getStorage(origValue);
 
   if (storage.storageAddress)
     return storage.storageAddress;
 
-  // Handle a value that is composed by a user (struct/tuple/enum).
+  // Handle a value that composes a user (struct/tuple/enum).
   if (storage.isUseProjection) {
     Operand *use = pass.valueStorageMap.getUseProjectionOperand(storage);
     storage.storageAddress = materializeProjectionFromUse(use);
@@ -1329,7 +1539,7 @@ AddressMaterialization::materializeProjectionFromDef(Operand *operand,
   }
   case SILInstructionKind::SwitchEnumInst: {
     auto *SEI = cast<SwitchEnumInst>(user);
-    // SwitchEnum is special because the composed operand isn't actually an
+    // SwitchEnum is special because the composing operand isn't actually an
     // operand of origValue, which is itself a block argument.
     auto *destBB = cast<SILPHIArgument>(origValue)->getParent();
     SILValue enumAddr =
@@ -1345,7 +1555,7 @@ AddressMaterialization::materializeProjectionFromDef(Operand *operand,
   }
 }
 
-/// Materialize the address of a subobject composed by this operand. The
+/// Materialize the address of a subobject composinf this operand's use. The
 /// operand's user is an aggregate (struct, tuple, enum,
 /// init_existential_value), or a terminator that reuses storage from a block
 /// argument.
@@ -2250,8 +2460,8 @@ protected:
 
   // Opaque struct member.
   void visitStructInst(StructInst *structInst) {
-    // Structs are rewritten on the def-side, where both direct and indirect
-    // elements are composed.
+    // Structs are rewritten on the def-side, where both the direct and indirect
+    // elements that compose a struct can be handled.
   }
 
   // Opaque call argument.
@@ -2261,8 +2471,8 @@ protected:
 
   // Opaque tuple element.
   void visitTupleInst(TupleInst *tupleInst) {
-    // Tuples are rewritten on the def-side, where both direct and indirect
-    // elements are composed.
+    // Tuples are rewritten on the def-side, where both the direct and indirect
+    // elements that compose a struct can be handled.
   }
 
   // Extract from an opaque tuple.
