@@ -160,7 +160,7 @@ getUserRange(SILValue val) {
 /// Stop when the visitor returns `false`.
 ///
 /// TODO: MultiValue. Remove this helper.
-static void visitCallResults(ApplyInst *apply,
+static void visitCallResults(ApplyInst *applyInst,
                              llvm::function_ref<bool(SILValue)> visitor) {
   if (applyInst->getType().is<TupleType>()) {
     for (auto *operand : applyInst->getUses()) {
@@ -224,19 +224,16 @@ static bool isPseudoCallResult(SILValue value) {
 /// insertIndirectReturnArgs).
 static SILValue getTupleElementUserValue(Operand *oper) {
   auto *TI = cast<TupleInst>(oper->getUser());
-  if (!tupleInst->hasOneUse()
-      || !isa<ReturnInst>(tupleInst->use_begin()->getUser())) {
+  if (!TI->hasOneUse() || !isa<ReturnInst>(TI->use_begin()->getUser()))
     return TI;
-  }
-  unsigned opIdx = operand->getOperandNumber();
-  unsigned resultIdx = tupleInst->getElementIndex(operand);
+
+  unsigned resultIdx = TI->getElementIndex(oper);
 
   SILFunction *F = TI->getFunction();
   SILFunctionConventions loweredFnConv(
       F->getLoweredFunctionType(),
       SILModuleConventions::getLoweredAddressConventions());
-
-  assert(resultIdx < pass.loweredFnConv.getNumIndirectSILResults());
+  assert(resultIdx < loweredFnConv.getNumIndirectSILResults());
   (void)loweredFnConv;
 
   // Cannot call getIndirectSILResults here because that API uses the
@@ -278,13 +275,13 @@ static Operand *getProjectedDefOperand(SILValue value) {
     assert(value.getOwnershipKind() == ValueOwnershipKind::Guaranteed);
     return &cast<SingleValueInstruction>(value)->getAllOperands()[0];
 
-  case SILInstructionKind::SILPHIArgument: {
+  case ValueKind::SILPHIArgument: {
     auto *bbArg = cast<SILPHIArgument>(value);
     auto *predBB = bbArg->getParent()->getSinglePredecessorBlock();
     assert(predBB && "Block arg def projection must have a single pred.");
     return &cast<SwitchEnumInst>(predBB->getTerminator())->getAllOperands()[0];
   }
-  case SILInstructionKind::UncheckedEnumDataInst: {
+  case ValueKind::UncheckedEnumDataInst: {
     llvm_unreachable("unchecked_enum_data unimplemented"); //!!!
   }
   }
@@ -301,7 +298,7 @@ static Operand *getProjectedDefOperand(SILValue value) {
 /// Then
 ///   `canProjectFromUse(use)`
 static bool canProjectFromUse(SILInstruction *composedUser) {
-  switch (composingUse->getKind()) {
+  switch (composedUser->getKind()) {
   default:
     return false;
 
@@ -365,31 +362,31 @@ static SILValue getStorageValueForNonBranchUse(Operand *operand) {
   if (auto *TI = dyn_cast<TupleInst>(user))
     return getTupleElementUserValue(operand);
 
-  if (auto *singleVal = dyn_cast<SingleValueInstruction>(user)) {
-    // Calls do not project storage onto their arguments.
-    if (ApplySite::isa(singleVal))
-      return SILValue();
+  // Calls do not project storage onto their arguments.
+  if (ApplySite::isa(user))
+    return SILValue();
 
+  if (auto *singleVal = dyn_cast<SingleValueInstruction>(user))
     return singleVal;
-  }
 
   switch (user->getKind()) {
   default:
     return SILValue();
 
-  case SILInstruction::ReturnInst {
+  case SILInstructionKind::ReturnInst: {
     auto *RI = cast<ReturnInst>(user);
 
     SILFunctionConventions loweredFnConv(
         RI->getFunction()->getLoweredFunctionType(),
-        SILModuleConventions::getLoweredAddressConventions()),
+        SILModuleConventions::getLoweredAddressConventions());
     assert(loweredFnConv.getNumIndirectSILResults() == 1);
     (void)loweredFnConv;
 
     // Cannot call getIndirectSILResults here because that API uses the
     // function conventions before address lowering.
-    return RI->getFunction()->getArguments()[resultIdx];
-  } case SILInstructionKind::TryApplyInst:
+    return RI->getFunction()->getArguments()[0];
+  }
+  case SILInstructionKind::TryApplyInst:
   case SILInstructionKind::BranchInst:
   case SILInstructionKind::CondBranchInst:
   case SILInstructionKind::SwitchEnumInst:
@@ -443,7 +440,7 @@ static void getStorageValuesForOperandUse(
   Operand * operand, SmallVectorImpl<SILValue> & storageValues) {
   SILInstruction *user = operand->getUser();
 
-  auto pushResult()[&](SILValue v) { storageValues.push_back(v) }
+  auto pushResult = [&](SILValue v) { storageValues.push_back(v); };
 
   if (SILValue useVal = getStorageValueForNonBranchUse(operand))
     return pushResult(useVal);
@@ -453,15 +450,15 @@ static void getStorageValuesForOperandUse(
   default:
     return;
 
-  case SILInstructionKind::TryApplyInst {
+  case SILInstructionKind::TryApplyInst:
     // Calls do not project storage onto their arguments.
     return;
 
-  } case SILInstructionKind::BranchInst: {
-      auto *BI = cast<BranchInst>(user);
-      unsigned bbArgIdx = BI->getArgIndexOfOperand(operand->getOperandNumber());
-      return pushResult(BI->getDestBB()->getArgument(bbArgIdx));
-    }
+  case SILInstructionKind::BranchInst: {
+    auto *BI = cast<BranchInst>(user);
+    unsigned bbArgIdx = BI->getArgIndexOfOperand(operand->getOperandNumber());
+    return pushResult(BI->getDestBB()->getArgument(bbArgIdx));
+  }
 
   // TODO: Add a utility for CondBranchInst::getBlockArgForOperand?
   case SILInstructionKind::CondBranchInst: {
@@ -478,7 +475,8 @@ static void getStorageValuesForOperandUse(
     }
   }
 
-  case SILInstructionKind::SwitchEnumInst {
+  case SILInstructionKind::SwitchEnumInst: {
+    auto *SEI = cast<SwitchEnumInst>(user);
     // Collect switch cases for rewriting and remove block arguments.
     for (unsigned caseIdx : range(SEI->getNumCases())) {
       auto *caseBB = SEI->getCase(caseIdx).second;
@@ -509,7 +507,8 @@ namespace {
 /// SILValues, mapped values can be replaced as long as the original value had
 /// no arguments (e.g. block arguments).
 struct ValueStorage {
-  enum : unsigned { InvalidID = ~0U };
+  enum : uint32_t { InvalidID = uint32_t(~0) };
+  enum : uint16_t { InvalidOper = uint16_t(~0) };
 
   /// The final address of this storage unit after rewriting the SIL.
   /// For values linked to their own storage, this is set during storage
@@ -532,7 +531,7 @@ struct ValueStorage {
   void clear() {
     storageAddress = SILValue();
     projectedStorageID = InvalidID;
-    projectedOperandNum = InvalidID;
+    projectedOperandNum = InvalidOper;
     isUseProjection = false;
     isDefProjection = false;
     isRewritten = false;
@@ -542,8 +541,8 @@ struct ValueStorage {
     return storageAddress || isUseProjection || isDefProjection;
   }
 
-  bool isBranchUseProjection const {
-    return isUseProjection && projectedOperandNum == InvalidID;
+  bool isBranchUseProjection() const {
+    return isUseProjection && projectedOperandNum == InvalidOper;
   }
 
   void markRewritten() {
@@ -655,11 +654,17 @@ public:
 
   /// Return the non-projection storage that the given storage ultimately refers
   /// to by following all projections.
-  Storage &getNonProjectionStorage(ValueStorage &storage) {
+  ValueStorage &getNonProjectionStorage(ValueStorage &storage) {
     if (storage.isDefProjection || storage.isUseProjection)
       return getNonProjectionStorage(getProjectedStorage(storage).storage);
 
     return storage;
+  }
+
+  /// Return the non-projection storage that the given storage ultimately refers
+  /// to by following all projections.
+  ValueStorage &getNonProjectionStorage(SILValue value) {
+    return getNonProjectionStorage(getStorage(value));
   }
 
   /// Record a storage projection from the source of the given operand into its
@@ -689,7 +694,7 @@ public:
   // project from.
   void setBranchUseProjection(ValueStorage &storage, SILPHIArgument *bbArg) {
     assert(!storage.isAllocated());
-    assert(storage.projectedOperandNum == ValueStorage::InvalidID);
+    assert(storage.projectedOperandNum == ValueStorage::InvalidOper);
     storage.projectedStorageID = getOrdinal(bbArg);
     storage.isUseProjection = true;
   }
@@ -831,7 +836,7 @@ static void convertIndirectFunctionArgs(AddressLoweringState &pass) {
 
 /// Before populating the ValueStorageMap, insert function arguments for any
 /// @out result type. Return the number of indirect result arguments added.
-static unsigned insertIndirectReturnArgs() {
+static unsigned insertIndirectReturnArgs(AddressLoweringState &pass) {
   auto &ctx = pass.F->getModule().getASTContext();
   unsigned argIdx = 0;
   for (auto resultTy : pass.loweredFnConv.getIndirectSILResultTypes()) {
@@ -955,12 +960,12 @@ void OpaqueValueVisitor::visitValue(SILValue value) {
 /// Prepare the SIL by rewriting function arguments and returns.
 /// Initialize the ValueStorageMap with an entry for each opaque value in the
 /// function.
-static prepareValueStorage(AddressLoweringState &pass) {
+static void prepareValueStorage(AddressLoweringState &pass) {
   // Fixup this function's argument types with temporary loads.
   convertIndirectFunctionArgs(pass);
 
   // Create a new function argument for each indirect result.
-  insertIndirectReturnArgs();
+  insertIndirectReturnArgs(pass);
 
   // Populate valueStorageMap.
   OpaqueValueVisitor(pass).mapValueStorage();
@@ -1061,6 +1066,7 @@ public:
 
 protected:
   bool computeIncomingLiveness(Operand *useOper, SILBasicBlock *defBB);
+  bool hasCoalescedOperand(SILInstruction *defInst);
 };
 } // namespace
 
@@ -1093,8 +1099,8 @@ bool BlockArgumentStorageOptimizer::computeIncomingLiveness(
 
 bool BlockArgumentStorageOptimizer::
 hasCoalescedOperand(SILInstruction *defInst) {
-  for (Operand *oper : defInst->getAllOperands()) {
-    if (pass.valueStorageMap.isNonBranchUseProjection(oper))
+  for (Operand &oper : defInst->getAllOperands()) {
+    if (pass.valueStorageMap.isNonBranchUseProjection(&oper))
       return true;
   }
   return false;
@@ -1269,7 +1275,7 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value) {
     return;
   }
   // Attempt to reuse a user's storage.
-  if (findProjectionFromUser(value)
+  if (findProjectionFromUser(value))
     return;
 
   createStackAllocationStorage(value);
@@ -1277,19 +1283,19 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value) {
 
 /// Find a use of this value that can provide storage for this value.
 /// \param value is the value the needs storage.
-/// \param C is a Range of SILValues (e.g. ArrayRef<SILValue>), that all need
-/// the storage to be available in their scope.
+/// \param incomingValues is a Range of SILValues (e.g. ArrayRef<SILValue>),
+/// that all need the storage to be available in their scope.
 bool OpaqueStorageAllocation::
 findProjectionFromUser(SILValue value, ArrayRef<SILValue> incomingValues) {
   // Def-projections take precedence.
   assert(!getProjectedDefOperand(value));
 
   for (Operand *use : value->getUses()) {
-    if (!canProjectFrom(use->getUser()))
+    if (!canProjectFromUse(use->getUser()))
       continue;
 
     // Get the user's value, whose storage we will project from.
-    SILValue userValue = getStorageValueForNonBranchUse(use, pass);
+    SILValue userValue = getStorageValueForNonBranchUse(use);
 
     // Recurse through all storage projections to find the uniquely allocated
     // storage.
@@ -1352,7 +1358,7 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
     if (isa<TryApplyInst>(predBB->getTerminator())) {
       // FIXME: MultiValue calls.
       if (!bbArg->getType().is<TupleType>()) {
-        if (!findProjectionFromUser(bbArg, bbArg)) {
+        if (!findProjectionFromUser(bbArg)) {
           createStackAllocationStorage(bbArg);
         }
       }
@@ -1377,7 +1383,7 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
 
   SmallVector<SILValue, 4> incomingValues;
   auto incomingValRange = argStorageResult.getIncomingValueRange();
-  incomingValues.resize(incomingValRange.size());
+  incomingValues.resize(argStorageResult.getArgumentProjections().size());
   for (SILValue val : incomingValRange)
     incomingValues.push_back(val);
   
@@ -1467,7 +1473,7 @@ public:
 
   SILValue materializeAddress(SILValue origValue);
 
-  SILValue materializeProjectionFromDef(Operand *operand, SILValue origValue);
+  SILValue materializeProjectionFromDef(SILValue origValue);
   SILValue materializeProjectionFromNonBranchUse(Operand *operand);
 };
 } // anonymous namespace
@@ -1512,10 +1518,10 @@ SILValue AddressMaterialization::materializeAddress(SILValue origValue) {
   // Handle a value that composes a user (struct/tuple/enum) or forward through
   // a block argument.
   if (storage.isUseProjection) {
-    SILValue useVal = storage.getProjectedStorage().value;
-    if (auto *defInst = useVal.getDefiningInstruction()) {
+    SILValue useVal = pass.valueStorageMap.getProjectedStorage(storage).value;
+    if (auto *defInst = useVal->getDefiningInstruction()) {
       return materializeProjectionFromNonBranchUse(
-        defInst->getOperand(storage.projectedOperandNum));
+          &defInst->getAllOperands()[storage.projectedOperandNum]);
 
     } else if (isa<SILPHIArgument>(useVal))
       return materializeAddress(useVal);
@@ -1544,7 +1550,7 @@ AddressMaterialization::materializeProjectionFromDef(SILValue origValue) {
     llvm_unreachable("open_existential should only be materialized once");
 
   case ValueKind::StructExtractInst: {
-    auto *extractInst = cast<StructExtractInst>(user);
+    auto *extractInst = cast<StructExtractInst>(origValue);
     SILValue srcAddr = materializeAddress(extractInst->getOperand());
 
     return B.createStructElementAddr(extractInst->getLoc(), srcAddr,
@@ -1552,7 +1558,7 @@ AddressMaterialization::materializeProjectionFromDef(SILValue origValue) {
                                      extractInst->getType().getAddressType());
   }
   case ValueKind::TupleExtractInst: {
-    auto *extractInst = cast<TupleExtractInst>(user);
+    auto *extractInst = cast<TupleExtractInst>(origValue);
     SILValue srcAddr = materializeAddress(extractInst->getOperand());
 
     return B.createTupleElementAddr(extractInst->getLoc(), srcAddr,
@@ -1573,7 +1579,7 @@ AddressMaterialization::materializeProjectionFromDef(SILValue origValue) {
     return B.createUncheckedTakeEnumDataAddr(SEI->getLoc(), enumAddr,
                                              eltDecl.get());
   }
-  case SILInstructionKind::UncheckedEnumDataInst: {
+  case ValueKind::UncheckedEnumDataInst: {
     llvm_unreachable("unchecked_enum_data unimplemented"); //!!!
   }
   }
@@ -1777,8 +1783,8 @@ class ApplyRewriter {
   // Use resultBuilder for loading results.
   SILBuilder resultBuilder;
   AddressMaterialization addrMat;
-  SILFunctionConventions origFnConv;
-  SILFunctionConventions loweredFnConv;
+  SILFunctionConventions origCalleeConv;
+  SILFunctionConventions loweredCalleeConv;
   SILLocation callLoc;
 
   // This apply site mutates when the new apply instruction is generated.
@@ -1788,11 +1794,10 @@ public:
   ApplyRewriter(ApplySite origCall, AddressLoweringState &pass)
       : pass(pass), argBuilder(origCall.getInstruction()),
         resultBuilder(getCallResultInsertionPoint()), addrMat(pass, argBuilder),
-        origFnConv(origCall.getSubstCalleeConv()),
+        origCalleeConv(origCall.getSubstCalleeConv()),
         loweredCalleeConv(origCall.getSubstCalleeType(),
                           SILModuleConventions::getLoweredAddressConventions()),
-        callLoc(origCall.getLoc()), origResultStorage(nullptr),
-        apply(origCall) {
+        callLoc(origCall.getLoc()), apply(origCall) {
     argBuilder.setSILConventions(
         SILModuleConventions::getLoweredAddressConventions());
     resultBuilder.setSILConventions(
@@ -1817,8 +1822,9 @@ protected:
   void canonicalizeResults(MutableArrayRef<SILValue> directResultValues,
                            ArrayRef<Operand *> nonCanonicalUses);
 
-  void getNewCallArgsAndResults(SmallVector<SILValue> &newCallArgs,
-                                SmallVector<unsigned> &newDirectResultIndices);
+  void
+  getNewCallArgsAndResults(SmallVectorImpl<SILValue> &newCallArgs,
+                           SmallVectorImpl<unsigned> &newDirectResultIndices);
 
   SILValue materializeIndirectResultAddress(SILValue origDirectResultVal,
                                             SILType argTy);
@@ -1959,12 +1965,12 @@ void ApplyRewriter::canonicalizeResults(
 // Get the new call instruction's SIL argument list and a map from old direct
 // result indices to new direct result indices.
 void ApplyRewriter::getNewCallArgsAndResults(
-  SmallVector<SILValue> &newCallArgs,
-  SmallVector<unsigned> &newDirectResultIndices) {
-  
+    SmallVectorImpl<SILValue> &newCallArgs,
+    SmallVectorImpl<unsigned> &newDirectResultIndices) {
+
   // List of the original results.
-  SmallVector<SILValue, 4>
-    origDirectResultValues(origFnConv.getNumDirectSILResults());
+  SmallVector<SILValue, 4> origDirectResultValues(
+      origCalleeConv.getNumDirectSILResults());
   getOriginalDirectResultValues(origDirectResultValues);
 
   // Indices used to populate newDirectResultIndices.
@@ -1981,7 +1987,7 @@ void ApplyRewriter::getNewCallArgsAndResults(
       apply.getSubstCalleeType()->getResults(), origDirectResultValues,
       [&](SILResultInfo resultInfo, SILValue origDirectResultVal) {
         // Assume that all original results are direct in SIL.
-        assert(!origFnConv.isSILIndirect(resultInfo));
+        assert(!origCalleeConv.isSILIndirect(resultInfo));
 
         if (loweredCalleeConv.isSILIndirect(resultInfo)) {
           SILValue indirectResultAddr = materializeIndirectResultAddress(
@@ -2112,12 +2118,12 @@ void ApplyRewriter::rewriteResult(SILInstruction *useInst,
   if (!extractInst) {
     // If the original call produces a single result, it will be replaced when
     // materializing the new call arguments.
-    assert(origFnConv.getNumDirectSILResults() == 1);
+    assert(origCalleeConv.getNumDirectSILResults() == 1);
     assert(pass.valueStorageMap.getStorage(origCallResult).isRewritten);
     return;
   }
   unsigned origResultIdx = extractInst->getFieldNo();
-  auto resultInfo = origFnConv.getResults()[origResultIdx];
+  auto resultInfo = origCalleeConv.getResults()[origResultIdx];
 
   if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
     // Uses of indirect results will be rewritten by AddressOnlyUseRewriter.
@@ -2524,8 +2530,7 @@ protected:
 
   // Extract from an opaque struct.
   void visitStructExtractInst(StructExtractInst *extractInst) {
-    SILValue extractAddr = addrMat.materializeProjectionFromDef(
-        &extractInst->getOperandRef(), extractInst);
+    SILValue extractAddr = addrMat.materializeProjectionFromDef(extractInst);
     if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
       assert(currOper
              == pass.valueStorageMap.getDefProjectionOperand(extractInst));
@@ -2562,8 +2567,7 @@ protected:
     if (ApplySite::isa(currOper->get()))
       return;
 
-    SILValue extractAddr = addrMat.materializeProjectionFromDef(
-        &extractInst->getOperandRef(), extractInst);
+    SILValue extractAddr = addrMat.materializeProjectionFromDef(extractInst);
     if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
       assert(currOper
              == pass.valueStorageMap.getDefProjectionOperand(extractInst));
@@ -2869,8 +2873,7 @@ static void rewriteSwitchEnum(SwitchEnumInst *SEI, AddressLoweringState &pass) {
       pass.valueStorageMap.replaceValue(caseArg, loadArg);
 
     } else {
-      SILValue eltAddr = addrMat.materializeProjectionFromDef(
-          &SEI->getAllOperands()[0], caseArg);
+      SILValue eltAddr = addrMat.materializeProjectionFromDef(caseArg);
 
       // Rewrite any non-opaque cases now since we don't visit their defs.
       auto *loadElt = argBuilder.createLoad(
