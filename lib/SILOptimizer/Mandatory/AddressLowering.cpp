@@ -181,8 +181,8 @@ static SILPHIArgument *getTryApplyPseudoResult(TryApplyInst *TAI) {
   return argBB->getPHIArguments()[0];
 }
 
-/// Get the tuple pseudo-value returned by the call. It may be the call itself,
-/// a "fake" tuple without storage, or a block argument.
+/// Get the SIL value that represents all of the given call's results. It may be
+/// the call itself, a "fake" tuple without storage, or a block argument.
 ///
 /// TODO: MultiValue: Only relevant for tuple pseudo results.
 SILValue getCallPseudoResult(ApplySite apply) {
@@ -214,6 +214,15 @@ static bool isPseudoCallResult(SILValue value) {
 
   return isa<TryApplyInst>(predBB->getTerminator())
          && bbArg->getType().is<TupleType>();
+}
+
+/// Return true if this is a pseudo-return value.
+static bool isPseudoReturnValue(SILValue value) {
+  auto *TI = dyn_cast<TupleInst>(value);
+  if (!TI)
+    return false;
+
+  return TI->hasOneUse() && isa<ReturnInst>(TI->use_begin()->getUser());
 }
 
 /// Return the value associated with the user of a tuple element.
@@ -392,103 +401,6 @@ static SILValue getStorageValueForNonBranchUse(Operand *operand) {
   case SILInstructionKind::SwitchEnumInst:
     // Projections through branches are intentionally ignored here.
     return SILValue();
-  }
-}
-
-/// Return the SILValues that may be associated with storage for the given
-/// operand's user in the `storageValues` vector.
-///
-/// Def/use projection oracle for operand to value association.
-///
-/// If an no SILValues are returned, then there can be no storage projection
-/// from either the operand's source to its use (def projection), or from its
-/// use to its source (use projection).
-///
-/// Returning a valid SILValue does not indicate the existence of a
-/// projection. However, the existence of a def projection can be determined
-/// by checking the returned value's storage. Also, the operand associated
-/// with branch use projection can be determined by checking the returned
-/// value's block.
-///
-/// In particular, for any operand: def -> use.
-/// If
-///   'valueStorageMap.getStorage(use).isDefProjection'
-/// Then
-///   'getStorageValuesForOperandUse(pass, operand) == {use}'
-///
-/// And If
-///   'valueStorageMap.getStorage(def).isUseProjection'
-/// Then
-///   'valueStorageMap.getProjectedStorage(valueStorageMap.getStorage(def))
-///      in valueStorageMap.getStorage(
-///           getStorageValuesForOperandUse(pass, operand))
-///
-/// For example, this allows checking whether a value's use may have been
-/// coalesced with another value's storage, which then makes it possible to
-/// reason about storage liveness once in the presence of storage
-/// projections. i.e. it allows any code with access to a valueStorageMap to
-/// check if a value's storage is coalesced with a use.
-///
-/// If the operand's user is a SingleValueInstruction, the storage value is
-/// the user itself. If the operand's user is a block terminator, it is the
-/// corresponding block argument that represents the operand's value. If the
-/// operand's user is a return_inst, it is an outgoing function argument.
-///
-/// switch_enum returns a SILValue for each case because it is possible to
-/// project storage from any one of the switch_enum's cases.
-static void getStorageValuesForOperandUse(
-  Operand * operand, SmallVectorImpl<SILValue> & storageValues) {
-  SILInstruction *user = operand->getUser();
-
-  auto pushResult = [&](SILValue v) { storageValues.push_back(v); };
-
-  if (SILValue useVal = getStorageValueForNonBranchUse(operand))
-    return pushResult(useVal);
-
-  // Handle branches.
-  switch (user->getKind()) {
-  default:
-    return;
-
-  case SILInstructionKind::TryApplyInst:
-    // Calls do not project storage onto their arguments.
-    return;
-
-  case SILInstructionKind::BranchInst: {
-    auto *BI = cast<BranchInst>(user);
-    unsigned bbArgIdx = BI->getArgIndexOfOperand(operand->getOperandNumber());
-    return pushResult(BI->getDestBB()->getArgument(bbArgIdx));
-  }
-
-  // TODO: Add a utility for CondBranchInst::getBlockArgForOperand?
-  case SILInstructionKind::CondBranchInst: {
-    auto *CBI = cast<CondBranchInst>(user);
-    unsigned opIdx = operand->getOperandNumber();
-    unsigned bbArgIdx;
-    if (CBI->isTrueOperandIndex(opIdx)) {
-      bbArgIdx = opIdx - CBI->getTrueOperands()[0].getOperandNumber();
-      return pushResult(CBI->getTrueBB()->getArgument(bbArgIdx));
-    } else {
-      assert(CBI->isFalseOperandIndex(opIdx));
-      bbArgIdx = opIdx - CBI->getFalseOperands()[0].getOperandNumber();
-      return pushResult(CBI->getFalseBB()->getArgument(bbArgIdx));
-    }
-  }
-
-  case SILInstructionKind::SwitchEnumInst: {
-    auto *SEI = cast<SwitchEnumInst>(user);
-    // Collect switch cases for rewriting and remove block arguments.
-    for (unsigned caseIdx : range(SEI->getNumCases())) {
-      auto *caseBB = SEI->getCase(caseIdx).second;
-      if (caseBB->getArguments().size() == 0)
-        continue;
-
-      assert(caseBB->getPHIArguments().size() == 1);
-      pushResult(caseBB->getPHIArguments()[0]);
-    }
-    return;
-  }
-  // TODO: SwitchValueInst, CheckedCastValueBranchInst.
   }
 }
 
@@ -825,8 +737,11 @@ static void convertIndirectFunctionArgs(AddressLoweringState &pass) {
 
       loadArg->setOperand(arg);
 
-      if (addrType.isAddressOnly(pass.F->getModule()))
-        pass.valueStorageMap.insertValue(loadArg).storageAddress = arg;
+      if (addrType.isAddressOnly(pass.F->getModule())) {
+        auto &storage = pass.valueStorageMap.insertValue(loadArg);
+        storage.storageAddress = arg;
+        storage.isRewritten = true;
+      }
     }
     ++argIdx;
   }
@@ -910,15 +825,15 @@ void OpaqueValueVisitor::mapValueStorage() {
     for (auto &II : *BB) {
       pass.openedArchetypesTracker.registerOpenedArchetypes(&II);
 
-      if (auto apply = ApplySite::isa(&II)) {
+      if (auto apply = ApplySite::isa(&II))
         checkForIndirectApply(apply);
 
-        // Do not call visitValue on pseudo call results.
-        if (isPseudoCallResult(getCallPseudoResult(apply)))
+      for (auto result : II.getResults()) {
+        if (isPseudoCallResult(result) || isPseudoReturnValue(result))
           continue;
-      }
-      for (auto result : II.getResults())
+
         visitValue(result);
+      }
     }
   }
 }
@@ -1266,7 +1181,16 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value) {
   // Pseudo call results have no storage.
   assert(!isPseudoCallResult(value));
 
+  // Pseudo return values have no storage.
+  assert(!isPseudoReturnValue(value));
+
   auto &storage = pass.valueStorageMap.getStorage(value);
+
+  // Fake loads for incoming function arguments and outgoing function arguments
+  // themselves are already rewritten
+  if (storage.isRewritten)
+    return;
+
   assert(!storage.isAllocated());
 
   // Check for values the inherently project storage from their operand.
@@ -1793,16 +1717,18 @@ class ApplyRewriter {
 public:
   ApplyRewriter(ApplySite origCall, AddressLoweringState &pass)
       : pass(pass), argBuilder(origCall.getInstruction()),
-        resultBuilder(getCallResultInsertionPoint()), addrMat(pass, argBuilder),
+        resultBuilder(*origCall.getFunction()), addrMat(pass, argBuilder),
         origCalleeConv(origCall.getSubstCalleeConv()),
         loweredCalleeConv(origCall.getSubstCalleeType(),
                           SILModuleConventions::getLoweredAddressConventions()),
         callLoc(origCall.getLoc()), apply(origCall) {
+
     argBuilder.setSILConventions(
         SILModuleConventions::getLoweredAddressConventions());
     resultBuilder.setSILConventions(
       SILModuleConventions::getLoweredAddressConventions());
-    resultBuilder.setCurrentDebugScope(origCallInst->getDebugScope());
+    resultBuilder.setCurrentDebugScope(origCall.getDebugScope());
+    resultBuilder.setInsertionPoint(getCallResultInsertionPoint());
   }
 
   void convertApplyWithIndirectResults();
@@ -1830,7 +1756,7 @@ protected:
                                             SILType argTy);
 
   ApplyInst *genApply(ApplyInst *AI, ArrayRef<SILValue> newCallArgs);
-  void rewriteTryApply(TryApplyInst *TAI, ArrayRef<SILValue> newCallArgs);
+  SILValue rewriteTryApply(TryApplyInst *TAI, ArrayRef<SILValue> newCallArgs);
 
   void rewriteResult(SILInstruction *useInst,
                      ArrayRef<unsigned> newDirectResultIndices,
@@ -1843,17 +1769,19 @@ protected:
 /// Top-level entry: Allocate storage for formally indirect results at the given
 /// call site. Create a new call instruction with indirect SIL arguments.
 void ApplyRewriter::convertApplyWithIndirectResults() {
+  pass.indirectApplies.remove(apply);
+
   // Gather information from the old apply before rewriting it.
 
   // List of new call arguments.
   SmallVector<SILValue, 8> newCallArgs(loweredCalleeConv.getNumSILArguments());
   // Map the original result indices to new result indices.
-  SmallVector<unsigned, 8> newDirectResultIndices(origDirectResultValues.size());
+  SmallVector<unsigned, 8> newDirectResultIndices(
+      origCalleeConv.getNumDirectSILResults());
   getNewCallArgsAndResults(newCallArgs, newDirectResultIndices);
   
   // Collect the original uses before potentialily removing the call
   // pseudo-result (e.g. try_apply's bb arg).
-  SILValue origCallValue = getCallPseudoResult(apply);
   SmallVector<SILInstruction *, 8> origUsers(
     getUserRange(getCallPseudoResult(apply)));
 
@@ -2131,18 +2059,19 @@ void ApplyRewriter::rewriteResult(SILInstruction *useInst,
     // Mark the extract as rewritten now so we don't attempt to convert the
     // call again.
     pass.valueStorageMap.getStorage(extractInst).markRewritten();
-    continue;
+    return;
   }
   if (loweredCalleeConv.isSILIndirect(resultInfo)) {
     // This loadable indirect use should already be redirected to a load from
     // the argument storage and marked dead.
     assert(extractInst->use_empty() && pass.isDead(extractInst));
-    continue;
+    return;
   }
   // Either the new call instruction has only a single direct result, or we
   // map the original tuple field to the new tuple field.
+  SILValue newResultVal = newCallResult;
   if (loweredCalleeConv.getNumDirectSILResults() > 1) {
-    assert(newCallValue->getType().is<TupleType>());
+    assert(newCallResult->getType().is<TupleType>());
     newResultVal =
         resultBuilder.createTupleExtract(extractInst->getLoc(), newCallResult,
                                          newDirectResultIndices[origResultIdx]);
@@ -2150,7 +2079,7 @@ void ApplyRewriter::rewriteResult(SILInstruction *useInst,
   // Since this is a loadable type, there's no associated storage, so erasing
   // the instruction and rewriting is use operands does not invalidate
   // ValueStorage.
-  extractInst->replaceAllUsesWith(newCallResult);
+  extractInst->replaceAllUsesWith(newResultVal);
   extractInst->eraseFromParent();
 }
 
@@ -2450,8 +2379,7 @@ protected:
   // use-side because it may produce either loadable or address-only types.
   void
   visitOpenExistentialValueInst(OpenExistentialValueInst *openExistential) {
-    assert(currOper
-           == pass.valueStorageMap.getDefProjectionOperand(openExistential));
+    assert(currOper == getProjectedDefOperand(openExistential));
     SILValue srcAddr =
         pass.valueStorageMap.getStorage(currOper->get()).storageAddress;
     // Mutable access is always by address.
@@ -2532,8 +2460,7 @@ protected:
   void visitStructExtractInst(StructExtractInst *extractInst) {
     SILValue extractAddr = addrMat.materializeProjectionFromDef(extractInst);
     if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
-      assert(currOper
-             == pass.valueStorageMap.getDefProjectionOperand(extractInst));
+      assert(currOper == getProjectedDefOperand(extractInst));
       markRewritten(extractInst, extractAddr);
     } else {
       assert(!pass.valueStorageMap.contains(extractInst));
@@ -2569,8 +2496,7 @@ protected:
 
     SILValue extractAddr = addrMat.materializeProjectionFromDef(extractInst);
     if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
-      assert(currOper
-             == pass.valueStorageMap.getDefProjectionOperand(extractInst));
+      assert(currOper == getProjectedDefOperand(extractInst));
       markRewritten(extractInst, extractAddr);
     } else {
       assert(!pass.valueStorageMap.contains(extractInst));
@@ -2739,13 +2665,6 @@ protected:
   // Define an opaque tuple.
   void visitTupleInst(TupleInst *tupleInst) {
     ValueStorage &storage = pass.valueStorageMap.getStorage(tupleInst);
-    if (storage.isUseProjection
-        && isa<ReturnInst>(
-               pass.valueStorageMap.getUseProjectionOperand(storage)
-                   ->getUser())) {
-      // For indirectly returned values, each element has its own storage.
-      return;
-    }
     // For each element, initialize the operand's memory. Some tuple elements
     // may be loadable types.
     for (Operand &operand : tupleInst->getAllOperands())
@@ -2788,30 +2707,29 @@ protected:
 // Rewrite applies with indirect paramters or results of loadable types which
 // were not visited during opaque value rewritting.
 static void rewriteIndirectApply(ApplySite apply, AddressLoweringState &pass) {
-  // Some normal calls with indirect formal results have already been rewritten.
-  if (apply.getSubstCalleeType()->hasIndirectFormalResults()) {
-    bool isRewritten = false;
-    if (auto *AI = dyn_cast<ApplyInst>(apply)) {
-      visitCallResults(AI, [&](SILValue result) {
-        // Normal applies that produce indirect results have already been
-        // rewritten when visiting mapped values.
-        if (result->getType().isAddressOnly(pass.F->getModule())) {
-          assert(pass.valueStorageMap.getStorage(result).isRewritten);
-          isRewritten = true;
-          return false;
-        }
-        return true;
-      });
-    }
-    // If the call has indirect results and wasn't already rewritten, rewrite it
-    // now. This also handles try_apply.
-    if (!isRewritten) {
-      ParameterRewriter(apply, pass).rewriteParameters();
-      ApplyRewriter(apply, pass).convertApplyWithIndirectResults();
-      return;
-    }
+  if (!apply.getSubstCalleeType()->hasIndirectFormalResults())
+    ParameterRewriter(apply, pass).rewriteParameters();
+
+#ifndef NDEBUG
+  bool isRewritten = false;
+  if (auto *AI = dyn_cast<ApplyInst>(apply)) {
+    visitCallResults(AI, [&](SILValue result) {
+      // Normal applies that produce indirect results have already been
+      // rewritten when visiting mapped values.
+      if (result->getType().isAddressOnly(pass.F->getModule())) {
+        assert(pass.valueStorageMap.getStorage(result).isRewritten);
+        isRewritten = true;
+        return false;
+      }
+      return true;
+    });
   }
-  ApplyRewriter(apply, pass).rewriteParameters();
+  assert(!isRewritten);
+#endif
+  // If the call has indirect results and wasn't already rewritten, rewrite it
+  // now. This also handles try_apply.
+  ParameterRewriter(apply, pass).rewriteParameters();
+  ApplyRewriter(apply, pass).convertApplyWithIndirectResults();
 }
 
 // Rewrite switch_enum to switch_enum_addr. This can only happen after all
@@ -2909,7 +2827,12 @@ static void rewriteFunction(AddressLoweringState &pass) {
     // TODO: MultiValueInstruction: ApplyInst
     if (auto *inst = dyn_cast<SingleValueInstruction>(valueDef))
       defVisitor.visitInst(inst);
-    else
+    else if (isa<SILFunctionArgument>(valueDef)) {
+      // Returned values are represented by their rewritten @out arguments
+      // because no opaque value exists.
+      assert(valueDef->getType().isAddress());
+      continue;
+    } else
       defVisitor.rewriteBBArg(cast<SILPHIArgument>(valueDef));
 
     SmallVector<Operand *, 8> uses(valueDef->getUses());
@@ -3077,9 +3000,10 @@ static void deleteRewrittenInstructions(AddressLoweringState &pass) {
     // TODO: MultiValueInstruction: ApplyInst
     auto *deadInst = dyn_cast<SingleValueInstruction>(val);
     if (!deadInst) {
-      // Just skip block args. Remove all of a block's dead args in one pass to
-      // avoid rewriting all predecessors terminators multiple times.
-      assert(isa<SILPHIArgument>(val));
+      // Skip arguments. Function arguments are already address types and are
+      // not dead. Dead block args are removed later to avoid rewriting all
+      // predecessors terminators multiple times.
+      assert(isa<SILArgument>(val));
       continue;
     }
 
