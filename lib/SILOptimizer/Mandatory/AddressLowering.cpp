@@ -608,7 +608,9 @@ public:
 
   // The terminator argument can be deduced from the block argument that we
   // project from.
-  void setBranchUseProjection(ValueStorage &storage, SILPHIArgument *bbArg) {
+  void setBranchUseProjection(Operand *oper, SILPHIArgument *bbArg) {
+    assert(isa<TermInst>(oper->getUser()));
+    auto &storage = getStorage(oper->get());
     assert(!storage.isAllocated());
     assert(storage.projectedOperandNum == ValueStorage::InvalidOper);
     storage.projectedStorageID = getOrdinal(bbArg);
@@ -1065,9 +1067,10 @@ BlockArgumentStorageOptimizer::computeArgumentProjections() && {
     SILBasicBlock *incomingPred = incomingOper->getUser()->getParent();
     SILValue incomingVal = incomingOper->get();
 
-    // If the incoming value is already coalesced with another use it can't
-    // project from bbArg.
-    if (pass.valueStorageMap.getStorage(incomingVal).isUseProjection)
+    // If the incoming use is pre-allocated it can't be coalesced.
+    // This also handles incoming values that are already coalesced with
+    // another use.
+    if (pass.valueStorageMap.getStorage(incomingVal).isAllocated())
       continue;
 
     // Make sure that the incomingVal is not coalesced with any of its operands.
@@ -1325,7 +1328,7 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
   // Regardless of whether we projected from a user or allocated storage,
   // provide this storage to all the incoming values that can reuse it.
   for (Operand *argOper : argStorageResult.getArgumentProjections())
-    pass.valueStorageMap.setComposingUseProjection(argOper);
+    pass.valueStorageMap.setBranchUseProjection(argOper, bbArg);
 }
 
 // Create alloc_stack and jointly-postdominating dealloc_stack instructions.
@@ -2719,8 +2722,10 @@ protected:
 // Rewrite applies with indirect paramters or results of loadable types which
 // were not visited during opaque value rewritting.
 static void rewriteIndirectApply(ApplySite apply, AddressLoweringState &pass) {
-  if (!apply.getSubstCalleeType()->hasIndirectFormalResults())
+  if (!apply.getSubstCalleeType()->hasIndirectFormalResults()) {
     ParameterRewriter(apply, pass).rewriteParameters();
+    return;
+  }
 
 #ifndef NDEBUG
   bool isRewritten = false;
