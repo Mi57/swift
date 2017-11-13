@@ -254,8 +254,8 @@ static SILValue getTupleElementUserValue(Operand *oper) {
 // ValueStorageMap: Map Opaque/Resilient SILValues to abstract storage units.
 //===----------------------------------------------------------------------===//
 
-/// Return the operand to the aggregate source value that is extracted into the
-/// given subobject value, or nullptr.
+/// Return the operand whose source is the aggregate value that is extracted
+/// into the given subobject value, or nullptr.
 /// 
 /// Def-projection oracle.
 ///
@@ -287,8 +287,12 @@ static Operand *getProjectedDefOperand(SILValue value) {
   case ValueKind::SILPHIArgument: {
     auto *bbArg = cast<SILPHIArgument>(value);
     auto *predBB = bbArg->getParent()->getSinglePredecessorBlock();
-    assert(predBB && "Block arg def projection must have a single pred.");
-    return &cast<SwitchEnumInst>(predBB->getTerminator())->getAllOperands()[0];
+    if (!predBB)
+      return nullptr;
+    auto *SEI = dyn_cast<SwitchEnumInst>(predBB->getTerminator());
+    if (!SEI)
+      return nullptr;
+    return &SEI->getAllOperands()[0];
   }
   case ValueKind::UncheckedEnumDataInst: {
     llvm_unreachable("unchecked_enum_data unimplemented"); //!!!
@@ -353,7 +357,7 @@ static bool canProjectFromUse(SILInstruction *composedUser) {
 ///
 /// Def/use projection oracle (operand/value association).
 ///
-/// If an no SILValues is returned, then there can be no storage projection
+/// If no SILValues is returned, then there can be no storage projection
 /// from either the operand's source to its use (def projection), or from its
 /// use to its source (use projection).
 ///
@@ -583,8 +587,8 @@ public:
   /// use (e.g. struct_extract, tuple_extract project storage from their
   /// source).
   void setExtractedDefOperand(Operand *oper) {
-    assert(isa<SingleValueInstruction>(oper->getUser()));
-    auto &storage = getStorage(oper->get());
+    auto *extractInst = cast<SingleValueInstruction>(oper->getUser());
+    auto &storage = getStorage(extractInst);
     storage.projectedStorageID = getOrdinal(oper->get());
     storage.isDefProjection = true;
   }
@@ -614,7 +618,11 @@ public:
   /// Return true if the given operand projects storage from its use into its
   /// source.
   bool isNonBranchUseProjection(Operand *oper) const {
-    auto &srcStorage = getStorage(oper->get());
+    auto hashPos = valueHashMap.find(oper->get());
+    if (hashPos == valueHashMap.end())
+      return false;
+    
+    auto &srcStorage = valueVector[hashPos->second].storage;
     if (!srcStorage.isUseProjection)
       return false;
 
@@ -1409,7 +1417,7 @@ public:
 SILValue AddressMaterialization::initializeOperandMem(Operand *operand) {
   SILValue def = operand->get();
   SILValue destAddr;
-  if (operand->get()->getType().isAddressOnly(pass.F->getModule())) {
+  if (def->getType().isAddressOnly(pass.F->getModule())) {
     ValueStorage &storage = pass.valueStorageMap.getStorage(def);
     // Source value should already be rewritten.
     assert(storage.isRewritten);
@@ -1444,11 +1452,15 @@ SILValue AddressMaterialization::materializeAddress(SILValue origValue) {
   if (storage.isUseProjection) {
     SILValue useVal = pass.valueStorageMap.getProjectedStorage(storage).value;
     if (auto *defInst = useVal->getDefiningInstruction()) {
-      return materializeProjectionFromNonBranchUse(
-          &defInst->getAllOperands()[storage.projectedOperandNum]);
+      storage.storageAddress = materializeProjectionFromNonBranchUse(
+        &defInst->getAllOperands()[storage.projectedOperandNum]);
 
-    } else if (isa<SILPHIArgument>(useVal))
-      return materializeAddress(useVal);
+    } else {
+      // origValue is projected from either a block or function argument.
+      assert(isa<SILArgument>(useVal));
+      storage.storageAddress = materializeAddress(useVal);
+    }
+    return storage.storageAddress;
   }
   // Handle a value that is extracted from an aggregate.
   assert(storage.isDefProjection);
