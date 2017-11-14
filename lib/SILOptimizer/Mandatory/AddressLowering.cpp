@@ -172,7 +172,7 @@ static void visitCallResults(ApplyInst *applyInst,
     visitor(applyInst);
 }
 
-/// Get the argument of a try_apply, or nullptr if it is unused.
+/// Get the argument of a try_apply.
 ///
 /// TODO: MultiValue: Only relevant for tuple pseudo results.
 static SILPHIArgument *getTryApplyPseudoResult(TryApplyInst *TAI) {
@@ -192,7 +192,8 @@ SILValue getCallPseudoResult(ApplySite apply) {
 }
 
 /// Return true if the given value is either a "fake" tuple that represents all
-/// of a call's results. This may be either a tuple_inst or a block argument.
+/// of a call's results or an empty tuple of no results. This may return true
+/// for either tuple_inst or a block argument.
 ///
 /// TODO: MultiValue. Calls are SILValues, but when the result type is a tuple,
 /// the call value does not represent a real value with storage. This is a bad
@@ -225,12 +226,13 @@ static bool isPseudoReturnValue(SILValue value) {
   return TI->hasOneUse() && isa<ReturnInst>(TI->use_begin()->getUser());
 }
 
-/// Return the value associated with the user of a tuple element.
+/// Return the value associated with the user of an address-only or indirectly
+/// returned tuple element.
 ///
 /// The given operand's user must be a TupleInst. For normal tuples, the value
 /// is the tuple itself. For returned tuples, the value is the indirect function
-/// argument. This requires indirect function arguments to be rewritten (see
-/// insertIndirectReturnArgs).
+/// argument. This requires indirect function arguments to be rewritten first
+/// (see insertIndirectReturnArgs).
 static SILValue getTupleElementUserValue(Operand *oper) {
   auto *TI = cast<TupleInst>(oper->getUser());
   if (!TI->hasOneUse() || !isa<ReturnInst>(TI->use_begin()->getUser()))
@@ -242,12 +244,15 @@ static SILValue getTupleElementUserValue(Operand *oper) {
   SILFunctionConventions loweredFnConv(
       F->getLoweredFunctionType(),
       SILModuleConventions::getLoweredAddressConventions());
-  assert(resultIdx < loweredFnConv.getNumIndirectSILResults());
-  (void)loweredFnConv;
-
-  // Cannot call getIndirectSILResults here because that API uses the
+  assert(loweredFnConv.getResults().size() == TI->getElements().size());
+  unsigned indirectResultIdx = 0;
+  for (SILResultInfo result : loweredFnConv.getResults().slice(0, resultIdx)) {
+    if (loweredFnConv.isSILIndirect(result))
+      ++indirectResultIdx;
+  }
+  // Cannot call F->getIndirectSILResults here because that API uses the
   // function conventions before address lowering.
-  return F->getArguments()[resultIdx];
+  return F->getArguments()[indirectResultIdx];
 }
 
 //===----------------------------------------------------------------------===//
@@ -344,10 +349,11 @@ static bool canProjectFromUse(SILInstruction *composedUser) {
   case SILInstructionKind::InitExistentialValueInst:
     return true;
 
-  // Terminators that supply block arguments.
+  // Terminators that supply block arguments are handled separately by
+  // BlockArgumentStorageOptimizer.
   case SILInstructionKind::BranchInst:
   case SILInstructionKind::CondBranchInst:
-    return true;
+    return false;
   }
   // TODO: SwitchValueInst, CheckedCastValueBranchInst.
 }
@@ -589,6 +595,14 @@ public:
   void setExtractedDefOperand(Operand *oper) {
     auto *extractInst = cast<SingleValueInstruction>(oper->getUser());
     auto &storage = getStorage(extractInst);
+    storage.projectedStorageID = getOrdinal(oper->get());
+    storage.isDefProjection = true;
+  }
+
+  // Record a storage projection from a terminator (switch_enum) to a block
+  // argument that is a subobject of the given operand of the terminator.
+  void setExtractedBlockArg(Operand *oper, SILPHIArgument *bbArg) {
+    auto &storage = getStorage(bbArg);
     storage.projectedStorageID = getOrdinal(oper->get());
     storage.isDefProjection = true;
   }
@@ -1284,7 +1298,7 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
     if (auto *SEI = dyn_cast<SwitchEnumInst>(predBB->getTerminator())) {
       Operand *incomingOper = &SEI->getAllOperands()[0];
       assert(incomingOper->get() == bbArg->getSingleIncomingValue());
-      pass.valueStorageMap.setExtractedDefOperand(incomingOper);
+      pass.valueStorageMap.setExtractedBlockArg(incomingOper, bbArg);
       return;
     }
     // try_apply is handled differently. If it returns a tuple, then the bbarg
@@ -1753,8 +1767,8 @@ protected:
     if (isa<ApplyInst>(apply))
       return std::next(SILBasicBlock::iterator(apply.getInstruction()));
 
-    auto *bbArg = getTryApplyPseudoResult(cast<TryApplyInst>(apply));
-    return bbArg->getParent()->begin();
+    auto *bb = cast<TryApplyInst>(apply)->getNormalBB();
+    return bb->begin();
   }
 
   void getOriginalDirectResultValues(
@@ -1826,6 +1840,9 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
     // storage.
     SILValue origResult = rewriteTryApply(
         cast<TryApplyInst>(apply.getInstruction()), newCallArgs);
+
+    if (!origResult)
+      return;
 
     // Replace all unmapped uses of the original call with uses of the new call.
     for (SILInstruction *useInst : origUsers)
@@ -2015,12 +2032,11 @@ ApplyInst *ApplyRewriter::genApply(ApplyInst *AI,
 SILValue ApplyRewriter::rewriteTryApply(TryApplyInst *TAI,
                                         ArrayRef<SILValue> newCallArgs) {
 
-  SILPHIArgument *resultArg = getTryApplyPseudoResult(TAI);
-  assert(resultArg->getParent()->getNumArguments() == 1);
-
   auto *newCallInst = argBuilder.createTryApply(
       callLoc, apply.getCallee(), apply.getSubstitutions(), newCallArgs,
       TAI->getNormalBB(), TAI->getErrorBB(), TAI->getSpecializationInfo());
+
+  SILPHIArgument *resultArg = getTryApplyPseudoResult(TAI);
 
   // Immediately delete the old try_apply (old applies hang around until
   // dead code removal because they define values).
@@ -2047,6 +2063,14 @@ SILValue ApplyRewriter::rewriteTryApply(TryApplyInst *TAI,
     pass.valueStorageMap.replaceValue(resultArg, loadArg);
   }
   resultArg->replaceAllUsesWith(loadArg);
+  assert(resultArg->getIndex() == 0);
+  SILType resultTy = loweredCalleeConv.getSILResultType();
+  auto ownership = resultTy.isTrivial(pass.F->getModule())
+                       ? ValueOwnershipKind::Trivial
+                       : ValueOwnershipKind::Owned;
+
+  resultArg->getParent()->replacePHIArgument(0, resultTy, ownership,
+                                             resultArg->getDecl());
 
   return loadArg;
 }
@@ -2980,6 +3004,9 @@ static void removeOpaqueBBArgs(SILBasicBlock *bb, AddressLoweringState &pass) {
       break;
     case TermKind::SwitchEnumInst:
       llvm_unreachable("switch_enum arguments are removed when the terminator "
+                       "is rewritten.");
+    case TermKind::TryApplyInst:
+      llvm_unreachable("try_apply arguments are removed when the terminator "
                        "is rewritten.");
       break;
     }
