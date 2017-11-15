@@ -290,6 +290,11 @@ static Operand *getProjectedDefOperand(SILValue value) {
     return &cast<SingleValueInstruction>(value)->getAllOperands()[0];
 
   case ValueKind::SILPHIArgument: {
+    // FIXME: enable switch_enum def projections.
+    // SIL does not currently have a way to project payload storage
+    // nondestructively.
+    llvm_unreachable("Unimplemented switch_enum optimization");
+    /*
     auto *bbArg = cast<SILPHIArgument>(value);
     auto *predBB = bbArg->getParent()->getSinglePredecessorBlock();
     if (!predBB)
@@ -298,6 +303,7 @@ static Operand *getProjectedDefOperand(SILValue value) {
     if (!SEI)
       return nullptr;
     return &SEI->getAllOperands()[0];
+    */
   }
   case ValueKind::UncheckedEnumDataInst: {
     llvm_unreachable("unchecked_enum_data unimplemented"); //!!!
@@ -1552,6 +1558,9 @@ AddressMaterialization::materializeProjectionFromDef(SILValue origValue) {
                                     extractInst->getType().getAddressType());
   }
   case ValueKind::SILPHIArgument: {
+    // FIXME: Enable def-projections for switch_num to avoid copying the payload.
+    llvm_unreachable("Unimplemented switch_enum optimization");
+    /*
     auto *destBB = cast<SILPHIArgument>(origValue)->getParent();
     Operand *switchOper = getProjectedDefOperand(origValue);
     auto *SEI = cast<SwitchEnumInst>(switchOper->getUser());
@@ -1564,6 +1573,7 @@ AddressMaterialization::materializeProjectionFromDef(SILValue origValue) {
     assert(eltDecl && "No unique case found for destination block");
     return B.createUncheckedTakeEnumDataAddr(SEI->getLoc(), enumAddr,
                                              eltDecl.get());
+    */
   }
   case ValueKind::UncheckedEnumDataInst: {
     llvm_unreachable("unchecked_enum_data unimplemented"); //!!!
@@ -2518,11 +2528,7 @@ protected:
   }
 
   // Opaque enum operand to a switch_enum.
-  void visitSwitchEnumInst(SwitchEnumInst *SEI) {
-    // The switch_enum should be rewritten to a switch_enum_addr here, but
-    // because it's a terminator, it cannot be rewritten until its block
-    // arguments are removed.
-  }
+  void visitSwitchEnumInst(SwitchEnumInst *SEI);
 
   void visitStoreInst(StoreInst *storeInst) {
     SILValue srcVal = storeInst->getSrc();
@@ -2605,6 +2611,86 @@ protected:
   }
 };
 } // end anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// rewriteSwitchEnum
+//===----------------------------------------------------------------------===//
+
+// Rewrite switch_enum to switch_enum_addr. This requires rewriting all the
+// associated block arguments are removed.
+void AddressOnlyUseRewriter::visitSwitchEnumInst(SwitchEnumInst *SEI) {
+  SILValue enumVal = SEI->getOperand();
+  assert(currOper->get() == enumVal);
+  
+  SILValue enumAddr = addrMat.materializeAddress(enumVal);
+
+  // TODO: We should be able to avoid locally copying the case pointers here.
+  SmallVector<std::pair<EnumElementDecl *, SILBasicBlock *>, 8> cases;
+  SmallVector<ProfileCounter, 8> caseCounters;
+
+  // Collect switch cases for rewriting and remove block arguments.
+  for (unsigned caseIdx : range(SEI->getNumCases())) {
+    EnumElementDecl *caseDecl;
+    SILBasicBlock *caseBB;
+    auto caseRecord = SEI->getCase(caseIdx);
+    std::tie(caseDecl, caseBB) = caseRecord;
+
+    cases.push_back(caseRecord);
+    caseCounters.push_back(SEI->getCaseCount(caseIdx));
+
+    if (caseBB->getArguments().size() == 0)
+      continue;
+
+    if (!caseDecl->hasAssociatedValues())
+      continue;
+
+    assert(caseBB->getPHIArguments().size() == 1);
+    SILPHIArgument *caseArg = caseBB->getPHIArguments()[0];
+
+    SILBuilderWithScope argBuilder(caseBB->begin());
+    argBuilder.setSILConventions(
+        SILModuleConventions::getLoweredAddressConventions());
+    AddressMaterialization argMat(pass, argBuilder);
+
+    if (caseArg->getType().isAddressOnly(pass.F->getModule())) {
+      // Replace the block arg with a dummy. As a rule, don't delete anything
+      // that may define an opaque value until dead code elimination. Also,
+      // conceivably we could have a cycle of switch_enum during rewriting.
+      LoadInst *loadArg = argBuilder.createLoad(
+          SEI->getLoc(),
+          SILUndef::get(caseArg->getType().getAddressType(),
+                        pass.F->getModule()),
+          LoadOwnershipQualifier::Unqualified);
+
+      caseArg->replaceAllUsesWith(loadArg);
+
+      auto &origStorage = pass.valueStorageMap.getStorage(caseArg);
+      assert(origStorage.isRewritten);
+
+      pass.valueStorageMap.replaceValue(caseArg, loadArg);
+
+    } else {
+      SILValue eltAddr = argMat.materializeProjectionFromDef(caseArg);
+
+      // Rewrite any non-opaque cases now since we don't visit their defs.
+      auto *loadElt = argBuilder.createLoad(
+          SEI->getLoc(), eltAddr, LoadOwnershipQualifier::Unqualified);
+
+      caseArg->replaceAllUsesWith(loadElt);
+    }
+    caseBB->eraseArgument(0);
+  }
+  auto *defaultBB = SEI->hasDefault() ? SEI->getDefaultBB() : nullptr;
+  auto defaultCounter =
+      SEI->hasDefault() ? SEI->getDefaultCount() : ProfileCounter();
+
+  SILBuilderWithScope B(SEI);
+  B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
+  B.createSwitchEnumAddr(SEI->getLoc(), enumAddr, defaultBB, cases,
+                         ArrayRef<ProfileCounter>(caseCounters),
+                         defaultCounter);
+  SEI->eraseFromParent();
+}
 
 //===----------------------------------------------------------------------===//
 // AddressOnlyDefRewriter - rewrite opaque value definitions.
@@ -2818,90 +2904,6 @@ static void rewriteIndirectApply(ApplySite apply, AddressLoweringState &pass) {
   // now. This also handles try_apply.
   ParameterRewriter(apply, pass).rewriteParameters();
   ApplyRewriter(apply, pass).convertApplyWithIndirectResults();
-}
-
-// Rewrite switch_enum to switch_enum_addr. This can only happen after all
-// associated block arguments are removed.
-//
-// FIXME: Make sure this is done such that ValueStorage projections can't be
-// referenced once we replace an operand with Undef or erase an instruction or
-// argument.
-static void rewriteSwitchEnum(SwitchEnumInst *SEI, AddressLoweringState &pass) {
-  SILValue enumVal = SEI->getOperand();
-  auto &storage = pass.valueStorageMap.getStorage(enumVal);
-  assert(storage.isRewritten);
-  SILValue enumAddr = storage.storageAddress;
-
-  // TODO: We should be able to avoid locally copying the case pointers here.
-  SmallVector<std::pair<EnumElementDecl *, SILBasicBlock *>, 8> cases;
-  SmallVector<ProfileCounter, 8> caseCounters;
-
-  // Collect switch cases for rewriting and remove block arguments.
-  for (unsigned caseIdx : range(SEI->getNumCases())) {
-    EnumElementDecl *caseDecl;
-    SILBasicBlock *caseBB;
-    auto caseRecord = SEI->getCase(caseIdx);
-    std::tie(caseDecl, caseBB) = caseRecord;
-
-    cases.push_back(caseRecord);
-    caseCounters.push_back(SEI->getCaseCount(caseIdx));
-
-    if (caseBB->getArguments().size() == 0)
-      continue;
-
-    if (!caseDecl->hasAssociatedValues())
-      continue;
-
-    assert(caseBB->getPHIArguments().size() == 1);
-    SILPHIArgument *caseArg = caseBB->getPHIArguments()[0];
-
-    SILBuilderWithScope argBuilder(caseBB->begin());
-    argBuilder.setSILConventions(
-        SILModuleConventions::getLoweredAddressConventions());
-    AddressMaterialization addrMat(pass, argBuilder);
-
-    if (caseArg->getType().isAddressOnly(pass.F->getModule())) {
-      // Replace the block arg with a dummy because. As a rule, don't delete
-      // anything that may define an opaque value until dead code
-      // elimination. Also, conceivably we could have a cycle of switch_enum
-      // during rewriting.
-      LoadInst *loadArg = argBuilder.createLoad(
-          SEI->getLoc(),
-          SILUndef::get(caseArg->getType().getAddressType(),
-                        pass.F->getModule()),
-          LoadOwnershipQualifier::Unqualified);
-
-      caseArg->replaceAllUsesWith(loadArg);
-
-      auto &origStorage = pass.valueStorageMap.getStorage(caseArg);
-      assert(origStorage.isRewritten);
-
-      pass.valueStorageMap.replaceValue(caseArg, loadArg);
-
-    } else {
-      SILValue eltAddr = addrMat.materializeProjectionFromDef(caseArg);
-
-      // Rewrite any non-opaque cases now since we don't visit their defs.
-      auto *loadElt = argBuilder.createLoad(
-          SEI->getLoc(), eltAddr, LoadOwnershipQualifier::Unqualified);
-
-      caseArg->replaceAllUsesWith(loadElt);
-    }
-    caseBB->eraseArgument(0);
-  }
-  auto *defaultBB = SEI->hasDefault() ? SEI->getDefaultBB() : nullptr;
-  auto defaultCounter =
-      SEI->hasDefault() ? SEI->getDefaultCount() : ProfileCounter();
-
-  SILBuilderWithScope B(SEI);
-  B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
-  B.createSwitchEnumAddr(SEI->getLoc(), enumAddr, defaultBB, cases,
-                         ArrayRef<ProfileCounter>(caseCounters),
-                         defaultCounter);
-  SEI->eraseFromParent();
-
-  if (auto *unusedI = enumVal->getDefiningInstruction())
-    pass.markDead(unusedI);
 }
 
 static void rewriteFunction(AddressLoweringState &pass) {
