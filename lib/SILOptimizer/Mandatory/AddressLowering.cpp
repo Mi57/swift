@@ -293,7 +293,7 @@ static Operand *getProjectedDefOperand(SILValue value) {
     // FIXME: enable switch_enum def projections.
     // SIL does not currently have a way to project payload storage
     // nondestructively.
-    llvm_unreachable("Unimplemented switch_enum optimization");
+    return nullptr;
     /*
     auto *bbArg = cast<SILPHIArgument>(value);
     auto *predBB = bbArg->getParent()->getSinglePredecessorBlock();
@@ -729,6 +729,17 @@ struct AddressLoweringState {
         assert(instsToDelete.count(use->getUser()));
 #endif
     instsToDelete.insert(inst);
+  }
+
+  SILBuilder getBuilder(SILBasicBlock::iterator insertPt,
+                        SILInstruction *originalInst = nullptr) {
+    if (!originalInst)
+      originalInst = &*insertPt;
+    SILBuilder B(insertPt);
+    B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
+    B.setOpenedArchetypesTracker(&openedArchetypesTracker);
+    B.setCurrentDebugScope(originalInst->getDebugScope());
+    return B;
   }
 };
 } // end anonymous namespace
@@ -1174,14 +1185,18 @@ protected:
   bool checkStorageDominates(AllocStackInst *allocInst,
                              ArrayRef<SILValue> incomingValues);
 
+  void allocateForSwitchEnum(SwitchEnumInst *SEI);
   void allocateForBBArg(SILPHIArgument *bbArg);
-  AllocStackInst *createStackAllocation(SILValue value);
+  AllocStackInst *
+  createStackAllocation(SILInstruction *defInst,
+                        ArrayRef<SILValue> values = ArrayRef < SILValue(),
+                        SILType allocTy = SILType());
 
   void deallocateValue(SILValue value);
 
   void createStackAllocationStorage(SILValue value) {
     pass.valueStorageMap.getStorage(value).storageAddress =
-        createStackAllocation(value);
+        createStackAllocation(cast<SingleValueInstruction>(value), value);
   }
 };
 } // end anonymous namespace
@@ -1308,6 +1323,45 @@ checkStorageDominates(AllocStackInst *allocInst,
   return true;
 }
 
+// FIXME: implement switch_enum optimization
+// switch_enum arguments are different than normal phi-like arguments. The
+// incoming value uses its own storage, and the block argument is always a
+// projection of that storage.
+//   Operand *incomingOper = &SEI->getAllOperands()[0];
+//   assert(incomingOper->get() == bbArg->getSingleIncomingValue());
+//   pass.valueStorageMap.setExtractedBlockArg(incomingOper, bbArg);
+void OpaqueStorageAllocation::allocateForSwitchEnum(SwitchEnumInst *SEI) {
+  // !!! get bbArgs
+  // !!! create a map from switch_enum to storage.
+
+  // Allocate storage for the enum, which is copied before switching and
+  // reused for all cases.
+  AllocStackInst *allocInst =
+      createStackAllocation(SEI, bbArgs, SEI->getOperand()->getType());
+
+  for (unsigned caseIdx : range(SEI->getNumCases())) {
+    EnumElementDecl *caseDecl;
+    SILBasicBlock *caseBB;
+    auto caseRecord = SEI->getCase(caseIdx);
+    std::tie(caseDecl, caseBB) = caseRecord;
+    if (caseBB->getArguments().size() == 0)
+      continue;
+
+    if (!caseDecl->hasAssociatedValues())
+      continue;
+
+    assert(caseBB->getPHIArguments().size() == 1);
+    SILPHIArgument *caseArg = caseBB->getPHIArguments()[0];
+
+    SILBuilder B = pass.getBuilder(caseBB->begin(), SEI);
+    auto *UTE =
+        B.createUncheckedTakeEnumDataAddr(SEI->getLoc(), allocInst, caseDecl);
+
+    if (pass.valueStorageMap.contains(caseArg))
+      pass.valueStorageMap.getStorage(caseArg).storageAddress = UTE;
+  }
+}
+
 // Allocate storage for a BB arg. Unlike normal values, this checks all the
 // incoming values to determine whether any are also candidates for
 // projection.
@@ -1315,13 +1369,9 @@ checkStorageDominates(AllocStackInst *allocInst,
 // TODO: consider coalescing storage from function arguments with block args.
 void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
   if (auto *predBB = bbArg->getParent()->getSinglePredecessorBlock()) {
-    // switch_enum arguments are different than normal phi-like arguments. The
-    // incoming value uses its own storage, and the block argument is always a
-    // projection of that storage.
     if (auto *SEI = dyn_cast<SwitchEnumInst>(predBB->getTerminator())) {
-      Operand *incomingOper = &SEI->getAllOperands()[0];
-      assert(incomingOper->get() == bbArg->getSingleIncomingValue());
-      pass.valueStorageMap.setExtractedBlockArg(incomingOper, bbArg);
+      if (!pass.valueStorageMap.getStorage(bbArg).isAllocated())
+        allocateForSwitchEnum(SEI);
       return;
     }
     // try_apply is handled differently. If it returns a tuple, then the bbarg
@@ -1388,9 +1438,13 @@ void OpaqueStorageAllocation::deallocateValue(SILValue value) {
 // Nesting will be fixed later.
 //
 // This may split critical edges. If so, it updates pass.domInfo.
-AllocStackInst *OpaqueStorageAllocation::createStackAllocation(SILValue value) {
-  SILType allocTy = value->getType();
-  auto *defInst = value->getDefiningInstruction();
+AllocStackInst *OpaqueStorageAllocation::createStackAllocation(
+    SILInstruction *defInst, ArrayRef<SILValue> values, SILType allocTy) {
+  if (values.empty())
+    values = cast<SingleValueInstruction>(defInst);
+
+  if (!allocTy)
+    allocTy = value->getType();
 
   auto createAllocStack = [&](SILInstruction *allocPoint,
                               ArrayRef<SILInstruction *> deallocPoints) {
@@ -1403,35 +1457,32 @@ AllocStackInst *OpaqueStorageAllocation::createStackAllocation(SILValue value) {
       allocBuilder.setCurrentDebugScope(defInst->getDebugScope());
 
     AllocStackInst *allocInstr =
-        allocBuilder.createAllocStack(value.getLoc(), allocTy);
+        allocBuilder.createAllocStack(defInst->getLoc(), allocTy);
 
     for (SILInstruction *deallocPoint : deallocPoints) {
       SILBuilderWithScope B(deallocPoint);
       if (defInst)
         B.setCurrentDebugScope(defInst->getDebugScope());
-      B.createDeallocStack(value.getLoc(), allocInstr);
+      B.createDeallocStack(defInst->getLoc(), allocInstr);
     }
     return allocInstr;
   };
 
   if (allocTy.isOpenedExistential()) {
-    // Don't allow non-instructions to have opened archetypes.
-    auto *def = cast<SingleValueInstruction>(value);
-
     // OpenExistential-ish instructions have guaranteed lifetime--they project
     // their operand's storage--so should never reach here.
-    assert(!getOpenedArchetypeOf(def));
+    assert(!getOpenedArchetypeOf(defInst));
 
     // For all other instructions, just allocate storage immediately before
     // the value is defined.
     DeadEndBlocks DEBlocks(pass.F);
     llvm::SmallVector<SILInstruction *, 8> UsePoints;
-    ValueLifetimeAnalysis VLA(def);
+    ValueLifetimeAnalysis VLA(value);
     ValueLifetimeAnalysis::Frontier Frontier;
     // This updates DominanceInfo if it splits a critical edge.
     VLA.computeFrontier(Frontier, ValueLifetimeAnalysis::AllowToModifyCFG,
                         &DEBlocks, pass.domInfo);
-    return createAllocStack(def, Frontier);
+    return createAllocStack(defInst, Frontier);
   }
   return createAllocStack(&*pass.F->begin()->begin(), pass.exitingInsts);
 }
@@ -2624,6 +2675,11 @@ void AddressOnlyUseRewriter::visitSwitchEnumInst(SwitchEnumInst *SEI) {
   
   SILValue enumAddr = addrMat.materializeAddress(enumVal);
 
+  auto *allocInst = xxx; //!!! get allocStack for switch from some map
+  // Copy the enum value into the switch enum's storage.
+  B.createCopyAddr(SEI->getLoc(), enumAddr, allocInst, IsTake,
+                   IsInitialization);
+
   // TODO: We should be able to avoid locally copying the case pointers here.
   SmallVector<std::pair<EnumElementDecl *, SILBasicBlock *>, 8> cases;
   SmallVector<ProfileCounter, 8> caseCounters;
@@ -2647,11 +2703,11 @@ void AddressOnlyUseRewriter::visitSwitchEnumInst(SwitchEnumInst *SEI) {
     assert(caseBB->getPHIArguments().size() == 1);
     SILPHIArgument *caseArg = caseBB->getPHIArguments()[0];
 
-    SILBuilderWithScope argBuilder(caseBB->begin());
-    argBuilder.setSILConventions(
-        SILModuleConventions::getLoweredAddressConventions());
-    AddressMaterialization argMat(pass, argBuilder);
-
+    SILBuilder argBuilder = pass.getBuilder(caseBB->begin(), SEI);
+    UncheckedTakeEnumDataAddrInst *UTE = x; // !!! get UTE
+    // !!! UTE = cast<UncheckedTakeEnumDataAddrInst>(origStorage.storageAddress)
+    /// !!! compute VLA for caseArg, insert destroys there
+    argBuilder.createDestroyAddr(SEI->getLoc(), UTE);
     if (caseArg->getType().isAddressOnly(pass.F->getModule())) {
       // Replace the block arg with a dummy. As a rule, don't delete anything
       // that may define an opaque value until dead code elimination. Also,
@@ -2665,16 +2721,11 @@ void AddressOnlyUseRewriter::visitSwitchEnumInst(SwitchEnumInst *SEI) {
       caseArg->replaceAllUsesWith(loadArg);
 
       auto &origStorage = pass.valueStorageMap.getStorage(caseArg);
-      assert(origStorage.isRewritten);
-
       pass.valueStorageMap.replaceValue(caseArg, loadArg);
-
     } else {
-      SILValue eltAddr = argMat.materializeProjectionFromDef(caseArg);
-
       // Rewrite any non-opaque cases now since we don't visit their defs.
       auto *loadElt = argBuilder.createLoad(
-          SEI->getLoc(), eltAddr, LoadOwnershipQualifier::Unqualified);
+          SEI->getLoc(), UTE, LoadOwnershipQualifier::Unqualified);
 
       caseArg->replaceAllUsesWith(loadElt);
     }
@@ -2938,18 +2989,6 @@ static void rewriteFunction(AddressLoweringState &pass) {
   // FIXME: remove an apply from this set when it's rewritten.
   for (ApplySite apply : pass.indirectApplies)
     rewriteIndirectApply(apply, pass);
-
-  // Rewrite terminators now that all opaque values are rewritten. Do this after
-  // rewriting all opaque value uses so that block arguments can be removed.
-  //
-  // Any try_apply with indirect parameters or results is already rewritten by
-  // rewriteIndirectApply.
-  for (auto &bb : *pass.F) {
-    if (auto *SEI = dyn_cast<SwitchEnumInst>(bb.getTerminator())) {
-      if (SEI->getOperand()->getType().isAddressOnly(pass.F->getModule()))
-        rewriteSwitchEnum(SEI, pass);
-    }
-  }
 
   // Rewrite this function's return value now that all opaque values within the
   // function are rewritten. This still depends on a valid ValueStorage
