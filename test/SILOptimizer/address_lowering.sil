@@ -77,7 +77,6 @@ bb0(%0 : $T):
 // CHECK-LABEL: sil @f031_unusedIndirect : $@convention(thin) <T> (@in T) -> @out T {
 // CHECK: bb0(%0 : $*T, %1 : $*T):
 // CHECK:   %[[OUT1:.*]] = alloc_stack $T
-// CHECK:   // function_ref f030_returnPair
 // CHECK:   %[[F:.*]] = function_ref @f030_returnPair : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0)
 // CHECK:   %[[R0:.*]] = apply %[[F]]<T>(%[[OUT1]], %0, %1) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0)
 // CHECK:   destroy_addr %[[OUT1]] : $*T
@@ -547,9 +546,9 @@ protocol P {
 // CHECK:   retain_value_addr %0 : $*P
 // CHECK:   copy_addr [take] %0 to [initialization] %1 : $*P
 // CHECK:   [[OPEN:%.*]] = open_existential_addr immutable_access %0 : $*P to $*[[ARCHETYPE:@opened(.*)]] P
-// CHECK:   [[WT:%.*]] = witness_method $[[ARCHETYPE]] P, #P.foo!1 : <Self where Self : P> (Self) -> () -> (), [[OPEN]] : $*[[ARCHETYPE]] P : $@convention(witness_method) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
+// CHECK:   [[WT:%.*]] = witness_method $[[ARCHETYPE]] P, #P.foo!1 : <Self where Self : P> (Self) -> () -> (), [[OPEN]] : $*[[ARCHETYPE]] P : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
 // CHECK:   retain_value_addr [[OPEN]] : $*[[ARCHETYPE]] P
-// CHECK:   %{{.*}} = apply [[WT]]<[[ARCHETYPE]] P>([[OPEN]]) : $@convention(witness_method) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
+// CHECK:   %{{.*}} = apply [[WT]]<[[ARCHETYPE]] P>([[OPEN]]) : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
 // CHECK:   destroy_addr [[ALLOC]] : $*P
 // CHECK:   dealloc_stack [[ALLOC]] : $*P
 // CHECK:   destroy_addr %0 : $*P
@@ -575,11 +574,11 @@ bb0(%0 : $P):
 
 // CHECK-LABEL: sil @f170_compare : $@convention(thin) <T where T : Comparable> (@in T, @in T) -> @out T {
 // CHECK: bb0(%0 : $*T, %1 : $*T, %2 : $*T):
-// CHECK:   [[WT:%.*]] = witness_method $T, #Comparable."<"!1 : <Self where Self : Comparable> (Self.Type) -> (Self, Self) -> Bool : $@convention(witness_method) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
+// CHECK:   [[WT:%.*]] = witness_method $T, #Comparable."<"!1 : <Self where Self : Comparable> (Self.Type) -> (Self, Self) -> Bool : $@convention(witness_method: Comparable) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
 // CHECK:   [[MT:%.*]] = metatype $@thick T.Type
 // CHECK:   retain_value_addr %2 : $*T
 // CHECK:   retain_value_addr %1 : $*T
-// CHECK:   [[CALL:%.*]] = apply [[WT]]<T>(%2, %1, [[MT]]) : $@convention(witness_method) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
+// CHECK:   [[CALL:%.*]] = apply [[WT]]<T>(%2, %1, [[MT]]) : $@convention(witness_method: Comparable) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
 // CHECK:   [[COND:%.*]] = struct_extract [[CALL]] : $Bool, #Bool._value
 // CHECK:   cond_br [[COND]], bb2, bb1
 // CHECK: bb1:
@@ -811,8 +810,17 @@ sil @returnInt : $@convention(thin) <T> (@in T) -> (Int, @error Error)
 sil @returnIntOut : $@convention(thin) <T> (@in T) -> (@out Int, @error Error)
 sil @returnTuple : $@convention(thin) <T> (@in T) -> (@out T, Int, @out Int, @out T, @error Error)
 
-//!!!
-sil @testTryApply : $@convention(thin) <T> (@in T) -> (@out T, @error Error) {
+// CHECK-LABEL: sil @f230_testTryApply : $@convention(thin) <T> (@in T) -> (@out T, @error Error) {
+// CHECK: bb0(%0 : $*T, %1 : $*T):
+// CHECK:   [[F:%.*]] = function_ref @throwsError : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @error Error)
+// CHECK:   try_apply [[F]]<T>(%0, %1) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @error Error), normal bb2, error bb1
+// CHECK: bb1([[E:%.*]] : $Error):
+// CHECK:   throw [[E]] : $Error
+// CHECK: bb2([[NONE:%.*]] : $()):
+// CHECK:   %{{.*}} = tuple ()
+// CHECK:   return %{{.*}} : $()
+// CHECK-LABEL: } // end sil function 'f230_testTryApply'
+sil @f230_testTryApply : $@convention(thin) <T> (@in T) -> (@out T, @error Error) {
 bb0(%0 : $T):
   %3 = function_ref @throwsError : $@convention(thin) <T> (@in T) -> (@out T, @error Error)
   try_apply %3<T>(%0) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @error Error), normal bb1, error bb2
@@ -824,8 +832,16 @@ bb2(%7 : $Error):
   throw %7 : $Error
 }
 
-//!!!
-sil @testTryApplyDirect : $@convention(thin) <T> (@in T) -> (Int, @error Error) {
+// CHECK-LABEL: sil @f240_testTryApplyDirect : $@convention(thin) <T> (@in T) -> (Builtin.Int64, @error Error) {
+// CHECK: bb0(%0 : $*T):
+// CHECK:   [[F:%.*]] = function_ref @returnInt : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (Builtin.Int64, @error Error)
+// CHECK:   try_apply [[F]]<T>(%0) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (Builtin.Int64, @error Error), normal bb2, error bb1
+// CHECK: bb1([[E:%.*]] : $Error):
+// CHECK:   throw [[E]] : $Error
+// CHECK: bb2([[V:%.*]] : $Builtin.Int64):
+// CHECK:   return [[V]] : $Builtin.Int64
+// CHECK-LABEL: } // end sil function 'f240_testTryApplyDirect'
+sil @f240_testTryApplyDirect : $@convention(thin) <T> (@in T) -> (Int, @error Error) {
 bb0(%0 : $T):
   %3 = function_ref @returnInt : $@convention(thin) <T> (@in T) -> (Int, @error Error)
   try_apply %3<T>(%0) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (Int, @error Error), normal bb1, error bb2
@@ -837,8 +853,20 @@ bb2(%7 : $Error):
   throw %7 : $Error
 }
 
-//!!!
-sil @testTryApplyIndirect : $@convention(thin) <T> (@in T) -> (Int, @error Error) {
+// CHECK-LABEL: sil @f250_testTryApplyIndirect : $@convention(thin) <T> (@in T) -> (Builtin.Int64, @error Error) {
+// CHECK: bb0(%0 : $*T):
+// CHECK:   [[F:%.*]] = function_ref @returnIntOut : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out Builtin.Int64, @error Error)
+// CHECK:   [[OUT_I:%.*]] = alloc_stack $Builtin.Int64
+// CHECK:   try_apply %1<T>([[OUT_I]], %0) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out Builtin.Int64, @error Error), normal bb2, error bb1
+// CHECK: bb1([[E:%.*]] : $Error):
+// CHECK:   dealloc_stack [[OUT_I]] : $*Builtin.Int64
+// CHECK:   throw [[E]] : $Error
+// CHECK: bb2(%{{.*}} : $()):
+// CHECK:   [[V:%.*]] = load [[OUT_I]] : $*Builtin.Int64
+// CHECK:   dealloc_stack [[OUT_I]] : $*Builtin.Int64
+// CHECK:   return [[V]] : $Builtin.Int64
+// CHECK-LABEL: } // end sil function 'f250_testTryApplyIndirect'
+sil @f250_testTryApplyIndirect : $@convention(thin) <T> (@in T) -> (Int, @error Error) {
 bb0(%0 : $T):
   %3 = function_ref @returnIntOut : $@convention(thin) <T> (@in T) -> (@out Int, @error Error)
   try_apply %3<T>(%0) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out Int, @error Error), normal bb1, error bb2
@@ -850,8 +878,24 @@ bb2(%7 : $Error):
   throw %7 : $Error
 }
 
-//!!!
-sil @testTryApplyTuple : $@convention(thin) <T> (@in T) -> (@out T, @error Error) {
+// CHECK-LABEL: sil @f260_testTryApplyTuple : $@convention(thin) <T> (@in T) -> (@out T, @error Error) {
+// CHECK: bb0(%0 : $*T, %1 : $*T):
+// CHECK:   [[OUT_T:%.*]] = alloc_stack $T
+// CHECK:   [[F:%.*]] = function_ref @returnTuple : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, Builtin.Int64, @out Builtin.Int64, @out τ_0_0, @error Error)
+// CHECK:   [[OUT_I:%.*]] = alloc_stack $Builtin.Int64
+// CHECK:   try_apply [[F]]<T>([[OUT_T]], [[OUT_I]], %0, %1) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, Builtin.Int64, @out Builtin.Int64, @out τ_0_0, @error Error), normal bb2, error bb1
+// CHECK: bb1([[E:%.*]] : $Error):
+// CHECK:   dealloc_stack [[OUT_I]] : $*Builtin.Int64
+// CHECK:   dealloc_stack [[OUT_T]] : $*T
+// CHECK:   throw [[E]] : $Error
+// CHECK: bb2([[RESULT:%.*]] : $Builtin.Int64):
+// CHECK:   dealloc_stack [[OUT_I]] : $*Builtin.Int64
+// CHECK:   destroy_addr [[OUT_T]] : $*T
+// CHECK:   %{{.*}} = tuple ()
+// CHECK:   dealloc_stack [[OUT_T]] : $*T
+// CHECK:   return %{{.*}} : $()
+// CHECK-LABEL: } // end sil function 'f260_testTryApplyTuple'
+sil @f260_testTryApplyTuple : $@convention(thin) <T> (@in T) -> (@out T, @error Error) {
 bb0(%0 : $T):
   %1 = function_ref @returnTuple : $@convention(thin) <T> (@in T) -> (@out T, Int, @out Int, @out T, @error Error)
   try_apply %1<T>(%0) : $@convention(thin) <T> (@in T) -> (@out T, Int, @out Int, @out T, @error Error), normal bb1, error bb2

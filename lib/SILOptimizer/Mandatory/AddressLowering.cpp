@@ -463,6 +463,8 @@ struct ValueStorage {
     return storageAddress || isUseProjection || isDefProjection;
   }
 
+  bool isProjection() const { return isUseProjection || isDefProjection; }
+
   bool isBranchUseProjection() const {
     return isUseProjection && projectedOperandNum == InvalidOper;
   }
@@ -1080,11 +1082,12 @@ BlockArgumentStorageOptimizer::computeArgumentProjections() && {
   for (auto *incomingOper : incomingOperands) {
     SILBasicBlock *incomingPred = incomingOper->getUser()->getParent();
     SILValue incomingVal = incomingOper->get();
+    auto &incomingStorage = pass.valueStorageMap.getStorage(incomingVal);
 
     // If the incoming use is pre-allocated it can't be coalesced.
     // This also handles incoming values that are already coalesced with
     // another use.
-    if (pass.valueStorageMap.getStorage(incomingVal).isAllocated())
+    if (incomingStorage.isProjection())
       continue;
 
     // Make sure that the incomingVal is not coalesced with any of its operands.
@@ -1093,6 +1096,12 @@ BlockArgumentStorageOptimizer::computeArgumentProjections() && {
     // recursively finding the set of value definitions and their dominating
     // defBB instead of incomingVal->getParentBlock().
     if (auto *defInst = incomingVal->getDefiningInstruction()) {
+      assert(incomingStorage.isAllocated());
+      // Don't coalesce an incoming value unless it's storage is from a stack
+      // allocation, which can be replaced.
+      if (!isa<AllocStackInst>(incomingStorage.storageAddress))
+        continue;
+
       if (hasCoalescedOperand(defInst))
         continue;
     } else {
@@ -1162,6 +1171,8 @@ protected:
   void allocateForBBArg(SILPHIArgument *bbArg);
   AllocStackInst *createStackAllocation(SILValue value);
 
+  void deallocateValue(SILValue value);
+
   void createStackAllocationStorage(SILValue value) {
     pass.valueStorageMap.getStorage(value).storageAddress =
         createStackAllocation(value);
@@ -1227,6 +1238,10 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value) {
   if (findProjectionFromUser(value))
     return;
 
+  // Eagerly create stack allocation. This way any operands can check
+  // alloc_stack dominance before their storage is coalesced with this
+  // value. Unfortunately, this alloc_stack may be dead if we later coalesce
+  // this value's storage with a branch use.
   createStackAllocationStorage(value);
 }
 
@@ -1290,6 +1305,8 @@ checkStorageDominates(AllocStackInst *allocInst,
 // Allocate storage for a BB arg. Unlike normal values, this checks all the
 // incoming values to determine whether any are also candidates for
 // projection.
+//
+// TODO: consider coalescing storage from function arguments with block args.
 void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
   if (auto *predBB = bbArg->getParent()->getSinglePredecessorBlock()) {
     // switch_enum arguments are different than normal phi-like arguments. The
@@ -1341,8 +1358,24 @@ void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
 
   // Regardless of whether we projected from a user or allocated storage,
   // provide this storage to all the incoming values that can reuse it.
-  for (Operand *argOper : argStorageResult.getArgumentProjections())
+  for (Operand *argOper : argStorageResult.getArgumentProjections()) {
+    deallocateValue(argOper->get());
     pass.valueStorageMap.setBranchUseProjection(argOper, bbArg);
+  }
+}
+
+// Unfortunately, we create alloc_stack instructions for SSA values before
+// coalescing block arguments. This temporary storage now needs to be removed.
+void OpaqueStorageAllocation::deallocateValue(SILValue value) {
+  auto &storage = pass.valueStorageMap.getStorage(value);
+  auto *allocInst = cast<AllocStackInst>(storage.storageAddress);
+  storage.storageAddress = nullptr;
+
+  // It's only use should be dealloc_stacks.
+  for (Operand *use : allocInst->getUses())
+    cast<DeallocStackInst>(use->getUser())->eraseFromParent();
+
+  allocInst->eraseFromParent();
 }
 
 // Create alloc_stack and jointly-postdominating dealloc_stack instructions.
@@ -1829,9 +1862,10 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
     // If this call won't be visited as an opaque value def, mark it deleted.
     // Note: Simply checking whether this call is address-only is insufficient,
     // because the address-only use may be have been dead to begin with.
-    if (!pass.valueStorageMap.contains(origCallInst))
-      removeCall(origCallInst);
-
+    if (!pass.valueStorageMap.contains(origCallInst)) {
+      pass.markDead(origCallInst);
+      //!!!removeCall(origCallInst);
+    }
     return;
   }
   case SILInstructionKind::TryApplyInst: {
@@ -1840,14 +1874,11 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
     // storage.
     SILValue origResult = rewriteTryApply(
         cast<TryApplyInst>(apply.getInstruction()), newCallArgs);
-
-    if (!origResult)
-      return;
-
-    // Replace all unmapped uses of the original call with uses of the new call.
-    for (SILInstruction *useInst : origUsers)
+    // Replace unmapped uses of the original call with uses of the new call.
+    for (SILInstruction *useInst : origUsers) {
       rewriteResult(useInst, newDirectResultIndices, origResult,
                     getCallPseudoResult(apply));
+    }
     return;
   }
   case SILInstructionKind::PartialApplyInst:
@@ -2000,16 +2031,17 @@ ApplyRewriter::materializeIndirectResultAddress(SILValue origDirectResultVal,
   auto *allocInst = argBuilder.createAllocStack(loc, argTy);
   LoadInst *loadInst = nullptr;
   if (origDirectResultVal) {
-    // TODO: Find the try_apply's result block.
     // Build results outside-in to next stack allocations.
     SILBuilder resultBuilder(getCallResultInsertionPoint());
     resultBuilder.setSILConventions(
         SILModuleConventions::getLoweredAddressConventions());
     resultBuilder.setCurrentDebugScope(origCallInst->getDebugScope());
-    // This is a formally indirect argument, but is loadable.
-    loadInst = resultBuilder.createLoad(loc, allocInst,
-                                        LoadOwnershipQualifier::Unqualified);
-    origDirectResultVal->replaceAllUsesWith(loadInst);
+    if (!origDirectResultVal->use_empty()) {
+      // This is a formally indirect argument, but is loadable.
+      loadInst = resultBuilder.createLoad(loc, allocInst,
+                                          LoadOwnershipQualifier::Unqualified);
+      origDirectResultVal->replaceAllUsesWith(loadInst);
+    }
     if (auto *resultInst = origDirectResultVal->getDefiningInstruction())
       pass.markDead(resultInst);
   }
@@ -2027,6 +2059,7 @@ ApplyInst *ApplyRewriter::genApply(ApplyInst *AI,
 /// Replace the given try_apply with a new try_apply using the given
 /// newCallArgs. Return the value representing the original (address-only)
 /// result of the try_apply, which will now be replaced with a fake load.
+/// If the original result was not address-only return an invalid SILValue.
 ///
 /// Update this->apply with the new call instruction.
 SILValue ApplyRewriter::rewriteTryApply(TryApplyInst *TAI,
@@ -2038,21 +2071,31 @@ SILValue ApplyRewriter::rewriteTryApply(TryApplyInst *TAI,
 
   SILPHIArgument *resultArg = getTryApplyPseudoResult(TAI);
 
+  auto replacePhi = [&](SILValue newResultVal) {
+    SILType resultTy = loweredCalleeConv.getSILResultType();
+    auto ownership = resultTy.isTrivial(pass.F->getModule())
+                         ? ValueOwnershipKind::Trivial
+                         : ValueOwnershipKind::Owned;
+    resultArg->replaceAllUsesWith(newResultVal);
+    resultArg->getParent()->replacePHIArgument(0, resultTy, ownership,
+                                               resultArg->getDecl());
+  };
   // Immediately delete the old try_apply (old applies hang around until
   // dead code removal because they define values).
   TAI->eraseFromParent();
   this->apply = ApplySite(newCallInst);
 
-  // Rewriting the apply with a new result type requires erasing any opaque
-  // block arguments.  Create dummy loads to stand in for those block
-  // arguments until everything has been rewritten. Just load from undef
-  // since, for tuple results, there's no storage address to load from.
-  LoadInst *loadArg = resultBuilder.createLoad(
-      callLoc,
-      SILUndef::get(resultArg->getType().getAddressType(), pass.F->getModule()),
-      LoadOwnershipQualifier::Unqualified);
-
   if (pass.valueStorageMap.contains(resultArg)) {
+    // Rewriting the apply with a new result type requires erasing any opaque
+    // block arguments.  Create dummy loads to stand in for those block
+    // arguments until everything has been rewritten. Just load from undef
+    // since, for tuple results, there's no storage address to load from.
+    LoadInst *loadArg = resultBuilder.createLoad(
+        callLoc,
+        SILUndef::get(resultArg->getType().getAddressType(),
+                      pass.F->getModule()),
+        LoadOwnershipQualifier::Unqualified);
+
     assert(!resultArg->getType().is<TupleType>());
 
     // Storage was materialized by materializeIndirectResultAddress.
@@ -2061,30 +2104,32 @@ SILValue ApplyRewriter::rewriteTryApply(TryApplyInst *TAI,
     (void)origStorage;
 
     pass.valueStorageMap.replaceValue(resultArg, loadArg);
+    replacePhi(loadArg);
+    return loadArg;
   }
-  resultArg->replaceAllUsesWith(loadArg);
+  // Loadable results were loaded by materializeIndirectResultAddress.
   assert(resultArg->getIndex() == 0);
-  SILType resultTy = loweredCalleeConv.getSILResultType();
-  auto ownership = resultTy.isTrivial(pass.F->getModule())
-                       ? ValueOwnershipKind::Trivial
-                       : ValueOwnershipKind::Owned;
-
-  resultArg->getParent()->replacePHIArgument(0, resultTy, ownership,
-                                             resultArg->getDecl());
-
-  return loadArg;
+  // Temporarily redirect all uses to Undef. They will be fixed in
+  // rewriteResults.
+  replacePhi(SILUndef::get(resultArg->getType().getAddressType(),
+                           pass.F->getModule()));
+  return SILValue();
 }
 
 // Replace any unmapped use of the original call's pseudo-result with a use of
 // the new call.
+//
+// origCallResult is only still valid for single-value calls.
 void ApplyRewriter::rewriteResult(SILInstruction *useInst,
                                   ArrayRef<unsigned> newDirectResultIndices,
                                   SILValue origCallResult,
                                   SILValue newCallResult) {
   auto *extractInst = dyn_cast<TupleExtractInst>(useInst);
   if (!extractInst) {
-    // If the original call produces a single result, it will be replaced when
+    // If the original call produces a single result, it was replaced when
     // materializing the new call arguments.
+    // origCallResult must still be valid because we can't delete a call that
+    // produces a single value mapped to storage.
     assert(origCalleeConv.getNumDirectSILResults() == 1);
     assert(pass.valueStorageMap.getStorage(origCallResult).isRewritten);
     return;
@@ -2095,6 +2140,8 @@ void ApplyRewriter::rewriteResult(SILInstruction *useInst,
   if (extractInst->getType().isAddressOnly(pass.F->getModule())) {
     // Uses of indirect results will be rewritten by AddressOnlyUseRewriter.
     assert(loweredCalleeConv.isSILIndirect(resultInfo));
+    // For try_apply, the operand was temporarily rewritten to undef.
+    extractInst->setOperand(newCallResult);
     // Mark the extract as rewritten now so we don't attempt to convert the
     // call again.
     pass.valueStorageMap.getStorage(extractInst).markRewritten();
@@ -3058,7 +3105,7 @@ static void deleteRewrittenInstructions(AddressLoweringState &pass) {
         assert(pass.instsToDelete.count(operand->getUser()));
 #endif
     pass.instsToDelete.insert(deadInst);
-
+#if 0 //!!!
     // FIXME: MultiValue. Insert non-value calls into the dead instruction list
     // if all of their results have been deleted.
     auto *extract = dyn_cast<TupleExtractInst>(deadInst);
@@ -3071,10 +3118,11 @@ static void deleteRewrittenInstructions(AddressLoweringState &pass) {
                    })) {
           DEBUG(llvm::dbgs() << "DEAD "; applyInst->dump());
           pass.instsToDelete.insert(applyInst);
-          assert(pass.callsToDelete.remove(applyInst));
+          //!!!assert(pass.callsToDelete.remove(applyInst));
         }
       }
     }
+#endif
   }
   assert(pass.callsToDelete.empty());
   
