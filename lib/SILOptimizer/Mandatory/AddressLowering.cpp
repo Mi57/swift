@@ -2509,7 +2509,10 @@ protected:
   }
 
   void visitDestroyValueInst(DestroyValueInst *destroyInst) {
-    llvm_unreachable("Unexpected destroy_value");
+    SILValue srcVal = destroyInst->getOperand();
+    SILValue srcAddr = pass.valueStorageMap.getStorage(srcVal).storageAddress;
+    B.createDestroyAddr(destroyInst->getLoc(), srcAddr);
+    pass.markDead(destroyInst);
   }
 
   // Opaque enum payload. Handle EnumInst on the def side to handle both opaque
