@@ -2458,7 +2458,12 @@ protected:
 
   // Copy from an opaque source operand.
   void visitCopyValueInst(CopyValueInst *copyInst) {
-    llvm_unreachable("Unexpected copy_value");
+    SILValue srcVal = copyInst->getOperand();
+    SILValue srcAddr = pass.valueStorageMap.getStorage(srcVal).storageAddress;
+    SILValue destAddr = addrMat.materializeAddress(copyInst);
+    B.createCopyAddr(copyInst->getLoc(), srcAddr, destAddr, IsNotTake,
+                     IsInitialization);
+    markRewritten(copyInst, destAddr);
   }
 
   // Opaque conditional branch argument.
@@ -2554,12 +2559,8 @@ protected:
     ValueStorage &storage = pass.valueStorageMap.getStorage(srcVal);
     SILValue srcAddr = storage.storageAddress;
 
-    // FIXME: We lower retain_value to retain_value_addr, but lower
-    // release_value to destroy_addr. This is confusingly assymetric.  We should
-    // remove the release_value_addr instruction complete and just add a flag to
-    // destroy_addr to indicate whether IRGen should "outline" its codegen.
-    // FIXME: destroy_addr ignores the "atomicity" flag. Do we care?
-    B.createDestroyAddr(releaseInst->getLoc(), srcAddr);
+    B.createReleaseValueAddr(releaseInst->getLoc(), srcAddr,
+                             releaseInst->getAtomicity());
     pass.markDead(releaseInst);
   }
 
