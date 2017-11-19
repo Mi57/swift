@@ -1990,8 +1990,9 @@ void ApplyRewriter::canonicalizeResults(
     ArrayRef<Operand *> nonCanonicalUses) {
 
   for (Operand *operand : nonCanonicalUses) {
-    SILInstruction *releaseInst = dyn_cast<ReleaseValueInst>(operand->getUser());
-    assert(releaseInst && "Simultaneous use of multiple call results.");
+    auto *destroyInst = dyn_cast<DestroyValueInst>(operand->getUser());
+    if (!destroyInst)
+      llvm::report_fatal_error("Simultaneous use of multiple call results.");
 
     for (unsigned resultIdx : indices(directResultValues)) {
       SILValue result = directResultValues[resultIdx];
@@ -2006,11 +2007,11 @@ void ApplyRewriter::canonicalizeResults(
             resultIdx);
         directResultValues[resultIdx] = result;
       }
-      SILBuilderWithScope B(releaseInst);
+      SILBuilderWithScope B(destroyInst);
       B.setSILConventions(SILModuleConventions::getLoweredAddressConventions());
-      B.emitDestroyValueOperation(releaseInst->getLoc(), result);
+      B.emitDestroyValueOperation(destroyInst->getLoc(), result);
     }
-    releaseInst->eraseFromParent();
+    destroyInst->eraseFromParent();
   }
 }
 
