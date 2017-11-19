@@ -1014,10 +1014,12 @@ static bool linkBBArgs(SILBasicBlock *BB) {
   return true;
 }
 
-/// Returns true if the type \p Ty is a reference or may transitively contains
+/// Returns true if the type \p Ty is a reference or may transitively contain
 /// a reference, i.e. if it is a "pointer" type.
 static bool mayContainReference(SILType Ty, SILModule *Mod) {
-  // Opaque types may contain a reference. Speculatively track them too.
+  // Opaque types may contain a reference. Speculatively track them
+  // too. EscapeAnalysis may be asked to track an opaque value for any of these
+  // reasons:
   //
   // 1. It may be possible to optimize opaque values based on known mutation
   // points.
