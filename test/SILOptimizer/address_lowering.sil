@@ -21,9 +21,9 @@ bb0(%0 : $T):
 
 sil hidden [noinline] @f020_multiResult : $@convention(thin) <T> (@in T) -> (@out T, @out T, @out T) {
 bb0(%0 : $T):
-  retain_value %0 : $T
-  retain_value %0 : $T
-  %6 = tuple (%0 : $T, %0 : $T, %0 : $T)
+  %1 = copy_value %0 : $T
+  %2 = copy_value %0 : $T
+  %6 = tuple (%0 : $T, %1 : $T, %2 : $T)
   return %6 : $(T, T, T)
 }
 
@@ -68,8 +68,8 @@ bb0(%0 : $Int):
 // CHECK-LABEL: } // end sil function 'f030_returnPair'
 sil @f030_returnPair : $@convention(thin) <T> (@in T) -> (@out T, @out T) {
 bb0(%0 : $T):
-  retain_value %0 : $T
-  %3 = tuple (%0 : $T, %0 : $T)
+  %1 = copy_value %0 : $T
+  %3 = tuple (%0 : $T, %1 : $T)
   return %3 : $(T, T)
 }
 
@@ -89,17 +89,17 @@ bb0(%0 : $T):
   %2 = function_ref @f030_returnPair : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0)
   %4 = apply %2<T>(%0) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0)
   %5 = tuple_extract %4 : $(T, T), 0
-  retain_value %5 : $T
+  %6 = copy_value %5 : $T
   %7 = tuple_extract %4 : $(T, T), 1
-  retain_value %7 : $T
-  release_value %4 : $(T, T)
-  release_value %5 : $T
+  %8 = copy_value %7 : $T
+  destroy_value %4 : $(T, T)
+  destroy_value %6 : $T
   return %7 : $T
 }
 
 sil hidden @f040_consumeArg : $@convention(thin) <T> (@in T) -> () {
 bb0(%0 : $T):
-  release_value %0 : $T
+  destroy_value %0 : $T
   %3 = tuple ()
   return %3 : $()
 }
@@ -120,7 +120,7 @@ bb0(%0 : $T):
   %2 = function_ref @f040_consumeArg : $@convention(thin) <τ_0_0> (@in τ_0_0) -> ()
   %3 = copy_value %0 : $T
   %4 = apply %2<T>(%3) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> ()
-  release_value %0 : $T
+  destroy_value %0 : $T
   %6 = tuple ()
   return %6 : $()
 }
@@ -151,12 +151,12 @@ bb0(%0 : $*T, %1 : $*T, %2 : $T):
   %7 = load %0 : $*T
   %6 = copy_value %2 : $T
   store %6 to %0 : $*T
-  release_value %7 : $T
+  destroy_value %7 : $T
   %11 = load %1 : $*T
   %10 = copy_value %2 : $T
   store %10 to %1 : $*T
-  release_value %11 : $T
-  release_value %2 : $T
+  destroy_value %11 : $T
+  destroy_value %2 : $T
   %15 = tuple ()
   return %15 : $()
 }
@@ -166,8 +166,8 @@ bb0(%0 : $*T, %1 : $T):
   %4 = copy_value %1 : $T
   %5 = load %0 : $*T
   store %4 to %0 : $*T
-  release_value %5 : $T
-  release_value %1 : $T
+  destroy_value %5 : $T
+  destroy_value %1 : $T
   %9 = tuple ()
   return %9 : $()
 }
@@ -194,8 +194,8 @@ bb0(%0 : $T):
   %5 = function_ref @f060_mutate : $@convention(thin) <τ_0_0> (@inout τ_0_0, @in τ_0_0) -> ()
   %6 = copy_value %0 : $T
   %7 = apply %5<T>(%1, %6) : $@convention(thin) <τ_0_0> (@inout τ_0_0, @in τ_0_0) -> ()
-  release_addr %1 : $*T
-  release_value %0 : $T
+  destroy_addr %1 : $*T
+  destroy_value %0 : $T
   %10 = tuple ()
   dealloc_stack %1 : $*T
   return %10 : $()
@@ -251,9 +251,9 @@ bb0(%0 : $T, %1 : $C):
   %9 = copy_value %8 : $T
   %10 = tuple_extract %7 : $(T, C), 1
   strong_retain %10 : $C
-  release_value %7 : $(T, C)
+  destroy_value %7 : $(T, C)
   strong_release %1 : $C
-  release_value %0 : $T
+  destroy_value %0 : $T
   %15 = tuple (%9 : $T, %10 : $C)
   return %15 : $(T, C)
 }
@@ -270,8 +270,8 @@ bb0(%0 : $T, %1 : $C):
 // CHECK:   copy_addr %[[OUT2]] to [initialization] %1 : $*T
 // CHECK:   strong_retain %[[T1]] : $C
 // CHECK:   strong_retain %[[T2]] : $C
-// CHECK:   release_addr %[[OUT1]] : $*T
-// CHECK:   release_addr %[[OUT2]] : $*T
+// CHECK:   destroy_addr %[[OUT1]] : $*T
+// CHECK:   destroy_addr %[[OUT2]] : $*T
 // CHECK:   strong_release %[[T1]] : $C
 // CHECK:   strong_release %[[T2]] : $C
 // CHECK:   strong_release %3 : $C
@@ -293,9 +293,9 @@ bb0(%0 : $T, %1 : $C):
   strong_retain %12 : $C
   %14 = tuple_extract %7 : $(T, T, C, C), 3
   strong_retain %14 : $C
-  release_value %7 : $(T, T, C, C)
+  destroy_value %7 : $(T, T, C, C)
   strong_release %1 : $C
-  release_value %0 : $T
+  destroy_value %0 : $T
   %19 = tuple (%9 : $T, %11 : $T, %12 : $C, %14 : $C)
   return %19 : $(T, T, C, C)
 }
@@ -312,14 +312,14 @@ enum Optional<T> {
 // CHECK:   %[[DATA:.*]] = init_enum_data_addr %0 : $*Optional<T>, #Optional.some!enumelt.1
 // CHECK:   copy_addr %1 to [initialization] %[[DATA]] : $*T
 // CHECK:   inject_enum_addr %0 : $*Optional<T>, #Optional.some!enumelt.1
-// CHECK:   release_addr %1 : $*T
+// CHECK:   destroy_addr %1 : $*T
 // CHECK:   return %{{.*}} : $()
 // CHECK-LABEL: } // end sil function 'f080_optional'
 sil @f080_optional : $@convention(thin) <T> (@in T) -> @out Optional<T> {
 bb0(%0 : $T):
   %cpy = copy_value %0 : $T
   %opt = enum $Optional<T>, #Optional.some!enumelt.1, %cpy : $T
-  release_value %0 : $T
+  destroy_value %0 : $T
   return %opt : $Optional<T>
 }
 
@@ -375,14 +375,14 @@ bb0(%0: $Int):
 
 // CHECK-LABEL: sil hidden @f100_any : $@convention(thin) (@in Any) -> () {
 // CHECK: bb0(%0 : $*Any):
-// CHECK:   release_addr %0 : $*Any
+// CHECK:   destroy_addr %0 : $*Any
 // CHECK:   %[[T:.*]] = tuple ()
 // CHECK:   return %[[T]] : $()
 // CHECK-LABEL: } // end sil function 'f100_any'
 sil hidden @f100_any : $@convention(thin) (@in Any) -> () {
 bb0(%0 : $Any):
   debug_value %0 : $Any, let, name "any", argno 1
-  release_value %0 : $Any
+  destroy_value %0 : $Any
   %3 = tuple ()
   return %3 : $()
 }
@@ -394,7 +394,7 @@ bb0(%0 : $Any):
 // CHECK:   %[[T2:.*]] = init_existential_addr %[[A]] : $*Any, $T
 // CHECK:   copy_addr %0 to [initialization] %[[T2]] : $*T
 // CHECK:   %{{.*}} = apply %[[F]](%[[A]]) : $@convention(thin) (@in Any) -> ()
-// CHECK:   release_addr %0 : $*T
+// CHECK:   destroy_addr %0 : $*T
 // CHECK:   dealloc_stack %[[A]] : $*Any
 // CHECK:   return %{{.*}} : $()
 // CHECK-LABEL: } // end sil function 'f101_passAny'
@@ -404,7 +404,7 @@ bb0(%0 : $T):
   %3 = copy_value %0 : $T
   %4 = init_existential_value %3 : $T, $T, $Any
   %5 = apply %2(%4) : $@convention(thin) (@in Any) -> ()
-  release_value %0 : $T
+  destroy_value %0 : $T
   %7 = tuple ()
   return %7 : $()
 }
@@ -479,12 +479,12 @@ bb0(%0 : $S<Element>):
 
 // CHECK-LABEL: sil @f130_testReleaseValue : $@convention(thin) <T> (@in T) -> () {
 // CHECK: bb0(%0 : $*T):
-// CHECK:   release_value_addr %0 : $*T
+// CHECK:   destroy_value_addr %0 : $*T
 // CHECK:   return %{{.*}} : $()
 // CHECK-LABEL: } // end sil function 'f130_testReleaseValue'
 sil @f130_testReleaseValue : $@convention(thin) <T> (@in T) -> () {
 bb0(%0 : $T):
-  release_value %0 : $T
+  destroy_value %0 : $T
   %r = tuple ()
   return %r : $()
 }
@@ -499,7 +499,7 @@ bb0(%0 : $T):
 // CHECK:   copy_addr %0 to [initialization] [[ELT1]] : $*T
 // CHECK:   [[ELT0_1:%.*]] = tuple_element_addr [[ELT0]] : $*(T, T), 1
 // CHECK:   copy_addr [take] %0 to [initialization] [[ELT0_1]] : $*T
-// CHECK:   release_addr [[LOCAL]] : $*((T, T), T)
+// CHECK:   destroy_addr [[LOCAL]] : $*((T, T), T)
 // CHECK:   dealloc_stack [[LOCAL]] : $*((T, T), T)
 // CHECK:   return %{{.*}} : $()
 // CHECK-LABEL: } // end sil function 'f140_testTupleProject'
@@ -509,7 +509,7 @@ bb0(%0 : $T):
   %copy1 = copy_value %0 : $T
   %tuple1 = tuple (%copy0 : $T, %0 : $T)
   %tuple2 = tuple (%tuple1 : $(T, T), %copy1 : $T)
-  release_value %tuple2 : $((T, T), T)
+  destroy_value %tuple2 : $((T, T), T)
   %r = tuple ()
   return %r : $()
 }
@@ -529,7 +529,7 @@ struct Pair<T> {
 // CHECK:   copy_addr [take] %0 to [initialization] [[ELT_XX]] : $*T
 // CHECK:   [[ELT_Y:%.*]] = struct_element_addr [[ALLOC]] : $*Pair<Pair<T>>, #Pair.y
 // CHECK:   copy_addr [[ELT_X]] to [initialization] [[ELT_Y]] : $*Pair<T>
-// CHECK:   release_addr [[ALLOC]] : $*Pair<Pair<T>>
+// CHECK:   destroy_addr [[ALLOC]] : $*Pair<Pair<T>>
 // CHECK:   dealloc_stack [[ALLOC]] : $*Pair<Pair<T>>
 // CHECK:   return %{{.*}} : $()
 // CHECK-LABEL: } // end sil function 'f150_testStructProject'
@@ -539,7 +539,7 @@ bb0(%0 : $T):
   %struct1 = struct $Pair<T> (%0 : $T, %copy0 : $T)
   %struct_copy = copy_value %struct1 : $Pair<T>
   %struct2 = struct $Pair<Pair<T>> (%struct1 : $Pair<T>, %struct_copy : $Pair<T>)
-  release_value %struct2 : $Pair<Pair<T>>
+  destroy_value %struct2 : $Pair<Pair<T>>
   %r = tuple ()
   return %r : $()
 }
@@ -554,11 +554,11 @@ protocol P {
 // CHECK:   copy_addr %0 to [initialization] [[ALLOC]] : $*P
 // CHECK:   [[OPEN:%.*]] = open_existential_addr immutable_access %0 : $*P to $*[[ARCHETYPE:@opened(.*)]] P
 // CHECK:   [[WT:%.*]] = witness_method $[[ARCHETYPE]] P, #P.foo!1 : <Self where Self : P> (Self) -> () -> (), [[OPEN]] : $*[[ARCHETYPE]] P : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
-// CHECK:   retain_value_addr [[OPEN]] : $*[[ARCHETYPE]] P
+// CHECK:   copy_value_addr [[OPEN]] : $*[[ARCHETYPE]] P
 // CHECK:   %{{.*}} = apply [[WT]]<[[ARCHETYPE]] P>([[OPEN]]) : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
 // CHECK:   destroy_addr [[ALLOC]] : $*P
 // CHECK:   dealloc_stack [[ALLOC]] : $*P
-// CHECK:   release_addr %0 : $*P
+// CHECK:   destroy_addr %0 : $*P
 // CHECK:   %{{.*}} = tuple ()
 // CHECK:   return %{{.*}} : $()
 // CHECK-LABEL: } // end sil function 'f160_testOpenedArchetype'
@@ -570,11 +570,11 @@ bb0(%0 : $P):
   %8 = open_existential_value %0 : $P to $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P
   %9 = witness_method $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P, #P.foo!1 : <Self where Self : P> (Self) -> () -> (), %8 : $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
   // Test that we can handle owned value of type opened archetype.
-  retain_value %8 : $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P
-  %11 = apply %9<@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P>(%8) : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
+  %10 = copy_value %8 : $@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P
+  %11 = apply %9<@opened("EF755EF2-B636-11E7-B7B4-A45E60ECC541") P>(%10) : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> ()
   destroy_addr %2 : $*P
   dealloc_stack %2 : $*P
-  release_value %0 : $P
+  destroy_value %0 : $P
   %16 = tuple ()
   return %16 : $()
 }
@@ -583,8 +583,8 @@ bb0(%0 : $P):
 // CHECK: bb0(%0 : $*T, %1 : $*T, %2 : $*T):
 // CHECK:   [[WT:%.*]] = witness_method $T, #Comparable."<"!1 : <Self where Self : Comparable> (Self.Type) -> (Self, Self) -> Bool : $@convention(witness_method: Comparable) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
 // CHECK:   [[MT:%.*]] = metatype $@thick T.Type
-// CHECK:   retain_value_addr %2 : $*T
-// CHECK:   retain_value_addr %1 : $*T
+// CHECK:   copy_value_addr %2 : $*T
+// CHECK:   copy_value_addr %1 : $*T
 // CHECK:   [[CALL:%.*]] = apply [[WT]]<T>(%2, %1, [[MT]]) : $@convention(witness_method: Comparable) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
 // CHECK:   [[COND:%.*]] = struct_extract [[CALL]] : $Bool, #Bool._value
 // CHECK:   cond_br [[COND]], bb2, bb1
@@ -602,9 +602,9 @@ sil @f170_compare : $@convention(thin) <T where T : Comparable> (@in T, @in T) -
 bb0(%0 : $T, %1 : $T):
   %4 = witness_method $T, #Comparable."<"!1 : <Self where Self : Comparable> (Self.Type) -> (Self, Self) -> Bool : $@convention(witness_method: Comparable) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
   %5 = metatype $@thick T.Type
-  retain_value %1 : $T
-  retain_value %0 : $T
-  %8 = apply %4<T>(%1, %0, %5) : $@convention(witness_method: Comparable) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
+  %6 = copy_value %1 : $T
+  %7 = copy_value %0 : $T
+  %8 = apply %4<T>(%6, %7, %5) : $@convention(witness_method: Comparable) <τ_0_0 where τ_0_0 : Comparable> (@in τ_0_0, @in τ_0_0, @thick τ_0_0.Type) -> Bool
   %9 = struct_extract %8 : $Bool, #Bool._value
   cond_br %9, bb1, bb2
 
@@ -770,7 +770,7 @@ enum Mixed<T> {
 // f220_testSwitchMixed
 // CHECK-LABEL: sil @f220_testSwitchMixed : $@convention(method) <T> (@in Mixed<T>, @inout Builtin.Int64, @inout T) -> () {
 // CHECK: bb0(%0 : $*Mixed<T>, %1 : $*Builtin.Int64, %2 : $*T):
-// CHECK:   retain_value_addr %0 : $*Mixed<T>
+// CHECK:   copy_value_addr %0 : $*Mixed<T>
 // CHECK:   switch_enum_addr %0 : $*Mixed<T>, case #Mixed.i!enumelt.1: [[IBB:bb[0-9]+]], case #Mixed.t!enumelt.1: [[TBB:bb[0-9]+]], default [[DBB:bb[0-9]+]]
 // CHECK: [[DBB]]:
 // CHECK:   br [[RBB:bb[0-9]+]]
@@ -791,8 +791,8 @@ enum Mixed<T> {
 // CHECK-LABEL: } // end sil function 'f220_testSwitchMixed'
 sil @f220_testSwitchMixed : $@convention(method) <T> (@in Mixed<T>, @inout Int, @inout T) -> () {
 bb0(%0 : $Mixed<T>, %1 : $*Int, %2 : $*T):
-  retain_value %0 : $Mixed<T>
-  switch_enum %0 : $Mixed<T>, case #Mixed.i!enumelt.1: bb1, case #Mixed.t!enumelt.1: bb2, default bb3
+  %3 = copy_value %0 : $Mixed<T>
+  switch_enum %3 : $Mixed<T>, case #Mixed.i!enumelt.1: bb1, case #Mixed.t!enumelt.1: bb2, default bb3
 
 bb1(%13 : $Int):
   store %13 to %1 : $*Int
@@ -800,14 +800,14 @@ bb1(%13 : $Int):
 
 bb2(%14 : $T):
   store %14 to %2 : $*T
-  release_value %14 : $T
+  destroy_value %14 : $T
   br bb4
 
 bb3:
   br bb4
 
 bb4:
-  release_value %0 : $Mixed<T>
+  destroy_value %0 : $Mixed<T>
   %31 = tuple ()
   return %31 : $()
 }
@@ -912,7 +912,7 @@ bb1(%3 : $(T, Int, Int, T)):
   %5 = tuple_extract %3 : $(T, Int, Int, T), 1
   %6 = tuple_extract %3 : $(T, Int, Int, T), 2
   %7 = tuple_extract %3 : $(T, Int, Int, T), 3
-  release_value %4 : $T
+  destroy_value %4 : $T
   return %7 : $T
 
 bb2(%9 : $Error):
