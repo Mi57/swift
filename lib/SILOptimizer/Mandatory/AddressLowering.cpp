@@ -273,10 +273,7 @@ static bool isStoreCopy(SILValue value) {
     return false;
 
   auto storePos = SILBasicBlock::iterator(storeInst);
-  if (storeInst->getSrc() == copyInst && &*std::prev(storePos) == copyInst)
-    return storeInst;
-  
-  return nullptr;
+  return storeInst->getSrc() == copyInst && &*std::prev(storePos) == copyInst;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1291,8 +1288,11 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value) {
   if (findProjectionFromUser(value))
     return;
 
-  if (auto *SI = isStoreCopy(value)) {
-    storage.storageAddress = SI->getDest();
+  if (isStoreCopy(value)) {
+    pass.valueStorageMap.setBorrowedDefOperand(
+      &cast<CopyValueInst>(value)->getOperandRef());
+    // Don't rewrite this copy. It's store will directly use the borrowed
+    // address.
     storage.markRewritten();
   }
 
@@ -2470,7 +2470,7 @@ protected:
   // Copy from an opaque source operand.
   void visitCopyValueInst(CopyValueInst *copyInst) {
     // store-copy pairs are already rewritten.
-    if (storage.isRewritten)
+    if (pass.valueStorageMap.getStorage(copyInst).isRewritten)
       return;
     
     SILValue srcVal = copyInst->getOperand();
@@ -2609,9 +2609,14 @@ protected:
     SILValue srcAddr = storage.storageAddress;
 
     IsTake_t isTake = IsTake;
-    if (storage.isDefProjection) {
-      assert(isa<CopyValueInst>(origValue));
-      isTake = isNotTake;
+    if (auto *copy = dyn_cast<CopyValueInst>(srcVal)) {
+      if (storage.isDefProjection) {
+        SILValue copySrcAddr =
+          pass.valueStorageMap.getStorage(copy->getOperand()).storageAddress;
+        assert(srcAddr == copySrcAddr && "folded copy should borrow storage");
+        (void)copySrcAddr;
+        isTake = IsNotTake;
+      }
     }
     IsInitialization_t isInit;
     auto qualifier = storeInst->getOwnershipQualifier();
@@ -2882,7 +2887,7 @@ protected:
 
   // Load an opaque value.
   void visitLoadInst(LoadInst *loadInst) {
-    SILValue addr = materializeAddress(loadInst);
+    SILValue addr = addrMat.materializeAddress(loadInst);
     IsTake_t isTake;
     if (loadInst->getOwnershipQualifier() == LoadOwnershipQualifier::Take)
       isTake = IsTake;
