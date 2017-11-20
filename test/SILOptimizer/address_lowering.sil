@@ -1,7 +1,7 @@
 // RUN: %target-sil-opt -address-lowering -enable-sil-opaque-values -emit-sorted-sil -assume-parsing-unqualified-ownership-sil -optimize-opaque-address-lowering %s | %FileCheck %s
 
 import Builtin
-import Swift
+//!!!import Swift
 
 sil_stage canonical
 // CHECK: sil_stage lowered

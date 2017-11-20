@@ -14,11 +14,6 @@
 // is required for IRGen. It is a mandatory IRGen preparation pass (not a
 // diagnostic pass).
 //
-// The SIL input must already be ownership-lowered such that semantic copies do
-// not produce new SIL values. i.e. copy_value/destroy_value instructions are
-// not allowed. Instead we expect release_value/retain_value. The
-// OwnershipElimination pass handles this lowering.
-//
 // In the following comments, items marked "[REUSE]" only apply to the proposed
 // storage reuse optimization, which is not currently implemented. Note: The
 // currently implemented SSA-based on-the-fly optimization and
@@ -255,6 +250,35 @@ static SILValue getTupleElementUserValue(Operand *oper) {
   return F->getArguments()[indirectResultIdx];
 }
 
+// Check if this is a store->copy pair and return the StoreInst.
+//
+// We could check that no instructions write to memory (or destroy the copy
+// source) in between--but the goal here is not to discover copy coalescing
+// opportunities. I expect a copy-propagation prepass to do that for us. That
+// prepass should have already identified the fused copy->operand pairs and
+// inserted the copy just before the store, struct, enum, tuple, etc.
+// The non-store cases are handled naturally as projections. Store is special
+// because its memory location can be written by any instruction.
+static bool isStoreCopy(SILValue value) {
+  auto *copyInst = dyn_cast<CopyValueInst>(value);
+  if (!copyInst)
+    return false;
+
+  if (!copyInst->hasOneUse())
+    return false;
+
+  // Handle stores and aggregate composition.
+  auto *storeInst = dyn_cast<StoreInst>(value->getSingleUse()->getUser());
+  if (!storeInst)
+    return false;
+
+  auto storePos = SILBasicBlock::iterator(storeInst);
+  if (storeInst->getSrc() == copyInst && &*std::prev(storePos) == copyInst)
+    return storeInst;
+  
+  return nullptr;
+}
+
 //===----------------------------------------------------------------------===//
 // ValueStorageMap: Map Opaque/Resilient SILValues to abstract storage units.
 //===----------------------------------------------------------------------===//
@@ -290,11 +314,6 @@ static Operand *getProjectedDefOperand(SILValue value) {
     return &cast<SingleValueInstruction>(value)->getAllOperands()[0];
 
   case ValueKind::SILPHIArgument: {
-    // FIXME: enable switch_enum def projections.
-    // SIL does not currently have a way to project payload storage
-    // nondestructively.
-    return nullptr;
-    /*
     auto *bbArg = cast<SILPHIArgument>(value);
     auto *predBB = bbArg->getParent()->getSinglePredecessorBlock();
     if (!predBB)
@@ -303,12 +322,21 @@ static Operand *getProjectedDefOperand(SILValue value) {
     if (!SEI)
       return nullptr;
     return &SEI->getAllOperands()[0];
-    */
   }
   case ValueKind::UncheckedEnumDataInst: {
     llvm_unreachable("unchecked_enum_data unimplemented"); //!!!
   }
   }
+}
+
+/// Return the operand whose source is borrowed by this value.
+static Operand *getBorrowedDefOperand(SILValue value) {
+  // A store copy borrows is source just long enough to store it without
+  // its source being destroyed in between.
+  if (isStoreCopy(value))
+    return &cast<CopyValueInst>(value)->getOperandRef();
+
+  return nullptr;
 }
 
 /// Return true of the given instruction either composes an aggregate from its
@@ -607,11 +635,17 @@ public:
     storage.isDefProjection = true;
   }
 
+  /// Record a storage projection from the source of the given operand into its
+  /// borrowing use. e.g. copy->store.
+  void setBorrowedDefOperand(Operand *oper) {
+    setExtractedDefOperand(oper);
+  }
+
   // Record a storage projection from a terminator (switch_enum) to a block
   // argument that is a subobject of the given operand of the terminator.
-  void setExtractedBlockArg(Operand *oper, SILPHIArgument *bbArg) {
+  void setExtractedBlockArg(SILValue singlePredVal, SILPHIArgument *bbArg) {
     auto &storage = getStorage(bbArg);
-    storage.projectedStorageID = getOrdinal(oper->get());
+    storage.projectedStorageID = getOrdinal(singlePredVal);
     storage.isDefProjection = true;
   }
 
@@ -753,10 +787,7 @@ struct AddressLoweringState {
 /// load instruction.
 static void convertIndirectFunctionArgs(AddressLoweringState &pass) {
   // Insert temporary argument loads at the top of the function.
-  SILBuilderWithScope argBuilder(pass.F->getEntryBlock()->begin());
-  argBuilder.setSILConventions(
-      SILModuleConventions::getLoweredAddressConventions());
-  argBuilder.setOpenedArchetypesTracker(&pass.openedArchetypesTracker);
+  SILBuilder argBuilder = pass.getBuilder(pass.F->getEntryBlock()->begin());
 
   auto fnConv = pass.F->getConventions();
   unsigned argIdx = fnConv.getSILArgIndexOfFirstParam();
@@ -1185,18 +1216,14 @@ protected:
   bool checkStorageDominates(AllocStackInst *allocInst,
                              ArrayRef<SILValue> incomingValues);
 
-  void allocateForSwitchEnum(SwitchEnumInst *SEI);
   void allocateForBBArg(SILPHIArgument *bbArg);
-  AllocStackInst *
-  createStackAllocation(SILInstruction *defInst,
-                        ArrayRef<SILValue> values = ArrayRef < SILValue(),
-                        SILType allocTy = SILType());
 
   void deallocateValue(SILValue value);
 
+  AllocStackInst *createStackAllocation(SILValue value);
   void createStackAllocationStorage(SILValue value) {
     pass.valueStorageMap.getStorage(value).storageAddress =
-        createStackAllocation(cast<SingleValueInstruction>(value), value);
+        createStackAllocation(cast<SingleValueInstruction>(value));
   }
 };
 } // end anonymous namespace
@@ -1250,14 +1277,24 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value) {
 
   assert(!storage.isAllocated());
 
-  // Check for values the inherently project storage from their operand.
+  // Check for values that inherently project storage from their operand.
   if (auto *storageOper = getProjectedDefOperand(value)) {
     pass.valueStorageMap.setExtractedDefOperand(storageOper);
+    return;
+  }
+  // Check for values that borrow their operand.
+  if (auto *storageOper = getBorrowedDefOperand(value)) {
+    pass.valueStorageMap.setBorrowedDefOperand(storageOper);
     return;
   }
   // Attempt to reuse a user's storage.
   if (findProjectionFromUser(value))
     return;
+
+  if (auto *SI = isStoreCopy(value)) {
+    storage.storageAddress = SI->getDest();
+    storage.markRewritten();
+  }
 
   // Eagerly create stack allocation. This way any operands can check
   // alloc_stack dominance before their storage is coalesced with this
@@ -1323,45 +1360,6 @@ checkStorageDominates(AllocStackInst *allocInst,
   return true;
 }
 
-// FIXME: implement switch_enum optimization
-// switch_enum arguments are different than normal phi-like arguments. The
-// incoming value uses its own storage, and the block argument is always a
-// projection of that storage.
-//   Operand *incomingOper = &SEI->getAllOperands()[0];
-//   assert(incomingOper->get() == bbArg->getSingleIncomingValue());
-//   pass.valueStorageMap.setExtractedBlockArg(incomingOper, bbArg);
-void OpaqueStorageAllocation::allocateForSwitchEnum(SwitchEnumInst *SEI) {
-  // !!! get bbArgs
-  // !!! create a map from switch_enum to storage.
-
-  // Allocate storage for the enum, which is copied before switching and
-  // reused for all cases.
-  AllocStackInst *allocInst =
-      createStackAllocation(SEI, bbArgs, SEI->getOperand()->getType());
-
-  for (unsigned caseIdx : range(SEI->getNumCases())) {
-    EnumElementDecl *caseDecl;
-    SILBasicBlock *caseBB;
-    auto caseRecord = SEI->getCase(caseIdx);
-    std::tie(caseDecl, caseBB) = caseRecord;
-    if (caseBB->getArguments().size() == 0)
-      continue;
-
-    if (!caseDecl->hasAssociatedValues())
-      continue;
-
-    assert(caseBB->getPHIArguments().size() == 1);
-    SILPHIArgument *caseArg = caseBB->getPHIArguments()[0];
-
-    SILBuilder B = pass.getBuilder(caseBB->begin(), SEI);
-    auto *UTE =
-        B.createUncheckedTakeEnumDataAddr(SEI->getLoc(), allocInst, caseDecl);
-
-    if (pass.valueStorageMap.contains(caseArg))
-      pass.valueStorageMap.getStorage(caseArg).storageAddress = UTE;
-  }
-}
-
 // Allocate storage for a BB arg. Unlike normal values, this checks all the
 // incoming values to determine whether any are also candidates for
 // projection.
@@ -1370,8 +1368,7 @@ void OpaqueStorageAllocation::allocateForSwitchEnum(SwitchEnumInst *SEI) {
 void OpaqueStorageAllocation::allocateForBBArg(SILPHIArgument *bbArg) {
   if (auto *predBB = bbArg->getParent()->getSinglePredecessorBlock()) {
     if (auto *SEI = dyn_cast<SwitchEnumInst>(predBB->getTerminator())) {
-      if (!pass.valueStorageMap.getStorage(bbArg).isAllocated())
-        allocateForSwitchEnum(SEI);
+      pass.valueStorageMap.setExtractedBlockArg(SEI->getOperand(), bbArg);
       return;
     }
     // try_apply is handled differently. If it returns a tuple, then the bbarg
@@ -1434,18 +1431,14 @@ void OpaqueStorageAllocation::deallocateValue(SILValue value) {
   allocInst->eraseFromParent();
 }
 
-// Create alloc_stack and jointly-postdominating dealloc_stack instructions.
-// Nesting will be fixed later.
+// Create alloc_stack that dominates `value` and jointly-postdominating
+// dealloc_stack instructions.  Nesting will be fixed later.
 //
 // This may split critical edges. If so, it updates pass.domInfo.
-AllocStackInst *OpaqueStorageAllocation::createStackAllocation(
-    SILInstruction *defInst, ArrayRef<SILValue> values, SILType allocTy) {
-  if (values.empty())
-    values = cast<SingleValueInstruction>(defInst);
-
-  if (!allocTy)
-    allocTy = value->getType();
-
+AllocStackInst *OpaqueStorageAllocation::
+createStackAllocation(SILValue value) {
+  SILType allocTy = value->getType();
+  auto *defInst = value->getDefiningInstruction();
   auto createAllocStack = [&](SILInstruction *allocPoint,
                               ArrayRef<SILInstruction *> deallocPoints) {
     SILBuilderWithScope allocBuilder(allocPoint);
@@ -1457,27 +1450,28 @@ AllocStackInst *OpaqueStorageAllocation::createStackAllocation(
       allocBuilder.setCurrentDebugScope(defInst->getDebugScope());
 
     AllocStackInst *allocInstr =
-        allocBuilder.createAllocStack(defInst->getLoc(), allocTy);
+        allocBuilder.createAllocStack(allocPoint->getLoc(), allocTy);
 
     for (SILInstruction *deallocPoint : deallocPoints) {
       SILBuilderWithScope B(deallocPoint);
       if (defInst)
         B.setCurrentDebugScope(defInst->getDebugScope());
-      B.createDeallocStack(defInst->getLoc(), allocInstr);
+      B.createDeallocStack(deallocPoint->getLoc(), allocInstr);
     }
     return allocInstr;
   };
 
   if (allocTy.isOpenedExistential()) {
+    // Opened archetypes should always be produced by an Instruction.
+    assert(defInst);
     // OpenExistential-ish instructions have guaranteed lifetime--they project
     // their operand's storage--so should never reach here.
     assert(!getOpenedArchetypeOf(defInst));
-
     // For all other instructions, just allocate storage immediately before
     // the value is defined.
     DeadEndBlocks DEBlocks(pass.F);
     llvm::SmallVector<SILInstruction *, 8> UsePoints;
-    ValueLifetimeAnalysis VLA(value);
+    ValueLifetimeAnalysis VLA(defInst);
     ValueLifetimeAnalysis::Frontier Frontier;
     // This updates DominanceInfo if it splits a critical edge.
     VLA.computeFrontier(Frontier, ValueLifetimeAnalysis::AllowToModifyCFG,
@@ -1512,6 +1506,8 @@ public:
 
   SILValue materializeAddress(SILValue origValue);
 
+  SILValue materializeSwitchCase(SILPHIArgument *bbArg,
+                                 ValueStorage &caseStorage);
   SILValue materializeProjectionFromDef(SILValue origValue);
   SILValue materializeProjectionFromNonBranchUse(Operand *operand);
 };
@@ -1571,6 +1567,15 @@ SILValue AddressMaterialization::materializeAddress(SILValue origValue) {
   }
   // Handle a value that is extracted from an aggregate.
   assert(storage.isDefProjection);
+  if (auto *bbArg = dyn_cast<SILPHIArgument>(origValue))
+    return materializeSwitchCase(bbArg, storage);
+
+  if (isStoreCopy(origValue)) {
+    storage.storageAddress =
+      materializeAddress(cast<CopyValueInst>(origValue)->getOperand());
+    return storage.storageAddress;
+  }
+
   storage.storageAddress = materializeProjectionFromDef(origValue);
   return storage.storageAddress;
 }
@@ -1609,27 +1614,33 @@ AddressMaterialization::materializeProjectionFromDef(SILValue origValue) {
                                     extractInst->getType().getAddressType());
   }
   case ValueKind::SILPHIArgument: {
-    // FIXME: Enable def-projections for switch_num to avoid copying the payload.
+    // unchecked_take_enum_data_addr is destructive. It cannot be materialized
+    // on demand.
     llvm_unreachable("Unimplemented switch_enum optimization");
-    /*
-    auto *destBB = cast<SILPHIArgument>(origValue)->getParent();
-    Operand *switchOper = getProjectedDefOperand(origValue);
-    auto *SEI = cast<SwitchEnumInst>(switchOper->getUser());
-
-    // SwitchEnum is special because the composing operand isn't actually an
-    // operand of origValue, which is itself a block argument.
-    SILValue enumAddr =
-        pass.valueStorageMap.getStorage(switchOper->get()).storageAddress;
-    auto eltDecl = SEI->getUniqueCaseForDestination(destBB);
-    assert(eltDecl && "No unique case found for destination block");
-    return B.createUncheckedTakeEnumDataAddr(SEI->getLoc(), enumAddr,
-                                             eltDecl.get());
-    */
   }
   case ValueKind::UncheckedEnumDataInst: {
     llvm_unreachable("unchecked_enum_data unimplemented"); //!!!
   }
   }
+}
+
+/// Materialize the address of a switch_enum case. This destroys the enum
+/// storage, so it can only be called once per switch case.
+SILValue
+AddressMaterialization::materializeSwitchCase(SILPHIArgument *bbArg,
+                                              ValueStorage &caseStorage) {
+  assert(!caseStorage.isAllocated() && "only destroy the enum once.");
+  
+  auto *destBB = bbArg->getParent();
+  Operand *switchOper = getProjectedDefOperand(bbArg);
+  auto *SEI = cast<SwitchEnumInst>(switchOper->getUser());
+  auto eltDecl = SEI->getUniqueCaseForDestination(destBB);
+  assert(eltDecl && "No unique case found for destination block");
+
+  SILValue enumAddr = materializeAddress(switchOper->get());
+  caseStorage.storageAddress =
+    B.createUncheckedTakeEnumDataAddr(SEI->getLoc(), enumAddr, eltDecl.get());
+  return caseStorage.storageAddress;
 }
 
 /// Materialize the address of a subobject composing this operand's use. The
@@ -2458,6 +2469,10 @@ protected:
 
   // Copy from an opaque source operand.
   void visitCopyValueInst(CopyValueInst *copyInst) {
+    // store-copy pairs are already rewritten.
+    if (storage.isRewritten)
+      return;
+    
     SILValue srcVal = copyInst->getOperand();
     SILValue srcAddr = pass.valueStorageMap.getStorage(srcVal).storageAddress;
     SILValue destAddr = addrMat.materializeAddress(copyInst);
@@ -2593,14 +2608,21 @@ protected:
     ValueStorage &storage = pass.valueStorageMap.getStorage(srcVal);
     SILValue srcAddr = storage.storageAddress;
 
-    IsTake_t isTakeFlag = IsTake;
-    assert(storeInst->getOwnershipQualifier()
-           == StoreOwnershipQualifier::Unqualified);
-
-    // Bitwise copy the value. Two locations now share ownership. This is
-    // modeled as a take-init.
+    IsTake_t isTake = IsTake;
+    if (storage.isDefProjection) {
+      assert(isa<CopyValueInst>(origValue));
+      isTake = isNotTake;
+    }
+    IsInitialization_t isInit;
+    auto qualifier = storeInst->getOwnershipQualifier();
+    if (qualifier == StoreOwnershipQualifier::Init)
+      isInit = IsInitialization;
+    else {
+      assert(qualifier == StoreOwnershipQualifier::Assign);
+      isInit = IsNotInitialization;
+    }
     B.createCopyAddr(storeInst->getLoc(), srcAddr, storeInst->getDest(),
-                     isTakeFlag, IsInitialization);
+                     isTake, isInit);
     pass.markDead(storeInst);
   }
 
@@ -2680,12 +2702,7 @@ void AddressOnlyUseRewriter::visitSwitchEnumInst(SwitchEnumInst *SEI) {
   
   SILValue enumAddr = addrMat.materializeAddress(enumVal);
 
-  auto *allocInst = xxx; //!!! get allocStack for switch from some map
-  // Copy the enum value into the switch enum's storage.
-  B.createCopyAddr(SEI->getLoc(), enumAddr, allocInst, IsTake,
-                   IsInitialization);
-
-  // TODO: We should be able to avoid locally copying the case pointers here.
+  // TODO: We should be able to avoid copying the case elements into a vector.
   SmallVector<std::pair<EnumElementDecl *, SILBasicBlock *>, 8> cases;
   SmallVector<ProfileCounter, 8> caseCounters;
 
@@ -2699,20 +2716,17 @@ void AddressOnlyUseRewriter::visitSwitchEnumInst(SwitchEnumInst *SEI) {
     cases.push_back(caseRecord);
     caseCounters.push_back(SEI->getCaseCount(caseIdx));
 
-    if (caseBB->getArguments().size() == 0)
-      continue;
-
-    if (!caseDecl->hasAssociatedValues())
+    // Nothing to do for unused case payloads.
+    if (caseBB->getPHIArguments().size() == 0)
       continue;
 
     assert(caseBB->getPHIArguments().size() == 1);
     SILPHIArgument *caseArg = caseBB->getPHIArguments()[0];
 
-    SILBuilder argBuilder = pass.getBuilder(caseBB->begin(), SEI);
-    UncheckedTakeEnumDataAddrInst *UTE = x; // !!! get UTE
-    // !!! UTE = cast<UncheckedTakeEnumDataAddrInst>(origStorage.storageAddress)
-    /// !!! compute VLA for caseArg, insert destroys there
-    argBuilder.createDestroyAddr(SEI->getLoc(), UTE);
+    assert(caseDecl->hasAssociatedValues() && "caseBB has a payload argument");
+
+    SILBuilder argBuilder = pass.getBuilder(caseBB->begin());
+
     if (caseArg->getType().isAddressOnly(pass.F->getModule())) {
       // Replace the block arg with a dummy. As a rule, don't delete anything
       // that may define an opaque value until dead code elimination. Also,
@@ -2725,13 +2739,13 @@ void AddressOnlyUseRewriter::visitSwitchEnumInst(SwitchEnumInst *SEI) {
 
       caseArg->replaceAllUsesWith(loadArg);
 
-      auto &origStorage = pass.valueStorageMap.getStorage(caseArg);
       pass.valueStorageMap.replaceValue(caseArg, loadArg);
     } else {
       // Rewrite any non-opaque cases now since we don't visit their defs.
+      auto *UTE = argBuilder.createUncheckedTakeEnumDataAddr(
+        SEI->getLoc(), enumAddr, caseDecl);
       auto *loadElt = argBuilder.createLoad(
-          SEI->getLoc(), UTE, LoadOwnershipQualifier::Unqualified);
-
+        SEI->getLoc(), UTE, LoadOwnershipQualifier::Unqualified);
       caseArg->replaceAllUsesWith(loadElt);
     }
     caseBB->eraseArgument(0);
@@ -2868,11 +2882,17 @@ protected:
 
   // Load an opaque value.
   void visitLoadInst(LoadInst *loadInst) {
-    // Bitwise copy the value. Two locations now share ownership. This is
-    // modeled as a take-init.
-    SILValue addr = pass.valueStorageMap.getStorage(loadInst).storageAddress;
+    SILValue addr = materializeAddress(loadInst);
+    IsTake_t isTake;
+    if (loadInst->getOwnershipQualifier() == LoadOwnershipQualifier::Take)
+      isTake = IsTake;
+    else {
+      assert(loadInst->getOwnershipQualifier() == LoadOwnershipQualifier::Copy);
+      isTake = IsNotTake;
+    }
+    // Dummy loads are already mapped to their storage address.
     if (addr != loadInst->getOperand()) {
-      B.createCopyAddr(loadInst->getLoc(), loadInst->getOperand(), addr, IsTake,
+      B.createCopyAddr(loadInst->getLoc(), loadInst->getOperand(), addr, isTake,
                        IsInitialization);
     }
     storage->markRewritten();
