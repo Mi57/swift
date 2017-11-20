@@ -99,7 +99,7 @@ bool OwnershipModelEliminatorVisitor::visitLoadInst(LoadInst *LI) {
     return false;
 
   // If the loaded value is address-only, just return.
-  if (LI->getType().isLoadable(B.getModule()))
+  if (LI->getType().isAddressOnly(B.getModule()))
     return false;
 
   SILValue Result = B.emitLoadValueOperation(LI->getLoc(), LI->getOperand(),
@@ -121,7 +121,7 @@ bool OwnershipModelEliminatorVisitor::visitStoreInst(StoreInst *SI) {
     return false;
 
   // If the stored value is address-only, just return.
-  if (SI->getSrc()->getType().isLoadable(B.getModule()))
+  if (SI->getSrc()->getType().isAddressOnly(B.getModule()))
     return false;
 
   B.emitStoreValueOperation(SI->getLoc(), SI->getSrc(), SI->getDest(),
