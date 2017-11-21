@@ -12,7 +12,9 @@
 ///
 /// SSA Copy propagation removes unnecessary copy_value/destroy_value
 /// instructions.
-/// 
+///
+/// This requires ownership.
+///
 /// [WIP] This is meant to complement opaque values. Initially this will run at
 /// -O, but eventually may also be adapted to -Onone (as currently designed, it
 /// shrinks variable live ranges).
@@ -41,6 +43,9 @@
 ///    If a consumer is not the last use, copy the consumed element.
 ///    If a last use is consuming, remove the destroy of the consumed element.
 ///
+/// This is only valid for ownership-SSA. Otherwise, we would need to do the
+/// usual ValueLifetimeAnalysis.
+///
 /// TODO: This will only be effective for aggregates once SILGen is no longer
 /// generating spurious borrows.
 /// ===----------------------------------------------------------------------===
@@ -57,24 +62,35 @@ using llvm::PointerIntPair;
 STATISIC(NumCopiesEliminated, "number of copy_value instructions removed");
 STATISIC(NumDestroysEliminated, "number of destroy_value instructions removed");
 
+// FIXME: factor with AddressLowering if it ends up remaining useful.
+namespace {
+struct GetUser {
+  SILInstruction *operator()(Operand *oper) const { return oper->getUser(); }
+};
+} // namespace
+
+// TODO: LLVM needs a map_range.
+iterator_range<llvm::mapped_iterator<ValueBase::use_iterator, GetUser>>
+getUserRange(SILValue val) {
+  return make_range(llvm::map_iterator(val->use_begin(), GetUser()),
+                    llvm::map_iterator(val->use_end(), GetUser()));
+}
+
 //===----------------------------------------------------------------------===//
 // CopyPropagationState: shared state for the pass's analysis and transforms.
 //===----------------------------------------------------------------------===//
 
 namespace {
-CopyPropagationState {
-  struct LiveBlock {
-    PointerIntPair<SILBasicBlock *, 1, bool> bbAndIsLiveOut;
+enum IsLive_t { LiveWithin, LiveOut, Dead };
 
-    SILBasicBlock getBB() const { return bbAndIsLiveOut->getPointer(); }
-    bool isLiveOut() const { return bbAndIsLiveOut->getInt(); }
-  };
-  
+/// This pass' shated state per copied def.
+CopyPropagationState {
   SILFunction *F;
 
-  // Per-copied-def state.
-  DenseMap<LiveBlock> liveBlocks;
-  DenseMap<SILInstruction *> lastUsers;
+  // Map of all blocks in which current def is live. True if it is also liveout.
+  DenseMap<SILBasicBlock *, bool> liveBlocks;
+  // Set of all last users in this def's live range.
+  DenseSet<SILInstruction *> lastUsers;
 
   CopyPropagationState(SILFunction *F): F(F) {
 
@@ -82,34 +98,91 @@ CopyPropagationState {
     liveBlocks.clear();
     lastUsers.clear();
   }
+
+  BlockLive_t isBlockLive(SILBasicBlock *bb) const {
+    auto &liveBlockIter = pass.liveBlocks.find(bb);
+    if (liveBlockIter == pass.liveBlocks.end())
+      return Dead;
+    return liveBlockIter->second ? LiveOut : LiveWithin;
+  }
+
+  void markBlockLive(SILBasicBlock *bb, IsLive_t isLive) {
+    assert(isLive != Dead && "erasing live blocks isn't implemented.");
+    liveBlocks[bb] = isLive;
+  }
 };
 } // namespace
 
 //===----------------------------------------------------------------------===//
-// Eliminate Copies for a single copied definition.
+// Find liveness and last users ignoring copies and destroys.
 //===----------------------------------------------------------------------===//
+
+/// Mark blocks live in a reverse CFG traversal from this user.
+void computeUseBlockLiveness(SILBasicBlock *userBB,
+                             CopyPropagationState &pass) {
+
+  pass.markBlockLive(userBB, LiveWithin);
+
+  SmallVector<SILBasicBlock *, 8> worklist(userBB);
+  while (!worklist.empty()) {
+    SILBasicBlock *bb = worklist.pop_back_val();
+    for (auto *predBB : bb->getPredecessorBlocks()) {
+      switch (pass.isLive(predBB)) {
+      case Dead:
+        worklist.push_back(bb);
+        LLVM_FALLTHROUGH;
+      case LiveWithin:
+        pass.markBlockLive(predBB, LiveOut);
+        break;
+      case LiveOut:
+        break;
+      }
+    }
+  }
+}
+
+/// Scan this user's block for another lastUser. If found, replace it.
+///
+/// TODO: This could be expensive for many users within a large block. Consider
+/// using the VLA approach of finding live blocks before last users, or just use
+/// VLA with a predefined UserSet.
+void findLastUser(SILInstruction *user, CopyPropagationState &pass) {
+  auto *I = user->getIterator();
+  auto *B = user->getParent()->begin;
+  while (I != B) {
+    --I;
+    if (pass.lastUsers.erase(&*I)) {
+      pass.lastUsers.insert(&*I);
+      return;
+    }
+  }
+}
 
 /// Update the current def's liveness at the given user.
 void visitUser(SILInstruction *user, CopyPropagationState &pass) {
   auto *bb = user->getParent();
-  auto &pos = pass.liveBlocks.find(bb);
-  if (pos != pass.liveBlocks.end()) {
-    if (pos->
+  auto isLive = pass.liveBlocks.isLive(bb);
+  switch (isLive) {
+  case LiveOut:
     return;
-
-  
+  case LiveWithin:
+    findLastUser(user, pass);
+  case Dead:
+    computeUseBlockLiveness(bb, pass);
+  }
 }
 
 /// Populate pass.liveBlocks and pass.lastUsers.
 void findUsers(SILValue def, CopyPropagationState &pass) {
-  SmallVector<SILValue, 8> worklist(def);
+  SmallSetVector<SILValue, 8> worklist(def);
 
   while (!worklist.empty()) {
-    SILValue def = worklist.pop_back_val();
-    for (Operand *use : def->getUses()) {
+    SILValue value = worklist.pop_back_val();
+    for (Operand *use : value->getUses()) {
       auto *user = use->getUser();
+
       if (isa<CopyValueInst>(user))
-        worklist.push_back(user);
+        worklist.insert(user);
 
       if (isa<DestroyValueInst>(user))
         continue;
@@ -119,10 +192,43 @@ void findUsers(SILValue def, CopyPropagationState &pass) {
   }
 }
 
-Invalidation eliminateCopies(SILValue def, CopyPropagationState &pass) {
-  findUsers();
+//===----------------------------------------------------------------------===//
+// Rewrite copies and destroys for a single copied definition.
+//===----------------------------------------------------------------------===//
+
+void rewriteUser(Operand *use, CopyPropagationState &pass) {
+  if (isConsuming(use))
+    return;
+
+  // !!! Create the destroy.
 }
 
+Invalidation rewriteCopies(SILValue def, CopyPropagationState &pass) {
+  SmallSetVector<SILInstruction *, 8> instsToDelete;
+  SmallSetVector<SILValue, 8> worklist(def);
+
+  while (!worklist.empty()) {
+    SILValue value = worklist.pop_back_val();
+    if (auto *copy = dyn_cast<CopyValueInst>(value)) {
+      worklist.append(getUserRange(value));
+      copy->replaceAllUsesWith(copy->getOperand());
+      instsToDelete.insert(copy);
+      continue;
+    }
+    for (Operand *use : value->getUses()) {
+      auto *user = use->getUser();
+      if (isa<CopyValueInst>(user)) {
+        worklist.insert(user);
+        continue;
+      }
+      if (isa<DestroyValueInst>(user)) {
+        instsToDelete.insert(user);
+        continue;
+      }
+      rewriteUser(use, pass);
+    }
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // CopyPropagation: Top-Level Function Transform.
@@ -161,9 +267,11 @@ class CopyPropagation : public SILModuleTransform {
 };
 } // end anonymous namespace
 
-
 void CopyPropagation::run() {
   DEBUG(llvm::dbgs() << "*** CopyPropagation: " << F.getName() << "\n");
+
+  assert(getFunction()->hasQualifiedOwnership()
+         && "SSA copy propagation is only valid for ownership-SSA");
 
   SILAnalysis::InvalidationKind invalidation =
     SILAnalysis::InvalidationKind::Nothing;
@@ -176,9 +284,10 @@ void CopyPropagation::run() {
         copiedDefs.insert(stripCopies(copy));
     }
   }
-  for (auto &def : copiedDefs)
-    invalidation |= eliminateCopies(pass);
-  
+  for (auto &def : copiedDefs) {
+    findUsers(def, pass);
+    invalidation |= rewriteCopies(def, pass);
+  }
   invalidateAnalysis(invalidation);
 }
 
