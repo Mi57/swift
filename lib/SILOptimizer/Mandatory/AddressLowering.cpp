@@ -132,7 +132,6 @@
 
 using namespace swift;
 using llvm::SmallSetVector;
-using llvm::PointerIntPair;
 
 llvm::cl::opt<bool>
     OptimizeOpaqueAddressLowering("optimize-opaque-address-lowering",
@@ -3216,7 +3215,7 @@ namespace {
 // Note: the only reason this is not a FunctionTransform is to change the SIL
 // stage for all functions at once.
 class AddressLowering : public SILModuleTransform {
-  /// The entry point to this function transformation.
+  /// The entry point to this module transformation.
   void run() override;
 
   void runOnFunction(SILFunction *F);
@@ -3259,7 +3258,7 @@ void AddressLowering::runOnFunction(SILFunction *F) {
   invalidateAnalysis(F, SILAnalysis::InvalidationKind::BranchesAndInstructions);
 }
 
-/// The entry point to this function transformation.
+/// The entry point to this module transformation.
 void AddressLowering::run() {
   if (getModule()->getASTContext().LangOpts.EnableSILOpaqueValues) {
     for (auto &F : *getModule())
