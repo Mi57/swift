@@ -25,7 +25,7 @@
 /// State:
 /// copiedDefs : {SILValue}
 /// liveBlocks : {SILBasicBlock, bool isLiveOut}
-/// lastUsers  : {SILInstruction}
+/// lastUsers  : {Operand}
 ///
 /// 1. Forward walk the instruction stream. Insert the ultimate source of any
 ///    copy_value into copiedDefs.
@@ -74,21 +74,21 @@ struct GetUser {
 } // namespace
 
 // TODO: LLVM needs a map_range.
-iterator_range<llvm::mapped_iterator<ValueBase::use_iterator, GetUser>>
+static iterator_range<llvm::mapped_iterator<ValueBase::use_iterator, GetUser>>
 getUserRange(SILValue val) {
   return make_range(llvm::map_iterator(val->use_begin(), GetUser()),
                     llvm::map_iterator(val->use_end(), GetUser()));
 }
 
 //===----------------------------------------------------------------------===//
-// Ownership Abstraction: FIXME: None of this should be in this pass.
+// Ownership Abstraction.
 //
-// (Ownership properties need to be separate from
-//  OwnershipCompatibilityUseChecker.
+// FIXME: None of this should be in this pass. Ownership properties need an API
+// apart from OwnershipCompatibilityUseChecker.
 //===----------------------------------------------------------------------===//
 
 /// !!! use apply.getArgumentConvention?
-bool doesCallOperConsume(FullApplySite apply, unsigned operIdx) {
+static bool doesCallOperConsume(FullApplySite apply, unsigned operIdx) {
   ParameterConvention paramConv;
   if (operIdx == 0)
     paramConv = apply.getSubstCalleeType()->getCalleeConvention();
@@ -98,6 +98,45 @@ bool doesCallOperConsume(FullApplySite apply, unsigned operIdx) {
                   .getParamInfoForSILArg(argIndex)
                   .getConvention();
   return isConsumedParameter(paramConv);
+}
+
+static isConsuming(Operand *use) {
+  switch (use->getUser->getKind()) {
+  default:
+    llvm_unreachable("Unexpected last use of a loadable owned value.");
+
+  case AutoreleaseValueInst:
+  case DeallocBoxInst:
+  case DeallocExistentialBoxInst:
+  case DeallocRefInst:
+  case DestroyValueInst:
+  case ReleaseValueInst:
+  case ReleaseValueAddrInst:
+  case StrongReleaseInst:
+  case StrongUnpinInst:
+  case UnownedReleaseInst:
+  case InitExistentialRefInst:
+  case EndLifetimeInst:
+    return true;
+
+  case CheckedCastValueBranchInst:
+  case UnconditionalCheckedCastValueInst:
+  case InitExistentialValueInst:
+  case DeinitExistentialValueInst:
+    return true;
+
+  case DebugValueInst:
+  case FixLifetimeInst:
+  case UncheckedBitwiseCastInst: // Is this right?
+  case WitnessMethodInst:        // Is this right?
+  case ProjectBoxInst:           // The result is a T*.
+  case DynamicMethodBranchInst:
+  case UncheckedTrivialBitCastInst:
+  case ExistentialMetatypeInst:
+  case ValueMetatypeInst:
+  case UncheckedOwnershipConversionInst:
+    return false;
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -139,11 +178,15 @@ CopyPropagationState {
 
 //===----------------------------------------------------------------------===//
 // Find liveness and last users ignoring copies and destroys.
-//===----------------------------------------------------------------------===//
+//
+// TODO: Make sure all dependencies are accounted for (mark_dependence,
+// ref_element_addr?). We should have an ownership API so that the pass doesn't
+// require any special knowledge of value dependencies.
+// ===----------------------------------------------------------------------===//
 
 /// Mark blocks live in a reverse CFG traversal from this user.
-void computeUseBlockLiveness(SILBasicBlock *userBB,
-                             CopyPropagationState &pass) {
+static void computeUseBlockLiveness(SILBasicBlock *userBB,
+                                    CopyPropagationState &pass) {
 
   pass.markBlockLive(userBB, LiveWithin);
 
@@ -167,10 +210,10 @@ void computeUseBlockLiveness(SILBasicBlock *userBB,
 
 /// Scan this user's block for another lastUser. If found, replace it.
 ///
-/// TODO: This could be expensive for many users within a large block. Consider
-/// using the VLA approach of finding live blocks before last users, or just use
-/// VLA with a predefined UserSet.
-void findLastUser(SILInstruction *user, CopyPropagationState &pass) {
+/// TODO: This could be costly for many users in a very large block. Consider
+/// using a ValueLifetime-like approach of finding live blocks first before last
+/// users. The current approach has the advantage of not storing UserSet.
+static void findLastUser(SILInstruction *user, CopyPropagationState &pass) {
   auto *I = user->getIterator();
   auto *B = user->getParent()->begin;
   while (I != B) {
@@ -183,7 +226,7 @@ void findLastUser(SILInstruction *user, CopyPropagationState &pass) {
 }
 
 /// Update the current def's liveness at the given user.
-void visitUser(SILInstruction *user, CopyPropagationState &pass) {
+static void visitUser(SILInstruction *user, CopyPropagationState &pass) {
   auto *bb = user->getParent();
   auto isLive = pass.liveBlocks.isLive(bb);
   switch (isLive) {
@@ -197,7 +240,7 @@ void visitUser(SILInstruction *user, CopyPropagationState &pass) {
 }
 
 /// Populate pass.liveBlocks and pass.lastUsers.
-void findUsers(SILValue def, CopyPropagationState &pass) {
+static void findUsers(SILValue def, CopyPropagationState &pass) {
   SmallSetVector<SILValue, 8> worklist(def);
 
   while (!worklist.empty()) {
@@ -208,9 +251,13 @@ void findUsers(SILValue def, CopyPropagationState &pass) {
       if (isa<CopyValueInst>(user))
         worklist.insert(user);
 
-      if (auto *borrow = dyn_cast<BeginBorrowInst>(user))
-        //!!! user = findEndBorrow(borrow)
-
+      // Skip begin_borrow. Consider its end_borrows the use points.
+      if (auto *BBI = dyn_cast<BeginBorrowInst>(user)) {
+        for (Operand *use : BBI) {
+          if (auto *EBI = dyn_cast<EndBorrowInst>(use->getUser()))
+            pass.worklist.insert(EBI);
+        }
+      }
       if (isa<DestroyValueInst>(user))
         continue;
 
@@ -223,15 +270,23 @@ void findUsers(SILValue def, CopyPropagationState &pass) {
 // Rewrite copies and destroys for a single copied definition.
 //===----------------------------------------------------------------------===//
 
-void rewriteUser(Operand *use, CopyPropagationState &pass) {
+static void destroyLastUse(Operand *use, CopyPropagationState &pass) {
   if (isConsuming(use))
     return;
 
-  // !!! Create the destroy.
+  SILValue srcVal = use->get();
+  if (auto *BBI = dyn_cast<BeginBorrowInst>(srcVal))
+    srcVal = BBI->getOperand();
+
+  auto *user = use->getUser();
+  assert(!isa<TerminatorInst>(user) && "Terminator must consume its operand.");
+  SILBuilder B(std::next(user->getIterator()));
+  B.setDebugScope(user);
+  B.createDestroyValue(user->getLoc(), srcVal);
 }
 
 // TODO: Avoid churn. Identify destroys that already complement a last use.
-Invalidation rewriteCopies(SILValue def, CopyPropagationState &pass) {
+static Invalidation rewriteCopies(SILValue def, CopyPropagationState &pass) {
   SmallSetVector<SILInstruction *, 8> instsToDelete;
   SmallSetVector<SILValue, 8> worklist(def);
 
@@ -253,11 +308,11 @@ Invalidation rewriteCopies(SILValue def, CopyPropagationState &pass) {
         instsToDelete.insert(user);
         continue;
       }
-      rewriteUser(use, pass);
+      destroyLastUse(use, pass);
     }
   }
   recursivelyDeleteTriviallyDeadInstructions(pass.instsToDelete.takeVector(),
-                                             true);
+                                             /*force=*/true);
 }
 
 //===----------------------------------------------------------------------===//

@@ -144,7 +144,7 @@ struct GetUser {
 } // namespace
 
 // TODO: LLVM needs a map_range.
-iterator_range<llvm::mapped_iterator<ValueBase::use_iterator, GetUser>>
+static iterator_range<llvm::mapped_iterator<ValueBase::use_iterator, GetUser>>
 getUserRange(SILValue val) {
   return make_range(llvm::map_iterator(val->use_begin(), GetUser()),
                     llvm::map_iterator(val->use_end(), GetUser()));
