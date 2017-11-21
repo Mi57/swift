@@ -13,10 +13,13 @@
 /// SSA Copy propagation removes unnecessary copy_value/destroy_value
 /// instructions.
 ///
-/// This requires ownership.
+/// This requires ownership SSA form.
 ///
-/// [WIP] This is meant to complement opaque values. Initially this will run at
-/// -O, but eventually may also be adapted to -Onone (as currently designed, it
+/// [WIP] This is an incomplete proof of concept. Ownership properties should
+/// be exposed via an API that makes this pass trivially complete.
+///
+/// This is meant to complement opaque values. Initially this will run at -O,
+/// but eventually may also be adapted to -Onone (as currently designed, it
 /// shrinks variable live ranges).
 ///
 /// State:
@@ -25,11 +28,12 @@
 /// lastUsers  : {SILInstruction}
 ///
 /// 1. Forward walk the instruction stream. Insert the ultimate source of any
-/// copy_value into copiedDefs.
+///    copy_value into copiedDefs.
 ///
 /// 2. For each copied Def, visit all uses:
 ///    - Recurse through copies.
-///    - Ignore DestroyValue.
+///    - Skip over borrows.
+///    - Ignore destroys.
 ///
 ///    For each use, first walk the use block:
 ///    - If in liveBlocks and isLiveOut, continue.
@@ -43,8 +47,8 @@
 ///    If a consumer is not the last use, copy the consumed element.
 ///    If a last use is consuming, remove the destroy of the consumed element.
 ///
-/// This is only valid for ownership-SSA. Otherwise, we would need to do the
-/// usual ValueLifetimeAnalysis.
+/// This is sound assuming for ownership-SSA. Otherwise, we would need to handle
+/// the same conditions as ValueLifetimeAnalysis.
 ///
 /// TODO: This will only be effective for aggregates once SILGen is no longer
 /// generating spurious borrows.
@@ -74,6 +78,26 @@ iterator_range<llvm::mapped_iterator<ValueBase::use_iterator, GetUser>>
 getUserRange(SILValue val) {
   return make_range(llvm::map_iterator(val->use_begin(), GetUser()),
                     llvm::map_iterator(val->use_end(), GetUser()));
+}
+
+//===----------------------------------------------------------------------===//
+// Ownership Abstraction: FIXME: None of this should be in this pass.
+//
+// (Ownership properties need to be separate from
+//  OwnershipCompatibilityUseChecker.
+//===----------------------------------------------------------------------===//
+
+/// !!! use apply.getArgumentConvention?
+bool doesCallOperConsume(FullApplySite apply, unsigned operIdx) {
+  ParameterConvention paramConv;
+  if (operIdx == 0)
+    paramConv = apply.getSubstCalleeType()->getCalleeConvention();
+
+  unsigned argIndex = apply.getCalleeArgIndex(Op);
+  paramConv = apply.getSubstCalleeConv()
+                  .getParamInfoForSILArg(argIndex)
+                  .getConvention();
+  return isConsumedParameter(paramConv);
 }
 
 //===----------------------------------------------------------------------===//
@@ -184,6 +208,9 @@ void findUsers(SILValue def, CopyPropagationState &pass) {
       if (isa<CopyValueInst>(user))
         worklist.insert(user);
 
+      if (auto *borrow = dyn_cast<BeginBorrowInst>(user))
+        //!!! user = findEndBorrow(borrow)
+
       if (isa<DestroyValueInst>(user))
         continue;
 
@@ -203,6 +230,7 @@ void rewriteUser(Operand *use, CopyPropagationState &pass) {
   // !!! Create the destroy.
 }
 
+// TODO: Avoid churn. Identify destroys that already complement a last use.
 Invalidation rewriteCopies(SILValue def, CopyPropagationState &pass) {
   SmallSetVector<SILInstruction *, 8> instsToDelete;
   SmallSetVector<SILValue, 8> worklist(def);
@@ -228,6 +256,8 @@ Invalidation rewriteCopies(SILValue def, CopyPropagationState &pass) {
       rewriteUser(use, pass);
     }
   }
+  recursivelyDeleteTriviallyDeadInstructions(pass.instsToDelete.takeVector(),
+                                             true);
 }
 
 //===----------------------------------------------------------------------===//
