@@ -27,7 +27,7 @@
 /// liveBlocks : {SILBasicBlock, bool isLiveOut}
 /// lastUsers  : {Operand}
 ///
-/// 1. Forward walk the instruction stream. Insert the ultimate source of any
+/// 1. Forward walk the instruction stream. Record the originating source of any
 ///    copy_value into copiedDefs.
 ///
 /// 2. For each copied Def, visit all uses:
@@ -35,10 +35,10 @@
 ///    - Skip over borrows.
 ///    - Ignore destroys.
 ///
-///    For each use, first walk the use block:
-///    - If in liveBlocks and isLiveOut, continue.
+///    For each use:
+///    - If in liveBlocks and isLiveOut, continue to the next use.
 ///    - If in liveBlocks and !liveout, scan backward from this Use:
-///      - If lastUsers.erase(I); lastUsers.insert(Use), stop.
+///      - If lastUsers.erase(I); lastUsers.insert(Use), continue to next use.
 ///    - Mark this block as live, not isLiveOut.
 ///    Then traverse CFG preds using a worklist, marking each live-out:
 ///    - If pred block is already in liveBlocks, set isLiveOut and stop.
@@ -50,8 +50,8 @@
 /// This is sound assuming for ownership-SSA. Otherwise, we would need to handle
 /// the same conditions as ValueLifetimeAnalysis.
 ///
-/// TODO: This will only be effective for aggregates once SILGen is no longer
-/// generating spurious borrows.
+/// TODO: This will only be an effective optimization for aggregates once SILGen
+/// is no longer generating spurious borrows.
 /// ===----------------------------------------------------------------------===
 
 #define DEBUG_TYPE "copy-propagation"
@@ -87,6 +87,38 @@ getUserRange(SILValue val) {
 // apart from OwnershipCompatibilityUseChecker.
 //===----------------------------------------------------------------------===//
 
+// TODO: Figure out how to handle these, if possible.
+static bool isUnknownUse(Operand *use) {
+  switch (use->getUser->getKind()) {
+  default:
+    return false;
+  // OwnershipVerifier says that ref_tail_addr, ref_to_raw_pointer, etc. can
+  // take an owned value, but don't consume it and appear to propagate it. This
+  // shouldn't normally happen without a borrow.
+  case RefTailAddrInst:
+  case RefToRawPointerInst:
+  case RefToUnmanagedInst:
+  case RefToUnownedInst:
+  // dynamic_method_br seems to capture self, presumably propagating lifetime.
+  case DynamicMethodBranchInst:
+  // If a value is unsafely cast, we can't say anything about its lifetime.
+  case UncheckedBitwiseCastInst: // Is this right?
+  case UncheckedTrivialBitCastInst:
+  // Ownership verifier says project_box can take an owned value, but
+  // that doesn't make sense to me.
+  case ProjectBoxInst:
+  case ProjectExistentialBoxInst:
+  // Ownership verifier says open_existential_box can take an owned value, but
+  // that doesn't make sense to me.
+  case OpenExistentialBoxInst:
+  // Unmanaged operations.
+  case UnmanagedRetainValueInst:
+  case UnmanagedReleaseValueInst:
+  case UnmanagedAutoreleaseValueInst:
+    return true;
+  }
+}
+
 /// !!! use apply.getArgumentConvention?
 static bool doesCallOperConsume(FullApplySite apply, unsigned operIdx) {
   ParameterConvention paramConv;
@@ -100,15 +132,20 @@ static bool doesCallOperConsume(FullApplySite apply, unsigned operIdx) {
   return isConsumedParameter(paramConv);
 }
 
-static isConsuming(Operand *use) {
-  switch (use->getUser->getKind()) {
+// TODO: Review the semantics of operations that extend the lifetime *without*
+// propagating the value. Ideally, that never happens without borrowing first.
+static bool isConsuming(Operand *use) {
+  switch (use->getUser()->getKind()) {
   default:
     llvm_unreachable("Unexpected last use of a loadable owned value.");
 
+  // Consume the value.
   case AutoreleaseValueInst:
+  case CheckedCastValueBranchInst:
   case DeallocBoxInst:
   case DeallocExistentialBoxInst:
   case DeallocRefInst:
+  case DeinitExistentialValueInst:
   case DestroyValueInst:
   case ReleaseValueInst:
   case ReleaseValueAddrInst:
@@ -116,28 +153,62 @@ static isConsuming(Operand *use) {
   case StrongUnpinInst:
   case UnownedReleaseInst:
   case InitExistentialRefInst:
-  case EndLifetimeInst:
-    return true;
-
-  case CheckedCastValueBranchInst:
-  case UnconditionalCheckedCastValueInst:
   case InitExistentialValueInst:
-  case DeinitExistentialValueInst:
+  case EndLifetimeInst:
+  case UnconditionalCheckedCastValueInst:
     return true;
 
+  // More value consumers?
+  case KeyPathInst:
+    return true;
+
+  case StoreInst:
+    assert(cast<StoreInst>(use->getUser())->getSrc() == use->get());
+    return true;
+
+  // Move the value.
+  case TupleInst:
+  case StructInst:
+  case ObjectInst:
+  case EnumInst:
+  case OpenExistentialRefInst:
+  case UpcastInst:
+  case UncheckedRefCastInst:
+  case ConvertFunctionInst:
+  case RefToBridgeObjectInst:
+  case BridgeObjectToRefInst:
+  case UnconditionalCheckedCastInst:
+  case MarkUninitializedInst:
+  case UncheckedEnumDataInst:
+  case DestructureStructInst:
+  case DestructureTupleInst:
+    return true;
+
+  // BeginBorrow should already be skipped.
+  // EndBorrow extends the lifetime.  
+  case EndBorrowInst:
+    return false;
+
+  // Extend the lifetime without borrowing, propagating, or destroying it.
+  case ClassMethodInst:
   case DebugValueInst:
-  case FixLifetimeInst:
-  case UncheckedBitwiseCastInst: // Is this right?
-  case WitnessMethodInst:        // Is this right?
-  case ProjectBoxInst:           // The result is a T*.
-  case DynamicMethodBranchInst:
-  case UncheckedTrivialBitCastInst:
   case ExistentialMetatypeInst:
   case ValueMetatypeInst:
-  case UncheckedOwnershipConversionInst:
+  case BridgeObjectToWordInst:
+  case CopyBlockInst:
+  case FixLifetimeInst:
+  case SetDeallocatingInst:
+  case StrongPinInst:
     return false;
+
+  // Dynamic dispatch without capturing self.
+  case ObjCMethodInst:
+  case ObjCSuperMethodInst:
+  case SuperMethodInst:
+  case WitnessMethodInst:
+    return false;
+    
   }
-}
 
 //===----------------------------------------------------------------------===//
 // CopyPropagationState: shared state for the pass's analysis and transforms.
@@ -180,9 +251,9 @@ CopyPropagationState {
 // Find liveness and last users ignoring copies and destroys.
 //
 // TODO: Make sure all dependencies are accounted for (mark_dependence,
-// ref_element_addr?). We should have an ownership API so that the pass doesn't
-// require any special knowledge of value dependencies.
-// ===----------------------------------------------------------------------===//
+// ref_element_addr, project_box?). We should have an ownership API so that the
+// pass doesn't require any special knowledge of value dependencies.
+//===----------------------------------------------------------------------===//
 
 /// Mark blocks live in a reverse CFG traversal from this user.
 static void computeUseBlockLiveness(SILBasicBlock *userBB,
@@ -240,13 +311,16 @@ static void visitUser(SILInstruction *user, CopyPropagationState &pass) {
 }
 
 /// Populate pass.liveBlocks and pass.lastUsers.
-static void findUsers(SILValue def, CopyPropagationState &pass) {
+static bool findUsers(SILValue def, CopyPropagationState &pass) {
   SmallSetVector<SILValue, 8> worklist(def);
 
   while (!worklist.empty()) {
     SILValue value = worklist.pop_back_val();
     for (Operand *use : value->getUses()) {
       auto *user = use->getUser();
+
+      if (isUnknownUse(use))
+        return false;
 
       if (isa<CopyValueInst>(user))
         worklist.insert(user);
@@ -264,6 +338,7 @@ static void findUsers(SILValue def, CopyPropagationState &pass) {
       visitUser(user);
     }
   }
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -370,8 +445,8 @@ void CopyPropagation::run() {
     }
   }
   for (auto &def : copiedDefs) {
-    findUsers(def, pass);
-    invalidation |= rewriteCopies(def, pass);
+    if (findUsers(def, pass))
+      invalidation |= rewriteCopies(def, pass);
   }
   invalidateAnalysis(invalidation);
 }
