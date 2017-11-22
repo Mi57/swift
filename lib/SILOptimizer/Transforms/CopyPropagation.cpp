@@ -92,8 +92,14 @@ static bool isUnknownUse(Operand *use) {
   switch (use->getUser->getKind()) {
   default:
     return false;
+  // mark_dependence requires recursion to find all uses. It should be
+  // replaced by begin/end dependence..
+  case MarkDependenceInst:
+  // select_enum propagates a value. We need a general API for instructions like
+  // this.
+  case SelectEnumInst:
   // OwnershipVerifier says that ref_tail_addr, ref_to_raw_pointer, etc. can
-  // take an owned value, but don't consume it and appear to propagate it. This
+  // accept an owned value, but don't consume it and appear to propagate it. This
   // shouldn't normally happen without a borrow.
   case RefTailAddrInst:
   case RefToRawPointerInst:
@@ -119,23 +125,52 @@ static bool isUnknownUse(Operand *use) {
   }
 }
 
-/// !!! use apply.getArgumentConvention?
-static bool doesCallOperConsume(FullApplySite apply, unsigned operIdx) {
+/// Return true if the given owned operand is consumed by the given call.
+static bool isAppliedArgConsumed(ApplySite apply, Operand *oper) {
   ParameterConvention paramConv;
-  if (operIdx == 0)
+  if (oper->get() == apply->getCallee()) {
+    assert(oper->getOperandNumber() == ApplySite::Callee &&
+           "function can't be passed to itself");
     paramConv = apply.getSubstCalleeType()->getCalleeConvention();
-
-  unsigned argIndex = apply.getCalleeArgIndex(Op);
-  paramConv = apply.getSubstCalleeConv()
-                  .getParamInfoForSILArg(argIndex)
-                  .getConvention();
+  } else {
+    unsigned argIndex = apply.getCalleeArgIndex(*oper);
+    paramConv = apply.getSubstCalleeConv()
+      .getParamInfoForSILArg(argIndex)
+      .getConvention();
+  }
   return isConsumedParameter(paramConv);
 }
 
-// TODO: Review the semantics of operations that extend the lifetime *without*
-// propagating the value. Ideally, that never happens without borrowing first.
+/// Return true if the given builtin consumes its operand.
+static bool isBuiltinArgConsumed(BuiltinInst *BI) {
+  const BuiltinInfo &Builtin = BI->getBuiltinInfo();
+  switch (Builtin.ID) {
+  default:
+    llvm_unreachable("Unexpected Builtin with owned value operand.");
+  // Extend lifetime without consuming.
+  case ErrorInMain:
+  case UnexpectedError:
+  case WillThrow:
+    return false;
+  // UnsafeGuaranteed moves the value, which will later be destroyed.
+  case UnsafeGuaranteed:
+    return true;
+  }
+}
+
+/// Return true if the given operand is consumed by its user.
+/// 
+/// TODO: Review the semantics of operations that extend the lifetime *without*
+/// propagating the value. Ideally, that never happens without borrowing first.
 static bool isConsuming(Operand *use) {
-  switch (use->getUser()->getKind()) {
+  auto *user = use->getUser();
+  if (isa<ApplySite>(user))
+    return isAppliedArgConsumed(ApplySite(user), use);
+
+  if (auto *BI = dyn_cast<BuiltinInst>(user))
+    return isBuiltinArgConsumed(BI);
+
+  switch (user->getKind()) {
   default:
     llvm_unreachable("Unexpected last use of a loadable owned value.");
 
@@ -147,6 +182,7 @@ static bool isConsuming(Operand *use) {
   case DeallocRefInst:
   case DeinitExistentialValueInst:
   case DestroyValueInst:
+  case KeyPathInst:
   case ReleaseValueInst:
   case ReleaseValueAddrInst:
   case StrongReleaseInst:
@@ -158,13 +194,21 @@ static bool isConsuming(Operand *use) {
   case UnconditionalCheckedCastValueInst:
     return true;
 
-  // More value consumers?
-  case KeyPathInst:
+  // Terminators must consume their values.
+  case BranchInst:
+  case CheckedCastBranchInst:
+  case CheckedCastValueBranchInst:
+  case CondBranchInst:
+  case ReturnInst:
+  case ThrowInst:
     return true;
 
   case StoreInst:
-    assert(cast<StoreInst>(use->getUser())->getSrc() == use->get());
+    assert(cast<StoreInst>(user)->getSrc() == use->get());
     return true;
+
+  case DeallocPartialRefInst:
+    return cast<DeallocPartialRefInst>(user)->getInstance() == use->get();
 
   // Move the value.
   case TupleInst:
@@ -198,6 +242,7 @@ static bool isConsuming(Operand *use) {
   case CopyBlockInst:
   case FixLifetimeInst:
   case SetDeallocatingInst:
+  case StoreWeakInst:
   case StrongPinInst:
     return false;
 
@@ -209,6 +254,7 @@ static bool isConsuming(Operand *use) {
     return false;
     
   }
+}
 
 //===----------------------------------------------------------------------===//
 // CopyPropagationState: shared state for the pass's analysis and transforms.
