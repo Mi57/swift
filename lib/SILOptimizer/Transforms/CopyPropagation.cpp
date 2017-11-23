@@ -16,16 +16,18 @@
 /// This requires ownership SSA form.
 ///
 /// [WIP] This is an incomplete proof of concept. Ownership properties should
-/// be exposed via an API that makes this pass trivially complete.
+/// be exposed via an API that makes this pass trivially sound.
 ///
 /// This is meant to complement opaque values. Initially this will run at -O,
-/// but eventually may also be adapted to -Onone (as currently designed, it
+/// but eventually may also be adapted to -Onone (but as currently designed, it
 /// shrinks variable live ranges).
 ///
 /// State:
 /// copiedDefs : {SILValue}
-/// liveBlocks : {SILBasicBlock, bool isLiveOut}
-/// lastUsers  : {Operand}
+/// liveBlocks : {SILBasicBlock -> [LiveOut|LiveWithin]}
+/// lastUsers  : {SILInstruction -> bool isConsume} // potential last users
+/// destroyBlocks: {SILBasicBlock} // original destroy points
+/// blockDestroys: {SILBasicBlock -> SILInstruction} // final last users
 ///
 /// 1. Forward walk the instruction stream. Record the originating source of any
 ///    copy_value into copiedDefs.
@@ -33,21 +35,40 @@
 /// 2. For each copied Def, visit all uses:
 ///    - Recurse through copies.
 ///    - Skip over borrows.
-///    - Ignore destroys.
+///    - Ignore destroys as uses, add their block to destroyBlocks.
 ///
 ///    For each use:
-///    - If in liveBlocks and isLiveOut, continue to the next use.
-///    - If in liveBlocks and !liveout, scan backward from this Use:
-///      - If lastUsers.erase(I); lastUsers.insert(Use), continue to next use.
-///    - Mark this block as live, not isLiveOut.
-///    Then traverse CFG preds using a worklist, marking each live-out:
-///    - If pred block is already in liveBlocks, set isLiveOut and stop.
+///    - If in liveBlocks and LiveOut: continue to the next use.
+///    - If in liveBlocks and LiveWithin:
+///        lastUsers.insert(Use), continue to next use.
+///    - Mark this block as LiveWithin
+///      Then traverse CFG preds using a worklist, marking each live-out:
+///      - If pred block is already in liveBlocks, set LiveOut and stop.
 ///
-/// 3. Revisit uses:
-///    If a consumer is not the last use, copy the consumed element.
-///    If a last use is consuming, remove the destroy of the consumed element.
+/// Observations:
+/// - The current def must be postdominated by some subset of its destroys.
+/// - The postdominating destroys cannot be within nested loops.
+/// - Any blocks in nested loops are now marked LiveOut.
+/// 
+/// 3. Backward walk from blockDestroys:
+///    For each destroyBlock:
+///    - if LiveOut: continue to next destroyBlock.
+///    Follow predecessor blocks:
+///    - if predBB is Dead: continue backward CFG traversal.
+///    - if predBB is LiveOut: insert destroy in this CFG edge.
+///    - if predBB is LiveWithin:
+///        if not predBB in blockDestroys:
+///          Backward scan predBB until I is in lastUsers.
+///          If lastUser[I].isConsume:
+///            blockDestroys[predBB] = I
+///          else
+///            blockDestroys[predBB] = new destroy_value.
 ///
-/// This is sound assuming for ownership-SSA. Otherwise, we would need to handle
+/// 4. Revisit uses:
+///    Remove copy_values in the def-use chain.
+///    If a consumer is not in blockDestroys:copy the consumed element.
+///
+/// This is sound for ownership-SSA. Otherwise, we would need to handle
 /// the same conditions as ValueLifetimeAnalysis.
 ///
 /// TODO: This will only be an effective optimization for aggregates once SILGen
@@ -65,6 +86,8 @@ using llvm::PointerIntPair;
 
 STATISIC(NumCopiesEliminated, "number of copy_value instructions removed");
 STATISIC(NumDestroysEliminated, "number of destroy_value instructions removed");
+STATISIC(NumCopiesGenerated, "number of copy_value instructions created");
+STATISIC(NumDestroysGenerated, "number of destroy_value instructions created");
 
 // FIXME: factor with AddressLowering if it ends up remaining useful.
 namespace {
@@ -351,15 +374,22 @@ static void visitUser(SILInstruction *user, CopyPropagationState &pass) {
     return;
   case LiveWithin:
     findLastUser(user, pass);
-  case Dead:
+  case Dead: {
     computeUseBlockLiveness(bb, pass);
+    // If this block is in a loop, it will end up LiveOut.
+    if (pass.liveBlocks.isLive(bb) == LiveWithin)
+      pass.lastUsers.insert(user);
+  }
   }
 }
 
 /// Populate pass.liveBlocks and pass.lastUsers.
+///
+/// Assumptions: No users occur before 'def' in def's BB.
 static bool findUsers(SILValue def, CopyPropagationState &pass) {
-  SmallSetVector<SILValue, 8> worklist(def);
+  pass.markBlockLive(def.getBB(), LiveWithin);
 
+  SmallSetVector<SILValue, 8> worklist(def);
   while (!worklist.empty()) {
     SILValue value = worklist.pop_back_val();
     for (Operand *use : value->getUses()) {
@@ -391,19 +421,39 @@ static bool findUsers(SILValue def, CopyPropagationState &pass) {
 // Rewrite copies and destroys for a single copied definition.
 //===----------------------------------------------------------------------===//
 
+static SILBuilder getBuilderForUser(SILInstruction *user,
+                                    CopyPropagationState &pass) {
+  assert(!isa<TerminatorInst>(user) && "Terminator must consume its operand.");
+  SILBuilder B(std::next(user->getIterator()));
+  B.setDebugScope(user);
+}
+
+/// The current value must be live across the given use. Copy the value for this
+/// use if necessary.
+static void copyLiveUse(Operand *use, CopyPropagationState &pass) {
+  if (!isConsuming(use))
+    return;
+  
+  auto B = getBuilderForUser(use->getUser());
+  auto *copy = B.createCopyValue(user->getLoc(), use->get());
+  use->set(copy);
+  ++NumCopiesGenerated;
+}
+
+/// The given use is the last use of the current value's live range. Make sure
+/// the value is destroyed. Any copies in the def-use chain have been rewritten,
+/// so the given operand refers to the value that needs to be destroyed.
 static void destroyLastUse(Operand *use, CopyPropagationState &pass) {
   if (isConsuming(use))
     return;
 
   SILValue srcVal = use->get();
-  if (auto *BBI = dyn_cast<BeginBorrowInst>(srcVal))
+  while (auto *BBI = dyn_cast<BeginBorrowInst>(srcVal))
     srcVal = BBI->getOperand();
 
-  auto *user = use->getUser();
-  assert(!isa<TerminatorInst>(user) && "Terminator must consume its operand.");
-  SILBuilder B(std::next(user->getIterator()));
-  B.setDebugScope(user);
+  auto B = getBuilderForUser(use->getUser());
   B.createDestroyValue(user->getLoc(), srcVal);
+  ++NumDestroysGenerated;
 }
 
 // TODO: Avoid churn. Identify destroys that already complement a last use.
@@ -417,6 +467,7 @@ static Invalidation rewriteCopies(SILValue def, CopyPropagationState &pass) {
       worklist.append(getUserRange(value));
       copy->replaceAllUsesWith(copy->getOperand());
       instsToDelete.insert(copy);
+      ++NumCopiesEliminated;
       continue;
     }
     for (Operand *use : value->getUses()) {
@@ -427,11 +478,24 @@ static Invalidation rewriteCopies(SILValue def, CopyPropagationState &pass) {
       }
       if (isa<DestroyValueInst>(user)) {
         instsToDelete.insert(user);
+        ++NumDestroysEliminated;
         continue;
       }
-      destroyLastUse(use, pass);
+      auto lastUserIt = pass.lastUsers.find(user);
+      if (lastUserIt == pass.lastUsers.end()) {
+        copyLiveUse(use, pass);
+      } else {
+        destroyLastUse(use, pass);
+        pass.lastUsers.erase(lastUserIt);
+      }
     }
   }
+#ifndef NDEBUG
+  for (auto *lastUser : lastUsers)
+    llvm::dbgs() << "Unreachable last user: " << *lastUser;
+#endif
+  assert(pass.lastUsers.empty() && "Unreachable last user");
+
   recursivelyDeleteTriviallyDeadInstructions(pass.instsToDelete.takeVector(),
                                              /*force=*/true);
 }

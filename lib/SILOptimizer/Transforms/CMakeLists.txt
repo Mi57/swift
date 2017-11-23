@@ -7,6 +7,7 @@ set(TRANSFORMS_SOURCES
   Transforms/CSE.cpp
   Transforms/ConditionForwarding.cpp
   Transforms/CopyForwarding.cpp
+  Transforms/CopyPropagation.cpp
   Transforms/DeadCodeElimination.cpp
   Transforms/DeadObjectElimination.cpp
   Transforms/DeadStoreElimination.cpp
