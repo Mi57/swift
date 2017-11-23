@@ -37,11 +37,11 @@
 ///    - Skip over borrows.
 ///    - Ignore destroys as uses, add their block to destroyBlocks.
 ///
-///    For each use:
+///    For each use, check it's block's liveness:
 ///    - If in liveBlocks and LiveOut: continue to the next use.
 ///    - If in liveBlocks and LiveWithin:
 ///        lastUsers.insert(Use), continue to next use.
-///    - Mark this block as LiveWithin
+///    - If not in liveBlocks, mark this block as LiveWithin
 ///      Then traverse CFG preds using a worklist, marking each live-out:
 ///      - If pred block is already in liveBlocks, set LiveOut and stop.
 ///
@@ -292,8 +292,13 @@ CopyPropagationState {
 
   // Map of all blocks in which current def is live. True if it is also liveout.
   DenseMap<SILBasicBlock *, bool> liveBlocks;
-  // Set of all last users in this def's live range.
-  DenseSet<SILInstruction *> lastUsers;
+  // Set of all last users in this def's live range and whether their used value
+  // is consumed.
+  DenseMap<SILInstruction *, bool> lastUsers;
+  // Original points in the CFG where the current value was destroyed.
+  DenseSet<SILBasicBlock *> destroyBlocks;
+  // Map blocks that contain a final destroy to the destroying instruction.
+  DenseMap<SILBasicBlock *, SILInstruction *> blockDestroys;
 
   CopyPropagationState(SILFunction *F): F(F) {
 
@@ -313,11 +318,24 @@ CopyPropagationState {
     assert(isLive != Dead && "erasing live blocks isn't implemented.");
     liveBlocks[bb] = isLive;
   }
+
+  Optional<bool> isLastUserConsuming(SILInstruction *user) {
+    auto &lastUseIter = lastUsers.find(user);
+    if (lastUseIter == lastUsers.end())
+      return None;
+    return lastUseIter->second;
+  }
+  
+  void setLastUse(Operand *use) {
+    lastUsers[use->getUser()] |= isConsuming(use);
+  }
 };
 } // namespace
 
 //===----------------------------------------------------------------------===//
-// Find liveness and last users ignoring copies and destroys.
+// Step 2. Find liveness for a copied def, ignoring copies and destroys.
+// Populates pass.liveBlocks with LiveOut and LiveWithin blocks.
+// Populates pass.lastUsers with potential last users.
 //
 // TODO: Make sure all dependencies are accounted for (mark_dependence,
 // ref_element_addr, project_box?). We should have an ownership API so that the
@@ -348,32 +366,15 @@ static void computeUseBlockLiveness(SILBasicBlock *userBB,
   }
 }
 
-/// Scan this user's block for another lastUser. If found, replace it.
-///
-/// TODO: This could be costly for many users in a very large block. Consider
-/// using a ValueLifetime-like approach of finding live blocks first before last
-/// users. The current approach has the advantage of not storing UserSet.
-static void findLastUser(SILInstruction *user, CopyPropagationState &pass) {
-  auto *I = user->getIterator();
-  auto *B = user->getParent()->begin;
-  while (I != B) {
-    --I;
-    if (pass.lastUsers.erase(&*I)) {
-      pass.lastUsers.insert(&*I);
-      return;
-    }
-  }
-}
-
 /// Update the current def's liveness at the given user.
-static void visitUser(SILInstruction *user, CopyPropagationState &pass) {
-  auto *bb = user->getParent();
+static void visitUse(Operand *use, CopyPropagationState &pass) {
+  auto *bb = use->getUser()->getParent();
   auto isLive = pass.liveBlocks.isLive(bb);
   switch (isLive) {
   case LiveOut:
     return;
   case LiveWithin:
-    findLastUser(user, pass);
+    pass.setLastUse(use);
   case Dead: {
     computeUseBlockLiveness(bb, pass);
     // If this block is in a loop, it will end up LiveOut.
@@ -384,9 +385,11 @@ static void visitUser(SILInstruction *user, CopyPropagationState &pass) {
 }
 
 /// Populate pass.liveBlocks and pass.lastUsers.
+/// Return true if successful.
 ///
-/// Assumptions: No users occur before 'def' in def's BB.
-static bool findUsers(SILValue def, CopyPropagationState &pass) {
+/// Assumptions: No users occur before 'def' in def's BB because this follows
+/// the SSA def-use chains and all terminators consume their operand.
+static bool computeLiveness(SILValue def, CopyPropagationState &pass) {
   pass.markBlockLive(def.getBB(), LiveWithin);
 
   SmallSetVector<SILValue, 8> worklist(def);
@@ -395,9 +398,10 @@ static bool findUsers(SILValue def, CopyPropagationState &pass) {
     for (Operand *use : value->getUses()) {
       auto *user = use->getUser();
 
-      if (isUnknownUse(use))
+      if (isUnknownUse(use)) {
+        DEBUG(llvm::dbgs() << "Unknown owned value user: " << *user);
         return false;
-
+      }
       if (isa<CopyValueInst>(user))
         worklist.insert(user);
 
@@ -408,17 +412,34 @@ static bool findUsers(SILValue def, CopyPropagationState &pass) {
             pass.worklist.insert(EBI);
         }
       }
-      if (isa<DestroyValueInst>(user))
+      if (isa<DestroyValueInst>(user)) {
+        pass.destroyBlocks.insert(user->getParentBB());
         continue;
-
-      visitUser(user);
+      }
+      visitUse(use);
     }
   }
   return true;
 }
 
 //===----------------------------------------------------------------------===//
-// Rewrite copies and destroys for a single copied definition.
+// Step 3. Find the destroy points of the current value.
+//===----------------------------------------------------------------------===//
+
+/// Populate pass.blockDestroys with the final destroy points once copies are
+/// eliminated.
+static Invalidation_t findOrInsertDestroys(CopyPropagationState &pass) {
+  for (auto *BB : pass.destroyBlocks) {
+    // Skip inner destroys.
+    if (pass.isBlockLive(BB) == LiveOut)
+      continue;
+    //!!!
+  }
+  return invalidation;
+}
+
+//===----------------------------------------------------------------------===//
+// Step 4. Rewrite copies and destroys for a single copied definition.
 //===----------------------------------------------------------------------===//
 
 static SILBuilder getBuilderForUser(SILInstruction *user,
@@ -498,6 +519,7 @@ static Invalidation rewriteCopies(SILValue def, CopyPropagationState &pass) {
 
   recursivelyDeleteTriviallyDeadInstructions(pass.instsToDelete.takeVector(),
                                              /*force=*/true);
+  return invalidation;
 }
 
 //===----------------------------------------------------------------------===//
@@ -537,6 +559,13 @@ class CopyPropagation : public SILModuleTransform {
 };
 } // end anonymous namespace
 
+/// Top-level pass driver.
+///
+/// Step 1. Find all copied defs.
+/// Then invoke the entry points for
+/// Step 2: computeLiveness
+/// Step 3: findDestroys
+/// Step 4: rewriteCopies
 void CopyPropagation::run() {
   DEBUG(llvm::dbgs() << "*** CopyPropagation: " << F.getName() << "\n");
 
@@ -555,7 +584,8 @@ void CopyPropagation::run() {
     }
   }
   for (auto &def : copiedDefs) {
-    if (findUsers(def, pass))
+    if (computeLiveness(def, pass))
+      invalidation |= findOrInsertDestroys(pass);
       invalidation |= rewriteCopies(def, pass);
   }
   invalidateAnalysis(invalidation);
