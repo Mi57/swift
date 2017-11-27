@@ -80,16 +80,21 @@
 #define DEBUG_TYPE "copy-propagation"
 #include "swift/SIL/Projection.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
+#include "swift/SILOptimizer/Utils/CFG.h"
 #include "swift/SILOptimizer/Utils/IndexTrie.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Statistic.h"
 
 using namespace swift;
+using llvm::DenseMap;
+using llvm::DenseSet;
 using llvm::SmallSetVector;
-using llvm::PointerIntPair;
 
-STATISIC(NumCopiesEliminated, "number of copy_value instructions removed");
-STATISIC(NumDestroysEliminated, "number of destroy_value instructions removed");
-STATISIC(NumCopiesGenerated, "number of copy_value instructions created");
-STATISIC(NumDestroysGenerated, "number of destroy_value instructions created");
+STATISTIC(NumCopiesEliminated, "number of copy_value instructions removed");
+STATISTIC(NumDestroysEliminated,
+          "number of destroy_value instructions removed");
+STATISTIC(NumCopiesGenerated, "number of copy_value instructions created");
+STATISTIC(NumDestroysGenerated, "number of destroy_value instructions created");
 
 // FIXME: factor with AddressLowering if it ends up remaining useful.
 namespace {
@@ -114,38 +119,38 @@ getUserRange(SILValue val) {
 
 // TODO: Figure out how to handle these, if possible.
 static bool isUnknownUse(Operand *use) {
-  switch (use->getUser->getKind()) {
+  switch (use->getUser()->getKind()) {
   default:
     return false;
   // mark_dependence requires recursion to find all uses. It should be
   // replaced by begin/end dependence..
-  case MarkDependenceInst:
+  case SILInstructionKind::MarkDependenceInst:
   // select_enum propagates a value. We need a general API for instructions like
   // this.
-  case SelectEnumInst:
+  case SILInstructionKind::SelectEnumInst:
   // OwnershipVerifier says that ref_tail_addr, ref_to_raw_pointer, etc. can
-  // accept an owned value, but don't consume it and appear to propagate it. This
-  // shouldn't normally happen without a borrow.
-  case RefTailAddrInst:
-  case RefToRawPointerInst:
-  case RefToUnmanagedInst:
-  case RefToUnownedInst:
+  // accept an owned value, but don't consume it and appear to propagate
+  // it. This shouldn't normally happen without a borrow.
+  case SILInstructionKind::RefTailAddrInst:
+  case SILInstructionKind::RefToRawPointerInst:
+  case SILInstructionKind::RefToUnmanagedInst:
+  case SILInstructionKind::RefToUnownedInst:
   // dynamic_method_br seems to capture self, presumably propagating lifetime.
-  case DynamicMethodBranchInst:
+  case SILInstructionKind::DynamicMethodBranchInst:
   // If a value is unsafely cast, we can't say anything about its lifetime.
-  case UncheckedBitwiseCastInst: // Is this right?
-  case UncheckedTrivialBitCastInst:
+  case SILInstructionKind::UncheckedBitwiseCastInst: // Is this right?
+  case SILInstructionKind::UncheckedTrivialBitCastInst:
   // Ownership verifier says project_box can take an owned value, but
   // that doesn't make sense to me.
-  case ProjectBoxInst:
-  case ProjectExistentialBoxInst:
+  case SILInstructionKind::ProjectBoxInst:
+  case SILInstructionKind::ProjectExistentialBoxInst:
   // Ownership verifier says open_existential_box can take an owned value, but
   // that doesn't make sense to me.
-  case OpenExistentialBoxInst:
+  case SILInstructionKind::OpenExistentialBoxInst:
   // Unmanaged operations.
-  case UnmanagedRetainValueInst:
-  case UnmanagedReleaseValueInst:
-  case UnmanagedAutoreleaseValueInst:
+  case SILInstructionKind::UnmanagedRetainValueInst:
+  case SILInstructionKind::UnmanagedReleaseValueInst:
+  case SILInstructionKind::UnmanagedAutoreleaseValueInst:
     return true;
   }
 }
@@ -153,9 +158,9 @@ static bool isUnknownUse(Operand *use) {
 /// Return true if the given owned operand is consumed by the given call.
 static bool isAppliedArgConsumed(ApplySite apply, Operand *oper) {
   ParameterConvention paramConv;
-  if (oper->get() == apply->getCallee()) {
-    assert(oper->getOperandNumber() == ApplySite::Callee &&
-           "function can't be passed to itself");
+  if (oper->get() == apply.getCallee()) {
+    assert(oper->getOperandNumber() == 0
+           && "function can't be passed to itself");
     paramConv = apply.getSubstCalleeType()->getCalleeConvention();
   } else {
     unsigned argIndex = apply.getCalleeArgIndex(*oper);
@@ -173,12 +178,12 @@ static bool isBuiltinArgConsumed(BuiltinInst *BI) {
   default:
     llvm_unreachable("Unexpected Builtin with owned value operand.");
   // Extend lifetime without consuming.
-  case ErrorInMain:
-  case UnexpectedError:
-  case WillThrow:
+  case BuiltinValueKind::ErrorInMain:
+  case BuiltinValueKind::UnexpectedError:
+  case BuiltinValueKind::WillThrow:
     return false;
   // UnsafeGuaranteed moves the value, which will later be destroyed.
-  case UnsafeGuaranteed:
+  case BuiltinValueKind::UnsafeGuaranteed:
     return true;
   }
 }
@@ -200,82 +205,81 @@ static bool isConsuming(Operand *use) {
     llvm_unreachable("Unexpected last use of a loadable owned value.");
 
   // Consume the value.
-  case AutoreleaseValueInst:
-  case CheckedCastValueBranchInst:
-  case DeallocBoxInst:
-  case DeallocExistentialBoxInst:
-  case DeallocRefInst:
-  case DeinitExistentialValueInst:
-  case DestroyValueInst:
-  case KeyPathInst:
-  case ReleaseValueInst:
-  case ReleaseValueAddrInst:
-  case StrongReleaseInst:
-  case StrongUnpinInst:
-  case UnownedReleaseInst:
-  case InitExistentialRefInst:
-  case InitExistentialValueInst:
-  case EndLifetimeInst:
-  case UnconditionalCheckedCastValueInst:
+  case SILInstructionKind::AutoreleaseValueInst:
+  case SILInstructionKind::DeallocBoxInst:
+  case SILInstructionKind::DeallocExistentialBoxInst:
+  case SILInstructionKind::DeallocRefInst:
+  case SILInstructionKind::DeinitExistentialValueInst:
+  case SILInstructionKind::DestroyValueInst:
+  case SILInstructionKind::KeyPathInst:
+  case SILInstructionKind::ReleaseValueInst:
+  case SILInstructionKind::ReleaseValueAddrInst:
+  case SILInstructionKind::StrongReleaseInst:
+  case SILInstructionKind::StrongUnpinInst:
+  case SILInstructionKind::UnownedReleaseInst:
+  case SILInstructionKind::InitExistentialRefInst:
+  case SILInstructionKind::InitExistentialValueInst:
+  case SILInstructionKind::EndLifetimeInst:
+  case SILInstructionKind::UnconditionalCheckedCastValueInst:
     return true;
 
   // Terminators must consume their values.
-  case BranchInst:
-  case CheckedCastBranchInst:
-  case CheckedCastValueBranchInst:
-  case CondBranchInst:
-  case ReturnInst:
-  case ThrowInst:
+  case SILInstructionKind::BranchInst:
+  case SILInstructionKind::CheckedCastBranchInst:
+  case SILInstructionKind::CheckedCastValueBranchInst:
+  case SILInstructionKind::CondBranchInst:
+  case SILInstructionKind::ReturnInst:
+  case SILInstructionKind::ThrowInst:
     return true;
 
-  case StoreInst:
+  case SILInstructionKind::StoreInst:
     assert(cast<StoreInst>(user)->getSrc() == use->get());
     return true;
 
-  case DeallocPartialRefInst:
+  case SILInstructionKind::DeallocPartialRefInst:
     return cast<DeallocPartialRefInst>(user)->getInstance() == use->get();
 
   // Move the value.
-  case TupleInst:
-  case StructInst:
-  case ObjectInst:
-  case EnumInst:
-  case OpenExistentialRefInst:
-  case UpcastInst:
-  case UncheckedRefCastInst:
-  case ConvertFunctionInst:
-  case RefToBridgeObjectInst:
-  case BridgeObjectToRefInst:
-  case UnconditionalCheckedCastInst:
-  case MarkUninitializedInst:
-  case UncheckedEnumDataInst:
-  case DestructureStructInst:
-  case DestructureTupleInst:
+  case SILInstructionKind::TupleInst:
+  case SILInstructionKind::StructInst:
+  case SILInstructionKind::ObjectInst:
+  case SILInstructionKind::EnumInst:
+  case SILInstructionKind::OpenExistentialRefInst:
+  case SILInstructionKind::UpcastInst:
+  case SILInstructionKind::UncheckedRefCastInst:
+  case SILInstructionKind::ConvertFunctionInst:
+  case SILInstructionKind::RefToBridgeObjectInst:
+  case SILInstructionKind::BridgeObjectToRefInst:
+  case SILInstructionKind::UnconditionalCheckedCastInst:
+  case SILInstructionKind::MarkUninitializedInst:
+  case SILInstructionKind::UncheckedEnumDataInst:
+  case SILInstructionKind::DestructureStructInst:
+  case SILInstructionKind::DestructureTupleInst:
     return true;
 
   // BeginBorrow should already be skipped.
-  // EndBorrow extends the lifetime.  
-  case EndBorrowInst:
+  // EndBorrow extends the lifetime.
+  case SILInstructionKind::EndBorrowInst:
     return false;
 
   // Extend the lifetime without borrowing, propagating, or destroying it.
-  case ClassMethodInst:
-  case DebugValueInst:
-  case ExistentialMetatypeInst:
-  case ValueMetatypeInst:
-  case BridgeObjectToWordInst:
-  case CopyBlockInst:
-  case FixLifetimeInst:
-  case SetDeallocatingInst:
-  case StoreWeakInst:
-  case StrongPinInst:
+  case SILInstructionKind::ClassMethodInst:
+  case SILInstructionKind::DebugValueInst:
+  case SILInstructionKind::ExistentialMetatypeInst:
+  case SILInstructionKind::ValueMetatypeInst:
+  case SILInstructionKind::BridgeObjectToWordInst:
+  case SILInstructionKind::CopyBlockInst:
+  case SILInstructionKind::FixLifetimeInst:
+  case SILInstructionKind::SetDeallocatingInst:
+  case SILInstructionKind::StoreWeakInst:
+  case SILInstructionKind::StrongPinInst:
     return false;
 
   // Dynamic dispatch without capturing self.
-  case ObjCMethodInst:
-  case ObjCSuperMethodInst:
-  case SuperMethodInst:
-  case WitnessMethodInst:
+  case SILInstructionKind::ObjCMethodInst:
+  case SILInstructionKind::ObjCSuperMethodInst:
+  case SILInstructionKind::SuperMethodInst:
+  case SILInstructionKind::WitnessMethodInst:
     return false;
     
   }
@@ -286,14 +290,14 @@ static bool isConsuming(Operand *use) {
 //===----------------------------------------------------------------------===//
 
 namespace {
-enum IsLive_t { LiveWithin, LiveOut, Dead };
+enum IsLiveKind { LiveWithin, LiveOut, Dead };
 
 /// This pass' shared state per copied def.
-CopyPropagationState {
+struct CopyPropagationState {
   SILFunction *F;
 
   // Per-function invalidation state.
-  Invalidation_t invalidation;
+  SILAnalysis::InvalidationKind invalidation;
 
   // Current copied def for which this state describes the liveness.
   SILValue currDef;
@@ -323,20 +327,20 @@ CopyPropagationState {
     blockDestroys.clear();
   }
 
-  BlockLive_t isBlockLive(SILBasicBlock *bb) const {
-    auto &liveBlockIter = pass.liveBlocks.find(bb);
-    if (liveBlockIter == pass.liveBlocks.end())
+  IsLiveKind isBlockLive(SILBasicBlock *bb) const {
+    auto liveBlockIter = liveBlocks.find(bb);
+    if (liveBlockIter == liveBlocks.end())
       return Dead;
     return liveBlockIter->second ? LiveOut : LiveWithin;
   }
 
-  void markBlockLive(SILBasicBlock *bb, IsLive_t isLive) {
+  void markBlockLive(SILBasicBlock *bb, IsLiveKind isLive) {
     assert(isLive != Dead && "erasing live blocks isn't implemented.");
     liveBlocks[bb] = isLive;
   }
 
   Optional<bool> isLastUserConsuming(SILInstruction *user) {
-    auto &lastUseIter = lastUsers.find(user);
+    auto lastUseIter = lastUsers.find(user);
     if (lastUseIter == lastUsers.end())
       return None;
     return lastUseIter->second;
@@ -348,7 +352,7 @@ CopyPropagationState {
 
   bool isDestroy(SILInstruction * inst) {
     auto destroyPos = blockDestroys.find(inst->getParent());
-    return destroyPos != pass.blockDestroys.end() && destroyPos->second != inst;
+    return destroyPos != blockDestroys.end() && destroyPos->second != inst;
   }
 };
 } // namespace
@@ -369,11 +373,11 @@ static void computeUseBlockLiveness(SILBasicBlock *userBB,
 
   pass.markBlockLive(userBB, LiveWithin);
 
-  SmallVector<SILBasicBlock *, 8> worklist(userBB);
+  SmallVector<SILBasicBlock *, 8> worklist({userBB});
   while (!worklist.empty()) {
     SILBasicBlock *bb = worklist.pop_back_val();
     for (auto *predBB : bb->getPredecessorBlocks()) {
-      switch (pass.isLive(predBB)) {
+      switch (pass.isBlockLive(predBB)) {
       case Dead:
         worklist.push_back(bb);
         LLVM_FALLTHROUGH;
@@ -390,17 +394,19 @@ static void computeUseBlockLiveness(SILBasicBlock *userBB,
 /// Update the current def's liveness at the given user.
 static void visitUse(Operand *use, CopyPropagationState &pass) {
   auto *bb = use->getUser()->getParent();
-  auto isLive = pass.liveBlocks.isLive(bb);
+  auto isLive = pass.isBlockLive(bb);
   switch (isLive) {
   case LiveOut:
     return;
   case LiveWithin:
     pass.setLastUse(use);
+    break;
   case Dead: {
     computeUseBlockLiveness(bb, pass);
     // If this block is in a loop, it will end up LiveOut.
-    if (pass.liveBlocks.isLive(bb) == LiveWithin)
-      pass.lastUsers.insert(user);
+    if (pass.isBlockLive(bb) == LiveWithin)
+      pass.setLastUse(use);
+    break;
   }
   }
 }
@@ -411,9 +417,16 @@ static void visitUse(Operand *use, CopyPropagationState &pass) {
 /// Assumptions: No users occur before 'def' in def's BB because this follows
 /// the SSA def-use chains and all terminators consume their operand.
 static bool computeLiveness(SILValue def, CopyPropagationState &pass) {
-  pass.markBlockLive(def.getBB(), LiveWithin);
+  SILBasicBlock *defBB;
+  if (auto *arg = dyn_cast<SILArgument>(def))
+    defBB = arg->getParent();
+  else
+    defBB = cast<SILInstruction>(def)->getParent();
 
-  SmallSetVector<SILValue, 8> worklist(def);
+  pass.markBlockLive(defBB, LiveWithin);
+
+  SmallSetVector<SILValue, 8> worklist;
+  worklist.insert(def);
   while (!worklist.empty()) {
     SILValue value = worklist.pop_back_val();
     for (Operand *use : value->getUses()) {
@@ -423,21 +436,21 @@ static bool computeLiveness(SILValue def, CopyPropagationState &pass) {
         DEBUG(llvm::dbgs() << "Unknown owned value user: " << *user);
         return false;
       }
-      if (isa<CopyValueInst>(user))
-        worklist.insert(user);
+      if (auto *copy = dyn_cast<CopyValueInst>(user))
+        worklist.insert(copy);
 
       // Skip begin_borrow. Consider its end_borrows the use points.
       if (auto *BBI = dyn_cast<BeginBorrowInst>(user)) {
-        for (Operand *use : BBI) {
+        for (Operand *use : BBI->getUses()) {
           if (auto *EBI = dyn_cast<EndBorrowInst>(use->getUser()))
-            pass.worklist.insert(EBI);
+            visitUse(use, pass);
         }
       }
       if (isa<DestroyValueInst>(user)) {
-        pass.destroyBlocks.insert(user->getParentBB());
+        pass.destroyBlocks.insert(user->getParent());
         continue;
       }
-      visitUse(use);
+      visitUse(use, pass);
     }
   }
   return true;
@@ -536,7 +549,8 @@ static void copyLiveUse(Operand *use, CopyPropagationState &pass) {
   ++NumCopiesGenerated;
 }
 
-// TODO: Avoid churn. Identify destroys that already complement a last use.
+// TODO: Avoid churn. Identify copies and destroys that already complement a
+// non-consuming use.
 static void rewriteCopies(SILValue def, CopyPropagationState &pass) {
   SmallSetVector<SILInstruction *, 8> instsToDelete;
   SmallSetVector<SILValue, 8> worklist(def);
