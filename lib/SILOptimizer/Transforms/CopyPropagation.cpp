@@ -78,10 +78,13 @@
 /// ===----------------------------------------------------------------------===
 
 #define DEBUG_TYPE "copy-propagation"
+#include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/Projection.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
+#include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/CFG.h"
 #include "swift/SILOptimizer/Utils/IndexTrie.h"
+#include "swift/SILOptimizer/Utils/Local.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Statistic.h"
 
@@ -95,20 +98,6 @@ STATISTIC(NumDestroysEliminated,
           "number of destroy_value instructions removed");
 STATISTIC(NumCopiesGenerated, "number of copy_value instructions created");
 STATISTIC(NumDestroysGenerated, "number of destroy_value instructions created");
-
-// FIXME: factor with AddressLowering if it ends up remaining useful.
-namespace {
-struct GetUser {
-  SILInstruction *operator()(Operand *oper) const { return oper->getUser(); }
-};
-} // namespace
-
-// TODO: LLVM needs a map_range.
-static iterator_range<llvm::mapped_iterator<ValueBase::use_iterator, GetUser>>
-getUserRange(SILValue val) {
-  return make_range(llvm::map_iterator(val->use_begin(), GetUser()),
-                    llvm::map_iterator(val->use_end(), GetUser()));
-}
 
 //===----------------------------------------------------------------------===//
 // Ownership Abstraction.
@@ -297,7 +286,7 @@ struct CopyPropagationState {
   SILFunction *F;
 
   // Per-function invalidation state.
-  SILAnalysis::InvalidationKind invalidation;
+  unsigned invalidation;
 
   // Current copied def for which this state describes the liveness.
   SILValue currDef;
@@ -314,11 +303,17 @@ struct CopyPropagationState {
   CopyPropagationState(SILFunction * F)
       : F(F), invalidation(SILAnalysis::InvalidationKind::Nothing) {}
 
+  void markInvalid(SILAnalysis::InvalidationKind kind) {
+    invalidation |= (unsigned)kind;
+  }
+
   void reset(SILValue def) {
     clear();
     currDef = def;
   }
 
+  // Do not clear invalidation. It accumulates for an entire function before
+  // the PassManager is notified.
   void clear() {
     currDef = SILValue();
     liveBlocks.clear();
@@ -416,17 +411,17 @@ static void visitUse(Operand *use, CopyPropagationState &pass) {
 ///
 /// Assumptions: No users occur before 'def' in def's BB because this follows
 /// the SSA def-use chains and all terminators consume their operand.
-static bool computeLiveness(SILValue def, CopyPropagationState &pass) {
+static bool computeLiveness(CopyPropagationState &pass) {
   SILBasicBlock *defBB;
-  if (auto *arg = dyn_cast<SILArgument>(def))
-    defBB = arg->getParent();
+  if (auto *defInst = pass.currDef->getDefiningInstruction())
+    defBB = defInst->getParent();
   else
-    defBB = cast<SILInstruction>(def)->getParent();
+    defBB = cast<SILArgument>(pass.currDef)->getParent();
 
   pass.markBlockLive(defBB, LiveWithin);
 
   SmallSetVector<SILValue, 8> worklist;
-  worklist.insert(def);
+  worklist.insert(pass.currDef);
   while (!worklist.empty()) {
     SILValue value = worklist.pop_back_val();
     for (Operand *use : value->getUses()) {
@@ -464,17 +459,18 @@ static void insertDestroyOnCFGEdge(SILBasicBlock *predBB, SILBasicBlock *succBB,
                                    CopyPropagationState &pass) {
   auto *destroyBB = splitIfCriticalEdge(predBB, succBB);
   if (destroyBB != succBB)
-    pass.invalidation |= SILAnalysis::InvalidationKind::Branches;
+    pass.markInvalid(SILAnalysis::InvalidationKind::Branches);
 
   SILBuilderWithScope B(destroyBB->begin());
   pass.blockDestroys[destroyBB] =
       B.createDestroyValue(succBB->begin()->getLoc(), pass.currDef);
-  pass.invalidation |= SILAnalysis::InvalidationKind::Instructions;
+  ++NumDestroysGenerated;
+  pass.markInvalid(SILAnalysis::InvalidationKind::Instructions);
 }
 
 static void findOrInsertDestroyInBlock(SILBasicBlock *bb,
                                        CopyPropagationState &pass) {
-  auto I = bb->getTerminator()->getIterator;
+  auto I = bb->getTerminator()->getIterator();
   while (true) {
     auto *inst = &*I;
     auto lastUserPos = pass.lastUsers.find(inst);
@@ -484,14 +480,16 @@ static void findOrInsertDestroyInBlock(SILBasicBlock *bb,
       --I;
       continue;
     }
-    bool isConsume = lastUserIt->second;
+    bool isConsume = lastUserPos->second;
     if (isConsume)
-      blockDestroys[bb] = inst;
+      pass.blockDestroys[bb] = inst;
     else {
       assert(inst != bb->getTerminator() && "Terminator must consume operand.");
-      SILBuilderWithScope B(&*next(I));
-      blockDestroys[bb] = B.createDestroyValue(inst->getLoc(), currDef);
-      pass.invalidation |= SILAnalysis::InvalidationKind::Instructions;
+      SILBuilderWithScope B(&*std::next(I));
+      pass.blockDestroys[bb] =
+          B.createDestroyValue(inst->getLoc(), pass.currDef);
+      ++NumDestroysGenerated;
+      pass.markInvalid(SILAnalysis::InvalidationKind::Instructions);
     }
     break;
   }
@@ -502,8 +500,8 @@ static void findOrInsertDestroyInBlock(SILBasicBlock *bb,
 static void findOrInsertDestroys(CopyPropagationState &pass) {
   for (auto *destroyBB : pass.destroyBlocks) {
     // Backward CFG traversal.
-    SmallSetVector<SILBasicBlock *> worklist;
-    auto visitBB = [&](SILBasicBlock *bb, *succBB) {
+    SmallSetVector<SILBasicBlock *, 8> worklist;
+    auto visitBB = [&](SILBasicBlock *bb, SILBasicBlock *succBB) {
       switch (pass.isBlockLive(bb)) {
       case LiveOut:
         // If succBB is null, then the destroy in destroyBB must be an inner
@@ -539,58 +537,59 @@ static void copyLiveUse(Operand *use, CopyPropagationState &pass) {
     return;
 
   SILInstruction *user = use->getUser();
-  assert(!isa<TerminatorInst>(user) && "Terminator must consume its operand.");
+  assert(!isa<TermInst>(user) && "Terminator must consume its operand.");
 
   SILBuilder B(std::next(user->getIterator()));
-  B.setDebugScope(user);
+  B.setCurrentDebugScope(user->getDebugScope());
 
   auto *copy = B.createCopyValue(user->getLoc(), use->get());
   use->set(copy);
   ++NumCopiesGenerated;
+  pass.markInvalid(SILAnalysis::InvalidationKind::Instructions);
 }
 
 // TODO: Avoid churn. Identify copies and destroys that already complement a
 // non-consuming use.
-static void rewriteCopies(SILValue def, CopyPropagationState &pass) {
+static void rewriteCopies(CopyPropagationState &pass) {
   SmallSetVector<SILInstruction *, 8> instsToDelete;
-  SmallSetVector<SILValue, 8> worklist(def);
+  SmallSetVector<SILValue, 8> worklist;
 
+  auto visitUse = [&](Operand *use) {
+    auto *user = use->getUser();
+    if (auto *copy = dyn_cast<CopyValueInst>(user)) {
+      worklist.insert(copy);
+      return;
+    }
+    if (auto *destroy = dyn_cast<DestroyValueInst>(user)) {
+      if (!pass.isDestroy(destroy)) {
+        instsToDelete.insert(destroy);
+        ++NumDestroysEliminated;
+      }
+      return;
+    }
+    if (!pass.isDestroy(user))
+      copyLiveUse(use, pass);
+  };
+
+  worklist.insert(pass.currDef);
   while (!worklist.empty()) {
     SILValue value = worklist.pop_back_val();
+    // Recurse through copies then remove them.
     if (auto *copy = dyn_cast<CopyValueInst>(value)) {
-      worklist.append(getUserRange(value));
+      for (auto *use : copy->getUses())
+        visitUse(use);
       copy->replaceAllUsesWith(copy->getOperand());
       instsToDelete.insert(copy);
       ++NumCopiesEliminated;
       continue;
     }
-    for (Operand *use : value->getUses()) {
-      auto *user = use->getUser();
-      if (isa<CopyValueInst>(user)) {
-        worklist.insert(user);
-        continue;
-      }
-      if (isa<DestroyValueInst>(user)) {
-        if (!pass.isDestroy(user)) {
-          instsToDelete.insert(user);
-          ++NumDestroysEliminated;
-        }
-        continue;
-      }
-      if (!pass.isDestoy(user))
-        copyLiveUse(use, pass);
-    }
+    for (Operand *use : value->getUses())
+      visitUse(use);
   }
-#ifndef NDEBUG
-  for (auto *lastUser : lastUsers)
-    llvm::dbgs() << "Unreachable last user: " << *lastUser;
-#endif
-  assert(pass.lastUsers.empty() && "Unreachable last user");
-
   if (!instsToDelete.empty()) {
-    recursivelyDeleteTriviallyDeadInstructions(pass.instsToDelete.takeVector(),
+    recursivelyDeleteTriviallyDeadInstructions(instsToDelete.takeVector(),
                                                /*force=*/true);
-    pass.invalidation |= SILAnalysis::InvalidationKind::Instructions;
+    pass.markInvalid(SILAnalysis::InvalidationKind::Instructions);
   }
 }
 
@@ -614,18 +613,7 @@ static SILValue stripCopies(SILValue v) {
 }
 
 namespace {
-class CopyPropagation : public SILModuleTransform {
-  /// A trie of integer indices that allows identificaiton of a projection
-  /// path. There only needs to be one of these for all passes in a module, but
-  /// each pass currently defines its own.
-  IndexTrieNode *subPathTrie;
-
-  CopyPropagation(): subPathTrie(nullptr) {}
-
-  ~CopyPropagation() {
-    delete subPathTrie;
-  }
-
+class CopyPropagation : public SILFunctionTransform {
   /// The entry point to this function transformation.
   void run() override;
 };
@@ -639,13 +627,14 @@ class CopyPropagation : public SILModuleTransform {
 /// Step 3: findDestroys
 /// Step 4: rewriteCopies
 void CopyPropagation::run() {
-  DEBUG(llvm::dbgs() << "*** CopyPropagation: " << F.getName() << "\n");
+  DEBUG(llvm::dbgs() << "*** CopyPropagation: " << getFunction()->getName()
+                     << "\n");
 
   assert(getFunction()->hasQualifiedOwnership()
          && "SSA copy propagation is only valid for ownership-SSA");
   
   CopyPropagationState pass(getFunction());
-  DenseMap<SILValue> copiedDefs;
+  SmallSetVector<SILValue, 16> copiedDefs;
   for (auto &BB : *pass.F) {
     for (auto &I : BB) {
       if (auto *copy = dyn_cast<CopyValueInst>(&I))
@@ -654,12 +643,12 @@ void CopyPropagation::run() {
   }
   for (auto &def : copiedDefs) {
     pass.reset(def);
-    if (computeLiveness(def, pass)) {
+    if (computeLiveness(pass)) {
       findOrInsertDestroys(pass);
-      rewriteCopies(def, pass);
+      rewriteCopies(pass);
     }
   }
-  invalidateAnalysis(pass.invalidation);
+  invalidateAnalysis(SILAnalysis::InvalidationKind(pass.invalidation));
 }
 
 SILTransform *swift::createCopyPropagation() { return new CopyPropagation(); }
