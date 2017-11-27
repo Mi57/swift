@@ -558,9 +558,10 @@ public:
     assert((Qualifier != LoadOwnershipQualifier::Unqualified) ||
            getFunction().hasUnqualifiedOwnership() &&
                "Unqualified inst in qualified function");
-    assert((Qualifier == LoadOwnershipQualifier::Unqualified) ||
-           getFunction().hasQualifiedOwnership() &&
-               "Qualified inst in unqualified function");
+    assert((Qualifier == LoadOwnershipQualifier::Unqualified)
+           || getFunction().hasQualifiedOwnership()
+           || LV->getType.isLoadable(getModule())
+                  && "Qualified inst in unqualified function");
     assert(!SILModuleConventions(getModule()).useLoweredAddresses()
            || LV->getType().isLoadable(getModule()));
     return insert(new (getModule())
@@ -628,9 +629,10 @@ public:
     assert((Qualifier != StoreOwnershipQualifier::Unqualified) ||
            getFunction().hasUnqualifiedOwnership() &&
                "Unqualified inst in qualified function");
-    assert((Qualifier == StoreOwnershipQualifier::Unqualified) ||
-           getFunction().hasQualifiedOwnership() &&
-               "Qualified inst in unqualified function");
+    assert((Qualifier == StoreOwnershipQualifier::Unqualified)
+           || getFunction().hasQualifiedOwnership()
+           || Src->getType.isLoadable(getModule())
+                  && "Qualified inst in unqualified function");
     return insert(new (getModule()) StoreInst(getSILDebugLocation(Loc), Src,
                                                 DestAddr, Qualifier));
   }

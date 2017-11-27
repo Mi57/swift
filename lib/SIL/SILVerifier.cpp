@@ -1311,7 +1311,8 @@ public:
       break;
     case LoadOwnershipQualifier::Copy:
     case LoadOwnershipQualifier::Take:
-      require(F.hasQualifiedOwnership(),
+      require(F.hasQualifiedOwnership()
+                  || !LI->getType().isLoadable(LI->getModule()),
               "Load with qualified ownership in an unqualified function");
       // TODO: Could probably make this a bit stricter.
       require(!LI->getType().isTrivial(LI->getModule()),
@@ -1329,7 +1330,8 @@ public:
 
   void checkLoadBorrowInst(LoadBorrowInst *LBI) {
     require(
-        F.hasQualifiedOwnership(),
+        F.hasQualifiedOwnership()
+            || !LBI->getType().isLoadable(LBI->getModule()),
         "Inst with qualified ownership in a function that is not qualified");
     require(LBI->getType().isObject(), "Result of load must be an object");
     require(!fnConv.useLoweredAddresses()
@@ -1343,7 +1345,8 @@ public:
 
   void checkEndBorrowInst(EndBorrowInst *EBI) {
     require(
-        F.hasQualifiedOwnership(),
+        F.hasQualifiedOwnership()
+            || !EBI->getBorrowedValue()->getType().isLoadable(EBI->getModule()),
         "Inst with qualified ownership in a function that is not qualified");
     // We allow for end_borrow to express relationships in between addresses and
     // values, but we require that the types are the same ignoring value
@@ -1429,7 +1432,8 @@ public:
     case StoreOwnershipQualifier::Init:
     case StoreOwnershipQualifier::Assign:
       require(
-          F.hasQualifiedOwnership(),
+          F.hasQualifiedOwnership()
+              || !SI->getSrc()->getType().isLoadable(SI->getModule()),
           "Inst with qualified ownership in a function that is not qualified");
       // TODO: Could probably make this a bit stricter.
       require(!SI->getSrc()->getType().isTrivial(SI->getModule()),
@@ -4141,7 +4145,7 @@ public:
       }
 
       // If we do not have qualified ownership, do not check ownership.
-      if (!F.hasQualifiedOwnership()) {
+      if (!F.hasQualifiedOwnership() && mappedTy->isLoadable(M)) {
         return;
       }
 
@@ -4422,8 +4426,9 @@ public:
 
       // In ownership qualified SIL, ban critical edges from CondBranchInst that
       // have non-trivial arguments.
-      if (!F->hasQualifiedOwnership())
-        continue;
+      auto isQualified = [&M, F](SILValue V) {
+        return F->hasQualifiedOwnership() || !V->getType()->isLoadable(M);
+      };
 
       auto *CBI = dyn_cast<CondBranchInst>(TI);
       if (!CBI)
@@ -4432,9 +4437,10 @@ public:
       if (isCriticalEdgePred(CBI, CondBranchInst::TrueIdx)) {
         require(
             llvm::all_of(CBI->getTrueArgs(),
-                         [](SILValue V) -> bool {
-                           return V.getOwnershipKind() ==
-                                  ValueOwnershipKind::Trivial;
+                         [&M](SILValue V) -> bool {
+                           return !isQualified(V)
+                                  || V.getOwnershipKind()
+                                         == ValueOwnershipKind::Trivial;
                          }),
             "cond_br with critical edges must not have a non-trivial value");
       }
@@ -4442,8 +4448,9 @@ public:
         require(
             llvm::all_of(CBI->getFalseArgs(),
                          [](SILValue V) -> bool {
-                           return V.getOwnershipKind() ==
-                                  ValueOwnershipKind::Trivial;
+                           return !isQualified(B)
+                                  || V.getOwnershipKind()
+                                         == ValueOwnershipKind::Trivial;
                          }),
             "cond_br with critical edges must not have a non-trivial value");
       }
