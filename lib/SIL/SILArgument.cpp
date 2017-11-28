@@ -110,6 +110,8 @@ static Operand &getIncomingOperandForPred(SILBasicBlock *BB,
   case TermKind::SwitchEnumAddrInst:
   case TermKind::CheckedCastAddrBranchInst:
   case TermKind::DynamicMethodBranchInst:
+  case TermKind::UnwindInst:
+  case TermKind::YieldInst:
     llvm_unreachable("No block arguments.");
   case TermKind::BranchInst:
     return cast<BranchInst>(TI)->getAllOperands()[Index];

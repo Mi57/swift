@@ -127,6 +127,11 @@ public:
     return F.getModule().getOptions().EnableSILOwnership;
   }
 
+  bool isQualified(SILValue V) const {
+    // Opaque values always have qualified ownership.
+    return F.hasQualifiedOwnership() || V->getType().isOpaque(F.getModule());
+  }
+
   void _require(bool condition, const Twine &complaint,
                 const std::function<void()> &extraContext = nullptr) {
     if (condition) return;
@@ -501,7 +506,7 @@ public:
     assert(F && "Expected value base with parent function");
     // If we do not have qualified ownership, then do not verify value base
     // ownership.
-    if (!F->hasQualifiedOwnership())
+    if (!isQualified(V))
       return;
     SILValue(V).verifyOwnership(F->getModule(), &DEBlocks);
   }
@@ -1311,8 +1316,7 @@ public:
       break;
     case LoadOwnershipQualifier::Copy:
     case LoadOwnershipQualifier::Take:
-      require(F.hasQualifiedOwnership()
-                  || !LI->getType().isLoadable(LI->getModule()),
+      require(isQualified(LI),
               "Load with qualified ownership in an unqualified function");
       // TODO: Could probably make this a bit stricter.
       require(!LI->getType().isTrivial(LI->getModule()),
@@ -1426,14 +1430,13 @@ public:
     case StoreOwnershipQualifier::Unqualified:
       // We should not see loads with unqualified ownership when SILOwnership is
       // enabled.
-      require(F.hasUnqualifiedOwnership(),
+      require(!isQualified(SI->getSrc()),
               "Qualified store in function with unqualified ownership?!");
       break;
     case StoreOwnershipQualifier::Init:
     case StoreOwnershipQualifier::Assign:
       require(
-          F.hasQualifiedOwnership()
-              || !SI->getSrc()->getType().isLoadable(SI->getModule()),
+          isQualified(SI->getSrc()),
           "Inst with qualified ownership in a function that is not qualified");
       // TODO: Could probably make this a bit stricter.
       require(!SI->getSrc()->getType().isTrivial(SI->getModule()),
@@ -1611,7 +1614,7 @@ public:
   void checkCopyValueInst(CopyValueInst *I) {
     require(I->getOperand()->getType().isObject(),
             "Source value should be an object value");
-    require(!fnConv.useLoweredAddresses() || F.hasQualifiedOwnership(),
+    require(isQualified(I),
             "copy_value is only valid in functions with qualified "
             "ownership");
   }
@@ -1620,7 +1623,7 @@ public:
     auto unownedType = requireObjectType(UnownedStorageType, I->getOperand(),
                                          "Operand of unowned_retain");
     require(unownedType->isLoadable(ResilienceExpansion::Maximal),
-            "unowned_retain requires unowned type to be loadable");
+            "unowned_value requires unowned type to be loadable");
     require(F.hasQualifiedOwnership(),
             "copy_unowned_value is only valid in functions with qualified "
             "ownership");
@@ -1629,7 +1632,7 @@ public:
   void checkDestroyValueInst(DestroyValueInst *I) {
     require(I->getOperand()->getType().isObject(),
             "Source value should be an object value");
-    require(!fnConv.useLoweredAddresses() || F.hasQualifiedOwnership(),
+    require(isQualified(I->getOperand()),
             "destroy_value is only valid in functions with qualified "
             "ownership");
   }
@@ -3004,7 +3007,8 @@ public:
                 CBI->getCastType(),
             "success dest block argument of checked_cast_value_br must match "
             "type of cast");
-    require(F.hasQualifiedOwnership() || CBI->getFailureBB()->args_empty(),
+    require(CBI->getFailureBB()->args_empty()
+                || isQualified(CBI->getFailureBB()->args_begin()[0]),
             "failure dest of checked_cast_value_br in unqualified ownership "
             "sil must take no arguments");
   }
@@ -4145,7 +4149,7 @@ public:
       }
 
       // If we do not have qualified ownership, do not check ownership.
-      if (!F.hasQualifiedOwnership() && mappedTy->isLoadable(M)) {
+      if (!isQualified(bbarg)) {
         return;
       }
 
@@ -4424,20 +4428,16 @@ public:
         continue;
       }
 
-      // In ownership qualified SIL, ban critical edges from CondBranchInst that
-      // have non-trivial arguments.
-      auto isQualified = [&M, F](SILValue V) {
-        return F->hasQualifiedOwnership() || !V->getType()->isLoadable(M);
-      };
-
       auto *CBI = dyn_cast<CondBranchInst>(TI);
       if (!CBI)
         continue;
 
+      // In ownership qualified SIL, ban critical edges from CondBranchInst that
+      // have non-trivial arguments.
       if (isCriticalEdgePred(CBI, CondBranchInst::TrueIdx)) {
         require(
             llvm::all_of(CBI->getTrueArgs(),
-                         [&M](SILValue V) -> bool {
+                         [this](SILValue V) -> bool {
                            return !isQualified(V)
                                   || V.getOwnershipKind()
                                          == ValueOwnershipKind::Trivial;
@@ -4447,8 +4447,8 @@ public:
       if (isCriticalEdgePred(CBI, CondBranchInst::FalseIdx)) {
         require(
             llvm::all_of(CBI->getFalseArgs(),
-                         [](SILValue V) -> bool {
-                           return !isQualified(B)
+                         [this](SILValue V) -> bool {
+                           return !isQualified(V)
                                   || V.getOwnershipKind()
                                          == ValueOwnershipKind::Trivial;
                          }),

@@ -233,7 +233,7 @@ bool OwnershipModelEliminatorVisitor::visitCheckedCastBranchInst(
   // 2. We delete the argument from the false block.
   SILBasicBlock *FailureBlock = CBI->getFailureBB();
   if (FailureBlock->getNumArguments() == 0
-      || !FailureBlock->getArgument(0)->getType()->isLoadable(CBI->getModule()))
+      || FailureBlock->getArgument(0)->getType().isOpaque(CBI->getModule()))
     return false;
   FailureBlock->getArgument(0)->replaceAllUsesWith(CBI->getOperand());
   FailureBlock->eraseArgument(0);

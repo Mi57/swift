@@ -125,6 +125,11 @@ public:
     return getModule().getTypeLowering(T);
   }
 
+  bool isQualified(SILValue V) const {
+    // Opaque values always have qualified ownership.
+    return F->hasQualifiedOwnership() || V->getType().isOpaque(Mod);
+  }
+
   void setOpenedArchetypesTracker(SILOpenedArchetypesTracker *Tracker) {
     this->OpenedArchetypesTracker = Tracker;
     this->OpenedArchetypes.setOpenedArchetypesTracker(OpenedArchetypesTracker);
@@ -540,7 +545,7 @@ public:
   LoadInst *createTrivialLoadOr(SILLocation Loc, SILValue LV,
                                 LoadOwnershipQualifier Qualifier,
                                 bool SupportUnqualifiedSIL = false) {
-    if (SupportUnqualifiedSIL && getFunction().hasUnqualifiedOwnership()) {
+    if (SupportUnqualifiedSIL && !isQualified(LV)) {
       assert(
           Qualifier != LoadOwnershipQualifier::Copy &&
           "In unqualified SIL, a copy must be done separately form the load");
@@ -555,13 +560,11 @@ public:
 
   LoadInst *createLoad(SILLocation Loc, SILValue LV,
                        LoadOwnershipQualifier Qualifier) {
-    assert((Qualifier != LoadOwnershipQualifier::Unqualified) ||
-           getFunction().hasUnqualifiedOwnership() &&
-               "Unqualified inst in qualified function");
-    assert((Qualifier == LoadOwnershipQualifier::Unqualified)
-           || getFunction().hasQualifiedOwnership()
-           || LV->getType.isLoadable(getModule())
-                  && "Qualified inst in unqualified function");
+    assert(
+        (Qualifier != LoadOwnershipQualifier::Unqualified || !isQualified(LV))
+        && "Unqualified inst in qualified function");
+    assert((Qualifier == LoadOwnershipQualifier::Unqualified || isQualified(LV))
+           && "Qualified inst in unqualified function");
     assert(!SILModuleConventions(getModule()).useLoweredAddresses()
            || LV->getType().isLoadable(getModule()));
     return insert(new (getModule())
@@ -611,7 +614,7 @@ public:
                                   SILValue DestAddr,
                                   StoreOwnershipQualifier Qualifier,
                                   bool SupportUnqualifiedSIL = false) {
-    if (SupportUnqualifiedSIL && getFunction().hasUnqualifiedOwnership()) {
+    if (SupportUnqualifiedSIL && !isQualified(Src)) {
       assert(
           Qualifier != StoreOwnershipQualifier::Assign &&
           "In unqualified SIL, assigns must be represented via 2 instructions");
@@ -626,13 +629,12 @@ public:
 
   StoreInst *createStore(SILLocation Loc, SILValue Src, SILValue DestAddr,
                          StoreOwnershipQualifier Qualifier) {
-    assert((Qualifier != StoreOwnershipQualifier::Unqualified) ||
-           getFunction().hasUnqualifiedOwnership() &&
-               "Unqualified inst in qualified function");
-    assert((Qualifier == StoreOwnershipQualifier::Unqualified)
-           || getFunction().hasQualifiedOwnership()
-           || Src->getType.isLoadable(getModule())
-                  && "Qualified inst in unqualified function");
+    assert(
+        (Qualifier != StoreOwnershipQualifier::Unqualified || !isQualified(Src))
+        && "Unqualified inst in qualified function");
+    assert(
+        (Qualifier == StoreOwnershipQualifier::Unqualified || isQualified(Src))
+        && "Qualified inst in unqualified function");
     return insert(new (getModule()) StoreInst(getSILDebugLocation(Loc), Src,
                                                 DestAddr, Qualifier));
   }
@@ -1922,7 +1924,7 @@ public:
     assert(!Value->getType().isAddress());
     // If ownership is not enabled in the function, just return our original
     // value.
-    if (getFunction().hasUnqualifiedOwnership())
+    if (!isQualified(Value))
       return Value;
 
     // If we have a trivial value, just return the value. Trivial values have
@@ -1946,7 +1948,7 @@ public:
                               SILValue Original) {
     assert(!Borrowed->getType().isAddress());
     // If ownership is not enabled, just return.
-    if (getFunction().hasUnqualifiedOwnership())
+    if (!isQualified(Borrowed))
       return;
 
     // If we have a trivial value, just return. Trivial values have lifetimes

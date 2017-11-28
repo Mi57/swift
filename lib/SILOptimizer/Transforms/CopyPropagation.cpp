@@ -630,9 +630,6 @@ void CopyPropagation::run() {
   DEBUG(llvm::dbgs() << "*** CopyPropagation: " << getFunction()->getName()
                      << "\n");
 
-  assert(getFunction()->hasQualifiedOwnership()
-         && "SSA copy propagation is only valid for ownership-SSA");
-  
   CopyPropagationState pass(getFunction());
   SmallSetVector<SILValue, 16> copiedDefs;
   for (auto &BB : *pass.F) {
