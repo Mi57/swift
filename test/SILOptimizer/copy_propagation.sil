@@ -24,26 +24,43 @@ bb0(%0 : $T):
   return %3 : $T
 }
 
+// CHECK: sil @multiResult : $@convention(thin) <T> (@in T) -> (@out T, @out T) {
+// CHECK: bb0(%0 : $T):
+// CHECK:   [[COPY:%.*]] = copy_value %0 : $T
+// CHECK:   [[R:%.*]] = tuple ([[COPY]] : $T, %0 : $T)
+// CHECK:   return [[R]] : $(T, T)
+// CHECK: } // end sil function 'multiResult'
 sil @multiResult : $@convention(thin) <T> (@in T) -> (@out T, @out T) {
-// %0                                             // users: %3, %2, %1
 bb0(%0 : $T):
-  debug_value %0 : $T, let, name "t", argno 1     // id: %1
-  %2 = copy_value %0 : $T                         // user: %3
-  %3 = tuple (%2 : $T, %0 : $T)                   // user: %4
-  return %3 : $(T, T)                             // id: %4
+  debug_value %0 : $T, let, name "t", argno 1
+  %2 = copy_value %0 : $T
+  %3 = tuple (%2 : $T, %0 : $T)
+  return %3 : $(T, T)
 }
 
+// CHECK-LABEL: sil @callMultiResult : $@convention(thin) <T> (@in T) -> @out T {
+// CHECK: bb0(%0 : $T):
+// CHECK:   [[F:%.*]] = function_ref @multiResult : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0)
+// CHECK:   [[CALL:%.*]] = apply [[F]]<T>(%0) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0)
+// CHECK:   [[E0:%.*]] = tuple_extract [[CALL]] : $(T, T), 0
+// CHECK:   [[E0COPY:%.*]] = copy_value [[E0]] : $T
+// CHECK:   [[E1:%.*]] = tuple_extract [[CALL]] : $(T, T), 1
+// CHECK:   [[E1COPY:%.*]] = copy_value [[E1]] : $T
+// CHECK:   destroy_value [[CALL]] : $(T, T)
+// CHECK:   destroy_value [[E0COPY]] : $T
+// CHECK:   return [[E1COPY]] : $T
+// CHECK: } // end sil function 'callMultiResult'
 sil @callMultiResult : $@convention(thin) <T> (@in T) -> @out T {
 bb0(%0 : $T):
-  %2 = copy_value %0 : $T                         // user: %4
-  %3 = function_ref @multiResult : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0) // user: %4
-  %4 = apply %3<T>(%2) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0) // users: %5, %7, %9
-  %5 = tuple_extract %4 : $(T, T), 0              // user: %6
-  %6 = copy_value %5 : $T                         // user: %10
-  %7 = tuple_extract %4 : $(T, T), 1              // user: %8
-  %8 = copy_value %7 : $T                         // user: %12
-  destroy_value %4 : $(T, T)                      // id: %9
-  destroy_value %6 : $T                           // id: %10
-  destroy_value %0 : $T                           // id: %11
-  return %8 : $T                                  // id: %12
+  %2 = copy_value %0 : $T
+  %3 = function_ref @multiResult : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0)
+  %4 = apply %3<T>(%2) : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0)
+  %5 = tuple_extract %4 : $(T, T), 0
+  %6 = copy_value %5 : $T
+  %7 = tuple_extract %4 : $(T, T), 1
+  %8 = copy_value %7 : $T
+  destroy_value %4 : $(T, T)
+  destroy_value %6 : $T
+  destroy_value %0 : $T
+  return %8 : $T
 }

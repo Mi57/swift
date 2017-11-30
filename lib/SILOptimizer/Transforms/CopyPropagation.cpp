@@ -79,6 +79,13 @@
 ///
 /// TODO: This will only be an effective optimization for aggregates once SILGen
 /// is no longer generating spurious borrows.
+///
+/// TODO: If we can't remove copies of borrows, then adapt this to handle +0
+/// values. Essentially: don't mark anything a final destroy and avoid inserting
+/// the new destroys.
+///
+/// TODO: Delete instructions with no side effects that produce values which are
+/// immediately destroyed after copy propagation.
 /// ===----------------------------------------------------------------------===
 
 #define DEBUG_TYPE "copy-propagation"
@@ -102,6 +109,7 @@ STATISTIC(NumDestroysEliminated,
           "number of destroy_value instructions removed");
 STATISTIC(NumCopiesGenerated, "number of copy_value instructions created");
 STATISTIC(NumDestroysGenerated, "number of destroy_value instructions created");
+STATISTIC(NumUnknownUsers, "number of functions with unknown users");
 
 //===----------------------------------------------------------------------===//
 // Ownership Abstraction.
@@ -301,7 +309,10 @@ class LivenessInfo {
   BlockSetVec destroyBlocks;
 
 public:
-  bool empty() { return liveBlocks.empty(); }
+  bool empty() {
+    assert(!liveBlocks.empty() || users.empty());
+    return liveBlocks.empty();
+  }
 
   void clear() {
     liveBlocks.clear();
@@ -349,7 +360,7 @@ class DestroyInfo {
   DenseMap<SILBasicBlock *, SILInstruction *> blockDestroys;
 
 public:
-  bool empty() const {}
+  bool empty() const { return blockDestroys.empty(); }
 
   void clear() { blockDestroys.clear(); }
 
@@ -358,10 +369,10 @@ public:
   // Return true if this instruction is marked as a final destroy point of the
   // current def's live range. A destroy can only be claimed once because
   // instructions like `tuple` can consume the same value via multiple operands.
-  bool claimDestroy(SILInstruction *inst) const {
+  bool claimDestroy(SILInstruction *inst) {
     auto destroyPos = blockDestroys.find(inst->getParent());
     if (destroyPos != blockDestroys.end() && destroyPos->second == inst) {
-      blockDestroys.erase(inst->getParent());
+      blockDestroys.erase(destroyPos);
       return true;
     }
     return false;
@@ -493,6 +504,7 @@ static bool computeLiveness(CopyPropagationState &pass) {
 
       if (isUnknownUse(use)) {
         DEBUG(llvm::dbgs() << "Unknown owned value user: " << *user);
+        ++NumUnknownUsers;
         return false;
       }
       if (auto *copy = dyn_cast<CopyValueInst>(user)) {
@@ -536,29 +548,46 @@ static void insertDestroyOnCFGEdge(SILBasicBlock *predBB, SILBasicBlock *succBB,
   pass.markInvalid(SILAnalysis::InvalidationKind::Instructions);
 }
 
+static void insertDestroyAtInst(SILBasicBlock::iterator pos,
+                                CopyPropagationState &pass) {
+  SILBuilderWithScope B(pos);
+  pass.destroys.recordFinalDestroy(
+      B.createDestroyValue((*pos).getLoc(), pass.currDef));
+  ++NumDestroysGenerated;
+  pass.markInvalid(SILAnalysis::InvalidationKind::Instructions);
+}
+
 static void findOrInsertDestroyInBlock(SILBasicBlock *bb,
                                        CopyPropagationState &pass) {
+  auto *defInst = pass.currDef->getDefiningInstruction();
   auto I = bb->getTerminator()->getIterator();
   while (true) {
     auto *inst = &*I;
     Optional<bool> isConsumingResult = pass.liveness.isConsumingUser(inst);
-    if (!isConsumingResult.hasValue()) {
-      // This is not a potential last user. Keep scanning.
-      assert(I != bb->begin());
-      --I;
-      continue;
-    }
-    if (isConsumingResult.getValue())
-      pass.destroys.recordFinalDestroy(inst);
-    else {
+    if (isConsumingResult.hasValue()) {
+      if (isConsumingResult.getValue()) {
+        // This consuming use becomes a final destroy.
+        pass.destroys.recordFinalDestroy(inst);
+        break;
+      }
+      // Insert a destroy after this non-consuming use.
       assert(inst != bb->getTerminator() && "Terminator must consume operand.");
-      SILBuilderWithScope B(&*std::next(I));
-      pass.destroys.recordFinalDestroy(
-          B.createDestroyValue(inst->getLoc(), pass.currDef));
-      ++NumDestroysGenerated;
-      pass.markInvalid(SILAnalysis::InvalidationKind::Instructions);
+      insertDestroyAtInst(std::next(I), pass);
+      break;
     }
-    break;
+    // This is not a potential last user. Keep scanning.
+    // If the original destroy is reached, this is a dead live range. Insert a
+    // destroy immediately after the def.
+    if (I == bb->begin()) {
+      assert(cast<SILArgument>(pass.currDef)->getParent() == bb);
+      insertDestroyAtInst(I, pass);
+      break;
+    }
+    --I;
+    if (&*I == defInst) {
+      insertDestroyAtInst(std::next(I), pass);
+      break;
+    }
   }
 }
 
@@ -708,6 +737,9 @@ void CopyPropagation::run() {
     }
   }
   for (auto &def : copiedDefs) {
+    if (def.getOwnershipKind() != ValueOwnershipKind::Owned)
+      continue;
+
     pass.resetDef(def);
     if (computeLiveness(pass)) {
       findOrInsertDestroys(pass);
