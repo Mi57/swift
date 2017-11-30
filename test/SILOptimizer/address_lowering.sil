@@ -1,7 +1,6 @@
 // RUN: %target-sil-opt -address-lowering -enable-sil-opaque-values -emit-sorted-sil -assume-parsing-unqualified-ownership-sil -optimize-opaque-address-lowering %s | %FileCheck %s
 
 import Builtin
-//!!!import Swift
 
 sil_stage canonical
 // CHECK: sil_stage lowered
@@ -34,7 +33,7 @@ bb0(%0 : $T):
 // CHECK: bb0(%0 : $Builtin.Int64):
 // CHECK:  %[[FN:.*]] = function_ref @f020_multiResult : $@convention(thin) <τ_0_0> (@in τ_0_0) -> (@out τ_0_0, @out τ_0_0, @out τ_0_0)
 // CHECK:  %[[IN:.*]] = alloc_stack $Builtin.Int64
-// CHECK:  store %0 to %[[IN]] : $*Builtin.Int64
+// CHECK:  store %0 to [init] %[[IN]] : $*Builtin.Int64
 // CHECK:  %[[OUT1:.*]] = alloc_stack $Builtin.Int64
 // CHECK:  %[[OUT2:.*]] = alloc_stack $Builtin.Int64
 // CHECK:  %[[OUT3:.*]] = alloc_stack $Builtin.Int64
@@ -150,7 +149,7 @@ bb0(%0 : $*T, %1 : $*T, %2 : $T):
   debug_value %2 : $T, let, name "x", argno 3
   %7 = load %0 : $*T
   %6 = copy_value %2 : $T
-  store %6 to %0 : $*T
+  store %6 to [init] %0 : $*T
   destroy_value %7 : $T
   %11 = load %1 : $*T
   %10 = copy_value %2 : $T
