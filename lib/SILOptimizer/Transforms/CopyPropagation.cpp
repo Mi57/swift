@@ -191,7 +191,7 @@ static bool isConsuming(Operand *use) {
 
   switch (user->getKind()) {
   default:
-    llvm_unreachable("Unexpected last use of a loadable owned value.");
+    llvm_unreachable("Unexpected use of a loadable owned value.");
 
   // Consume the value.
   case SILInstructionKind::AutoreleaseValueInst:
