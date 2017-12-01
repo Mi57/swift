@@ -5122,13 +5122,10 @@ bool SILParser::parseSILBasicBlock(SILBuilder &B) {
             P.parseToken(tok::colon, diag::expected_sil_colon_value_ref))
           return true;
 
-        // If SILOwnership is enabled and we are not assuming that we are
-        // parsing unqualified SIL, look for printed value ownership kinds.
-        if (!F->getModule()
-                 .getOptions()
-                 .AssumeUnqualifiedOwnershipWhenParsing &&
-            parseSILOwnership(OwnershipKind))
-          return true;
+        // The ownership qualified on block arguments is optional. If it is
+        // absent, then the ownership is assumed to be @any.
+        bool missingOwnership = parseSILOwnership(OwnershipKind);
+        (void)missingOwnership;
 
         if (parseSILType(Ty))
           return true;
