@@ -129,6 +129,8 @@ STATISTIC(NumUnknownUsers, "number of functions with unknown users");
 static bool isUnknownUse(Operand *use) {
   switch (use->getUser()->getKind()) {
   default:
+    DEBUG(llvm::dbgs() << "Unknown owned value user: " << use->getUser());
+    ++NumUnknownUsers;
     return false;
   // FIXME: (U3) mark_dependence requires recursion to find all uses. It should
   // be replaced by begin/end dependence.
@@ -737,8 +739,10 @@ void CopyPropagation::run() {
   SmallSetVector<SILValue, 16> copiedDefs;
   for (auto &BB : *pass.F) {
     for (auto &I : BB) {
-      if (auto *copy = dyn_cast<CopyValueInst>(&I))
-        copiedDefs.insert(stripCopies(copy));
+      if (auto *copy = dyn_cast<CopyValueInst>(&I)) {
+        if (pass.F->hasQualifiedOwnership() || copy->getType()->isOpaque())
+          copiedDefs.insert(stripCopies(copy));
+      }
     }
   }
   for (auto &def : copiedDefs) {
