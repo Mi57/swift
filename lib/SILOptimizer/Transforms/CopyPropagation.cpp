@@ -116,6 +116,13 @@ STATISTIC(NumUnknownUsers, "number of functions with unknown users");
 //
 // FIXME: None of this should be in this pass. Ownership properties need an API
 // apart from OwnershipCompatibilityUseChecker.
+//
+// Users of owned values:
+// U1. Instantaneous borrow, or "normal use" (copy_value, @guaranteed)
+// U2. Escape an address to the value (ref_to_unowned,
+// unchecked_trivial_bitcast) U3. Propagate the value without consuming it
+// (mark_dependence, begin_borrow) U4. Consume the value immediately (store,
+// destroy, @owned) U5. Consume the value indirectly via a move (tuple, struct)
 //===----------------------------------------------------------------------===//
 
 // TODO: Figure out how to handle these, if possible.
@@ -123,32 +130,24 @@ static bool isUnknownUse(Operand *use) {
   switch (use->getUser()->getKind()) {
   default:
     return false;
-  // mark_dependence requires recursion to find all uses. It should be
-  // replaced by begin/end dependence..
-  case SILInstructionKind::MarkDependenceInst:
-  // select_enum propagates a value. We need a general API for instructions like
-  // this.
-  case SILInstructionKind::SelectEnumInst:
-  // OwnershipVerifier says that ref_tail_addr, ref_to_raw_pointer, etc. can
-  // accept an owned value, but don't consume it and appear to propagate
-  // it. This shouldn't normally happen without a borrow.
+  // FIXME: (U3) mark_dependence requires recursion to find all uses. It should
+  // be replaced by begin/end dependence.
+  case SILInstructionKind::MarkDependenceInst: // Dependent
+  // FIXME: (U3) ref_tail_addr should require a borrow because it doesn't have
+  // fix_lifetime like other escaping instructions.
   case SILInstructionKind::RefTailAddrInst:
-  case SILInstructionKind::RefToRawPointerInst:
-  case SILInstructionKind::RefToUnmanagedInst:
-  case SILInstructionKind::RefToUnownedInst:
-  // dynamic_method_br seems to capture self, presumably propagating lifetime.
+  // FIXME: (U3) dynamic_method_br seems to capture self, presumably propagating
+  // lifetime. This should probably borrow self, then be treated like
+  // mark_dependence.
   case SILInstructionKind::DynamicMethodBranchInst:
-  // If a value is unsafely cast, we can't say anything about its lifetime.
-  case SILInstructionKind::UncheckedBitwiseCastInst: // Is this right?
-  case SILInstructionKind::UncheckedTrivialBitCastInst:
-  // Ownership verifier says project_box can take an owned value, but
-  // that doesn't make sense to me.
+  // FIXME: (U3) Ownership verifier says project_box can accept an owned value
+  // as a normal use, but it projects the address.
   case SILInstructionKind::ProjectBoxInst:
   case SILInstructionKind::ProjectExistentialBoxInst:
-  // Ownership verifier says open_existential_box can take an owned value, but
-  // that doesn't make sense to me.
+  // FIXME: (U3) Ownership verifier says open_existential_box can accept an
+  // owned value as a normal use, but it projects an address.
   case SILInstructionKind::OpenExistentialBoxInst:
-  // Unmanaged operations.
+  // Unmanaged operations hopefully don't apply to the same value as CopyValue?
   case SILInstructionKind::UnmanagedRetainValueInst:
   case SILInstructionKind::UnmanagedReleaseValueInst:
   case SILInstructionKind::UnmanagedAutoreleaseValueInst:
@@ -213,15 +212,16 @@ static bool isConsuming(Operand *use) {
   case SILInstructionKind::DeallocRefInst:
   case SILInstructionKind::DeinitExistentialValueInst:
   case SILInstructionKind::DestroyValueInst:
+  case SILInstructionKind::EndLifetimeInst:
+  case SILInstructionKind::InitExistentialRefInst:
+  case SILInstructionKind::InitExistentialValueInst:
   case SILInstructionKind::KeyPathInst:
   case SILInstructionKind::ReleaseValueInst:
   case SILInstructionKind::ReleaseValueAddrInst:
+  case SILInstructionKind::StoreInst:
   case SILInstructionKind::StrongReleaseInst:
   case SILInstructionKind::StrongUnpinInst:
   case SILInstructionKind::UnownedReleaseInst:
-  case SILInstructionKind::InitExistentialRefInst:
-  case SILInstructionKind::InitExistentialValueInst:
-  case SILInstructionKind::EndLifetimeInst:
   case SILInstructionKind::UnconditionalCheckedCastValueInst:
     return true;
 
@@ -256,13 +256,8 @@ static bool isConsuming(Operand *use) {
     return true;
 
   // BeginBorrow should already be skipped.
-  // EndBorrow extends the lifetime.
+  // EndBorrow extends the lifetime like a normal use.
   case SILInstructionKind::EndBorrowInst:
-    return false;
-
-  // Stores implicitly borrow the value being stored.
-  case SILInstructionKind::StoreInst:
-    assert(cast<StoreInst>(user)->getSrc() == use->get());
     return false;
 
   // Extend the lifetime without borrowing, propagating, or destroying it.
@@ -273,10 +268,20 @@ static bool isConsuming(Operand *use) {
   case SILInstructionKind::DebugValueInst:
   case SILInstructionKind::ExistentialMetatypeInst:
   case SILInstructionKind::FixLifetimeInst:
+  case SILInstructionKind::SelectEnumInst:
   case SILInstructionKind::SetDeallocatingInst:
   case SILInstructionKind::StoreWeakInst:
   case SILInstructionKind::StrongPinInst:
   case SILInstructionKind::ValueMetatypeInst:
+    return false;
+
+  // Escape the value. The lifetime must already be enforced via something like
+  // fix_lifetime.
+  case SILInstructionKind::RefToRawPointerInst:
+  case SILInstructionKind::RefToUnmanagedInst:
+  case SILInstructionKind::RefToUnownedInst:
+  case SILInstructionKind::UncheckedBitwiseCastInst:
+  case SILInstructionKind::UncheckedTrivialBitCastInst:
     return false;
 
   // Dynamic dispatch without capturing self.
