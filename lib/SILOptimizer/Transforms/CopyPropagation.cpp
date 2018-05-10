@@ -129,8 +129,6 @@ STATISTIC(NumUnknownUsers, "number of functions with unknown users");
 static bool isUnknownUse(Operand *use) {
   switch (use->getUser()->getKind()) {
   default:
-    DEBUG(llvm::dbgs() << "Unknown owned value user: " << use->getUser());
-    ++NumUnknownUsers;
     return false;
   // FIXME: (U3) mark_dependence requires recursion to find all uses. It should
   // be replaced by begin/end dependence.
@@ -227,7 +225,7 @@ static bool isConsuming(Operand *use) {
   case SILInstructionKind::UnconditionalCheckedCastValueInst:
     return true;
 
-  // Terminators must consume their values.
+  // Terminators must consume their owned values.
   case SILInstructionKind::BranchInst:
   case SILInstructionKind::CheckedCastBranchInst:
   case SILInstructionKind::CheckedCastValueBranchInst:
@@ -466,7 +464,8 @@ static void computeUseBlockLiveness(SILBasicBlock *userBB,
 
 /// Update the current def's liveness at the given user.
 ///
-/// Terminators consume their operands, so they are not live out of the block.
+/// Terminators consume their owned operands, so they are not live out of the
+/// block.
 static void computeUseLiveness(Operand *use, CopyPropagationState &pass) {
   auto *bb = use->getUser()->getParent();
   auto isLive = pass.liveness.isBlockLive(bb);
@@ -489,8 +488,8 @@ static void computeUseLiveness(Operand *use, CopyPropagationState &pass) {
 /// Generate pass.liveness.
 /// Return true if successful.
 ///
-/// Assumption: No users occur before 'def' in def's BB because this follows
-/// the SSA def-use chains and all terminators consume their operand.
+/// Assumption: No users occur before 'def' in def's BB because this follows the
+/// SSA def-use chains and all terminators consume their operand if it is owned.
 static bool computeLiveness(CopyPropagationState &pass) {
   assert(pass.liveness.empty());
 
@@ -510,7 +509,7 @@ static bool computeLiveness(CopyPropagationState &pass) {
       auto *user = use->getUser();
 
       if (isUnknownUse(use)) {
-        DEBUG(llvm::dbgs() << "Unknown owned value user: " << *user);
+        DEBUG(llvm::dbgs() << "Unknown owned value user: "; user->dump());
         ++NumUnknownUsers;
         return false;
       }
@@ -549,18 +548,20 @@ static void insertDestroyOnCFGEdge(SILBasicBlock *predBB, SILBasicBlock *succBB,
     pass.markInvalid(SILAnalysis::InvalidationKind::Branches);
 
   SILBuilderWithScope B(destroyBB->begin());
-  pass.destroys.recordFinalDestroy(
-      B.createDestroyValue(succBB->begin()->getLoc(), pass.currDef));
+  auto *DI = B.createDestroyValue(succBB->begin()->getLoc(), pass.currDef);
+  pass.destroys.recordFinalDestroy(DI);
   ++NumDestroysGenerated;
+  DEBUG(llvm::dbgs() << "  Destroy on edge "; DI->dump());
   pass.markInvalid(SILAnalysis::InvalidationKind::Instructions);
 }
 
 static void insertDestroyAtInst(SILBasicBlock::iterator pos,
                                 CopyPropagationState &pass) {
   SILBuilderWithScope B(pos);
-  pass.destroys.recordFinalDestroy(
-      B.createDestroyValue((*pos).getLoc(), pass.currDef));
+  auto *DI = B.createDestroyValue((*pos).getLoc(), pass.currDef);
+  pass.destroys.recordFinalDestroy(DI);
   ++NumDestroysGenerated;
+  DEBUG(llvm::dbgs() << "  Destroy at last use "; DI->dump());
   pass.markInvalid(SILAnalysis::InvalidationKind::Instructions);
 }
 
@@ -648,6 +649,7 @@ static void copyLiveUse(Operand *use, CopyPropagationState &pass) {
   auto *copy = B.createCopyValue(user->getLoc(), use->get());
   use->set(copy);
   ++NumCopiesGenerated;
+  DEBUG(llvm::dbgs() << "  Copying at last use "; copy->dump());
   pass.markInvalid(SILAnalysis::InvalidationKind::Instructions);
 }
 
@@ -666,6 +668,7 @@ static void rewriteCopies(CopyPropagationState &pass) {
     if (auto *destroy = dyn_cast<DestroyValueInst>(user)) {
       if (!pass.destroys.claimDestroy(destroy)) {
         instsToDelete.insert(destroy);
+        DEBUG(llvm::dbgs() << "  Removing "; destroy->dump());
         ++NumDestroysEliminated;
       }
       return;
@@ -683,6 +686,7 @@ static void rewriteCopies(CopyPropagationState &pass) {
         visitUse(use);
       copy->replaceAllUsesWith(copy->getOperand());
       instsToDelete.insert(copy);
+      DEBUG(llvm::dbgs() << "  Removing "; copy->dump());
       ++NumCopiesEliminated;
       continue;
     }
@@ -740,8 +744,10 @@ void CopyPropagation::run() {
   for (auto &BB : *pass.F) {
     for (auto &I : BB) {
       if (auto *copy = dyn_cast<CopyValueInst>(&I)) {
-        if (pass.F->hasQualifiedOwnership() || copy->getType()->isOpaque())
+        if (pass.F->hasQualifiedOwnership()
+            || copy->getType().isOpaque(pass.F->getModule())) {
           copiedDefs.insert(stripCopies(copy));
+        }
       }
     }
   }
