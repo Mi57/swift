@@ -509,12 +509,16 @@ struct OwnershipQualifiedKindVisitor : SILInstructionVisitor<OwnershipQualifiedK
     return OwnershipQualifiedKind::NotApplicable;
   }
 
-#define QUALIFIED_INST(CLASS) \
-  OwnershipQualifiedKind visit ## CLASS(CLASS *I) { \
-    return OwnershipQualifiedKind::Qualified;             \
+    // FIXME: Lie about opaque types being unqualified because the ownership
+    // eliminator can't unqualify it. Lying is bad but this is temporary until
+    // ownership is complete.
+#define QUALIFIED_INST(CLASS)                                                  \
+  OwnershipQualifiedKind visit##CLASS(CLASS *I) {                              \
+    if (I->getAllOperands()[0].get()->getType().isOpaque(I->getModule()))      \
+      return OwnershipQualifiedKind::Unqualified;                              \
+    return OwnershipQualifiedKind::Qualified;                                  \
   }
   QUALIFIED_INST(EndBorrowInst)
-  QUALIFIED_INST(LoadBorrowInst)
   QUALIFIED_INST(CopyValueInst)
   QUALIFIED_INST(DestroyValueInst)
 #define SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
@@ -522,14 +526,22 @@ struct OwnershipQualifiedKindVisitor : SILInstructionVisitor<OwnershipQualifiedK
 #include "swift/AST/ReferenceStorage.def"
 #undef QUALIFIED_INST
 
+  OwnershipQualifiedKind visitLoadBorrowInst(LoadBorrowInst *LI) {
+    return LI->getType().isOpaque(LI->getModule())
+               ? OwnershipQualifiedKind::Unqualified
+               : OwnershipQualifiedKind::Qualified;
+  }
+
   OwnershipQualifiedKind visitLoadInst(LoadInst *LI) {
-    if (LI->getOwnershipQualifier() == LoadOwnershipQualifier::Unqualified)
+    if (LI->getOwnershipQualifier() == LoadOwnershipQualifier::Unqualified
+        || LI->getType().isOpaque(LI->getModule()))
       return OwnershipQualifiedKind::Unqualified;
     return OwnershipQualifiedKind::Qualified;
   }
 
   OwnershipQualifiedKind visitStoreInst(StoreInst *SI) {
-    if (SI->getOwnershipQualifier() == StoreOwnershipQualifier::Unqualified)
+    if (SI->getOwnershipQualifier() == StoreOwnershipQualifier::Unqualified
+        || SI->getSrc()->getType().isOpaque(SI->getModule()))
       return OwnershipQualifiedKind::Unqualified;
     return OwnershipQualifiedKind::Qualified;
   }

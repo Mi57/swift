@@ -265,6 +265,9 @@ public:
   /// address-only. This is the opposite of isLoadable.
   bool isAddressOnly(SILModule &M) const;
 
+  /// True if the type is an opaque object.
+  bool isOpaque(SILModule &M) const { return isObject() && isAddressOnly(M); }
+
   /// True if the type, or the referenced type of an address type, is trivial.
   bool isTrivial(SILModule &M) const;
 

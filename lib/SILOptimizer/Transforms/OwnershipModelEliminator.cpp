@@ -210,7 +210,8 @@ bool OwnershipModelEliminatorVisitor::visitCheckedCastBranchInst(
   // checked cast branch's operand.
   // 2. We delete the argument from the false block.
   SILBasicBlock *FailureBlock = CBI->getFailureBB();
-  if (FailureBlock->getNumArguments() == 0)
+  if (FailureBlock->getNumArguments() == 0
+      || FailureBlock->getArgument(0)->getType().isOpaque(CBI->getModule()))
     return false;
   FailureBlock->getArgument(0)->replaceAllUsesWith(CBI->getOperand());
   FailureBlock->eraseArgument(0);
@@ -297,7 +298,8 @@ struct OwnershipModelEliminator : SILModuleTransform {
       for (auto &BB : F) {
         // Change all arguments to have ValueOwnershipKind::Any.
         for (auto *Arg : BB.getArguments()) {
-          Arg->setOwnershipKind(ValueOwnershipKind::Any);
+          if (!Arg->getType().isOpaque(*getModule()))
+            Arg->setOwnershipKind(ValueOwnershipKind::Any);
         }
 
         for (auto II = BB.begin(), IE = BB.end(); II != IE;) {

@@ -479,8 +479,8 @@ ClosureCloner::populateCloned() {
     // If SIL ownership is enabled, we need to perform a borrow here if we have
     // a non-trivial value. We know that our value is not written to and it does
     // not escape. The use of a borrow enforces this.
-    if (Cloned->hasQualifiedOwnership() &&
-        MappedValue.getOwnershipKind() != ValueOwnershipKind::Trivial) {
+    if (!getBuilder().needsOwnership(MappedValue)
+        && MappedValue.getOwnershipKind() != ValueOwnershipKind::Trivial) {
       SILLocation Loc(const_cast<ValueDecl *>((*I)->getDecl()));
       MappedValue = getBuilder().createBeginBorrow(Loc, MappedValue);
     }
@@ -577,8 +577,8 @@ void ClosureCloner::visitDestroyValueInst(DestroyValueInst *Inst) {
 
       // If ownership is enabled, then we must emit a begin_borrow for any
       // non-trivial value.
-      if (F.hasQualifiedOwnership() &&
-          Value.getOwnershipKind() != ValueOwnershipKind::Trivial) {
+      if (!B.needsOwnership(Value)
+          && Value.getOwnershipKind() != ValueOwnershipKind::Trivial) {
         auto *BBI = cast<BeginBorrowInst>(Value);
         Value = BBI->getOperand();
         B.createEndBorrow(Inst->getLoc(), BBI, Value);
@@ -637,8 +637,8 @@ void ClosureCloner::visitEndAccessInst(EndAccessInst *Inst) {
 /// The two relevant cases are a direct load from a promoted address argument or
 /// a load of a struct_element_addr of a promoted address argument.
 void ClosureCloner::visitLoadBorrowInst(LoadBorrowInst *LI) {
-  assert(LI->getFunction()->hasQualifiedOwnership() &&
-         "We should only see a load borrow in ownership qualified SIL");
+  assert(!getBuilder().needsOwnership(LI)
+         && "We should only see a load borrow in ownership qualified SIL");
   if (SILValue Val = getProjectBoxMappedVal(LI->getOperand())) {
     // Loads of the address argument get eliminated completely; the uses of
     // the loads get mapped to uses of the new object type argument.
@@ -667,7 +667,7 @@ void ClosureCloner::visitLoadInst(LoadInst *LI) {
     // behaviors depending on the type of load. Specifically, if we have a
     // load [copy], then we need to add a copy_value here. If we have a take
     // or trivial, we just propagate the value through.
-    if (LI->getFunction()->hasQualifiedOwnership()
+    if (getBuilder().needsOwnership(LI)
         && LI->getOwnershipQualifier() == LoadOwnershipQualifier::Copy) {
       Val = getBuilder().createCopyValue(LI->getLoc(), Val);
     }
@@ -685,15 +685,16 @@ void ClosureCloner::visitLoadInst(LoadInst *LI) {
     // Loads of a struct_element_addr of an argument get replaced with a
     // struct_extract of the new passed in value. The value should be borrowed
     // already, so we can just extract the value.
-    assert(!getBuilder().getFunction().hasQualifiedOwnership() ||
-           Val.getOwnershipKind().isTrivialOr(ValueOwnershipKind::Guaranteed));
+    assert(
+        !getBuilder().needsOwnership(Val)
+        || Val.getOwnershipKind().isTrivialOr(ValueOwnershipKind::Guaranteed));
     Val = getBuilder().emitStructExtract(LI->getLoc(), Val, SEAI->getField(),
                                          LI->getType());
 
     // If we were performing a load [copy], then we need to a perform a copy
     // here since when cloning, we do not eliminate the destroy on the copied
     // value.
-    if (LI->getFunction()->hasQualifiedOwnership()
+    if (getBuilder().needsOwnership(LI)
         && LI->getOwnershipQualifier() == LoadOwnershipQualifier::Copy) {
       Val = getBuilder().createCopyValue(LI->getLoc(), Val);
     }

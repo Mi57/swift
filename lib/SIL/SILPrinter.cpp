@@ -563,19 +563,17 @@ public:
 
     // If SIL ownership is enabled and the given function has not had ownership
     // stripped out, print out ownership of SILArguments.
-    if (BB->getParent()->hasQualifiedOwnership()) {
-      *this << getIDAndTypeAndOwnership(Args[0]);
-      for (SILArgument *Arg : Args.drop_front()) {
-        *this << ", " << getIDAndTypeAndOwnership(Arg);
+    auto argInfo = [this, BB](SILArgument *Arg) {
+      if (BB->getModule().getOptions().EnableSILOwnership
+          && (BB->getParent()->hasQualifiedOwnership()
+              || Arg->getType().isOpaque(BB->getModule()))) {
+        return getIDAndTypeAndOwnership(Arg);
       }
-      *this << ')';
-      return;
-    }
-
-    // Otherwise, fall back to the old behavior
-    *this << getIDAndType(Args[0]);
+      return getIDAndType(Arg);
+    };
+    *this << argInfo(Args[0]);
     for (SILArgument *Arg : Args.drop_front()) {
-      *this << ", " << getIDAndType(Arg);
+      *this << ", " << argInfo(Arg);
     }
     *this << ')';
   }

@@ -194,6 +194,12 @@ public:
     return getModule().getTypeLowering(T);
   }
 
+  bool needsOwnership(SILValue V) const {
+    // Opaque values always have qualified ownership.
+    return getFunction().hasQualifiedOwnership()
+      || V->getType().isOpaque(getModule());
+  }
+
   void setOpenedArchetypesTracker(SILOpenedArchetypesTracker *Tracker) {
     C.setOpenedArchetypesTracker(Tracker);
   }
@@ -613,7 +619,7 @@ public:
   LoadInst *createTrivialLoadOr(SILLocation Loc, SILValue LV,
                                 LoadOwnershipQualifier Qualifier,
                                 bool SupportUnqualifiedSIL = false) {
-    if (SupportUnqualifiedSIL && !getFunction().hasQualifiedOwnership()) {
+    if (SupportUnqualifiedSIL && !needsOwnership(LV)) {
       assert(
           Qualifier != LoadOwnershipQualifier::Copy &&
           "In unqualified SIL, a copy must be done separately form the load");
@@ -628,13 +634,13 @@ public:
 
   LoadInst *createLoad(SILLocation Loc, SILValue LV,
                        LoadOwnershipQualifier Qualifier) {
-    assert((Qualifier != LoadOwnershipQualifier::Unqualified) ||
-           !getFunction().hasQualifiedOwnership() &&
-               "Unqualified inst in qualified function");
-    assert((Qualifier == LoadOwnershipQualifier::Unqualified) ||
-           getFunction().hasQualifiedOwnership() &&
-               "Qualified inst in unqualified function");
-    assert(LV->getType().isLoadableOrOpaque(getModule()));
+    assert(
+        (Qualifier != LoadOwnershipQualifier::Unqualified || !needsOwnership(LV))
+        && "Unqualified inst in qualified function");
+    assert((Qualifier == LoadOwnershipQualifier::Unqualified || needsOwnership(LV))
+           && "Qualified inst in unqualified function");
+    assert(!SILModuleConventions(getModule()).useLoweredAddresses()
+           || LV->getType().isLoadable(getModule()));
     return insert(new (getModule())
                       LoadInst(getSILDebugLocation(Loc), LV, Qualifier));
   }
@@ -680,7 +686,7 @@ public:
                                   SILValue DestAddr,
                                   StoreOwnershipQualifier Qualifier,
                                   bool SupportUnqualifiedSIL = false) {
-    if (SupportUnqualifiedSIL && !getFunction().hasQualifiedOwnership()) {
+    if (SupportUnqualifiedSIL && !needsOwnership(Src)) {
       assert(
           Qualifier != StoreOwnershipQualifier::Assign &&
           "In unqualified SIL, assigns must be represented via 2 instructions");
@@ -695,12 +701,12 @@ public:
 
   StoreInst *createStore(SILLocation Loc, SILValue Src, SILValue DestAddr,
                          StoreOwnershipQualifier Qualifier) {
-    assert((Qualifier != StoreOwnershipQualifier::Unqualified) ||
-           !getFunction().hasQualifiedOwnership() &&
-               "Unqualified inst in qualified function");
-    assert((Qualifier == StoreOwnershipQualifier::Unqualified) ||
-           getFunction().hasQualifiedOwnership() &&
-               "Qualified inst in unqualified function");
+    assert(
+        (Qualifier != StoreOwnershipQualifier::Unqualified || !needsOwnership(Src))
+        && "Unqualified inst in qualified function");
+    assert(
+        (Qualifier == StoreOwnershipQualifier::Unqualified || needsOwnership(Src))
+        && "Qualified inst in unqualified function");
     return insert(new (getModule()) StoreInst(getSILDebugLocation(Loc), Src,
                                                 DestAddr, Qualifier));
   }
