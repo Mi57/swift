@@ -509,7 +509,6 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.EnableObjCInterop =
       Args.hasFlag(OPT_enable_objc_interop, OPT_disable_objc_interop,
                    Target.isOSDarwin());
-  Opts.EnableSILOpaqueValues |= Args.hasArg(OPT_enable_sil_opaque_values);
 
   Opts.UseDarwinPreStableABIBit =
     (Target.isMacOSX() && Target.isMacOSXVersionLT(10, 14, 4)) ||
@@ -712,9 +711,8 @@ void parseExclusivityEnforcementOptions(const llvm::opt::Arg *A,
 }
 
 static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
-                         IRGenOptions &IRGenOpts,
-                         FrontendOptions &FEOpts,
-                         DiagnosticEngine &Diags,
+                         IRGenOptions &IRGenOpts, LangOptions &LangOpts,
+                         FrontendOptions &FEOpts, DiagnosticEngine &Diags,
                          const llvm::Triple &Triple,
                          ClangImporterOptions &ClangOpts) {
   using namespace options;
@@ -844,6 +842,7 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
   Opts.StripOwnershipAfterSerialization |= Args.hasArg(OPT_enable_ownership_stripping_after_serialization);
   Opts.EnableDynamicReplacementCanCallPreviousImplementation = !Args.hasArg(
       OPT_disable_previous_implementation_calls_in_dynamic_replacements);
+  Opts.EnableSILOpaqueValues |= Args.hasArg(OPT_enable_sil_opaque_values);
 
   if (const Arg *A = Args.getLastArg(OPT_save_optimization_record_path))
     Opts.OptRecordFile = A->getValue();
@@ -1374,8 +1373,8 @@ bool CompilerInvocation::parseArgs(
     return true;
   }
 
-  if (ParseSILArgs(SILOpts, ParsedArgs, IRGenOpts, FrontendOpts, Diags,
-                   LangOpts.Target, ClangImporterOpts)) {
+  if (ParseSILArgs(SILOpts, ParsedArgs, IRGenOpts, LangOpts, FrontendOpts,
+                   Diags, LangOpts.Target, ClangImporterOpts)) {
     return true;
   }
 

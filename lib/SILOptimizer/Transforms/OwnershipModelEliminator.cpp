@@ -105,10 +105,6 @@ bool OwnershipModelEliminatorVisitor::visitLoadInst(LoadInst *LI) {
   if (Qualifier == LoadOwnershipQualifier::Unqualified)
     return false;
 
-  // If the loaded value is address-only, just return.
-  if (LI->getType().isAddressOnly(*LI->getFunction()))
-    return false;
-
   SILValue Result = B.emitLoadValueOperation(LI->getLoc(), LI->getOperand(),
                                              LI->getOwnershipQualifier());
 
@@ -125,10 +121,6 @@ bool OwnershipModelEliminatorVisitor::visitStoreInst(StoreInst *SI) {
   // If the qualifier is unqualified, there is nothing further to do
   // here. Just return.
   if (Qualifier == StoreOwnershipQualifier::Unqualified)
-    return false;
-
-  // If the stored value is address-only, just return.
-  if (SI->getSrc()->getType().isAddressOnly(*SI->getFunction()))
     return false;
 
   B.emitStoreValueOperation(SI->getLoc(), SI->getSrc(), SI->getDest(),
@@ -163,10 +155,6 @@ OwnershipModelEliminatorVisitor::visitLoadBorrowInst(LoadBorrowInst *LBI) {
 }
 
 bool OwnershipModelEliminatorVisitor::visitCopyValueInst(CopyValueInst *CVI) {
-  // A copy_value of an address-only type cannot be replaced.
-  if (CVI->getType().isAddressOnly(B.getFunction()))
-    return false;
-
   // Now that we have set the unqualified ownership flag, destroy value
   // operation will delegate to the appropriate strong_release, etc.
   B.emitCopyValueOperation(CVI->getLoc(), CVI->getOperand());
@@ -204,10 +192,6 @@ bool OwnershipModelEliminatorVisitor::visitUnmanagedAutoreleaseValueInst(
 }
 
 bool OwnershipModelEliminatorVisitor::visitDestroyValueInst(DestroyValueInst *DVI) {
-  // A destroy_value of an address-only type cannot be replaced.
-  if (DVI->getOperand()->getType().isAddressOnly(B.getFunction()))
-    return false;
-
   // Now that we have set the unqualified ownership flag, destroy value
   // operation will delegate to the appropriate strong_release, etc.
   B.emitDestroyValueOperation(DVI->getLoc(), DVI->getOperand());

@@ -238,6 +238,9 @@ def disable_arc_opts : Flag<["-"], "disable-arc-opts">,
 def disable_sil_partial_apply : Flag<["-"], "disable-sil-partial-apply">,
   HelpText<"Disable use of partial_apply in SIL generation">;
 
+def enable_sil_opaque_values : Flag<["-"], "enable-sil-opaque-values">,
+  HelpText<"Enable SIL Opaque Values">;
+
 def enable_ownership_stripping_after_serialization
   : Flag<["-"], "enable-ownership-stripping-after-serialization">,
   HelpText<"Strip ownership after serialization">;
@@ -318,9 +321,6 @@ def disable_sil_ownership_verifier : Flag<["-"], "disable-sil-ownership-verifier
 def suppress_static_exclusivity_swap : Flag<["-"], "suppress-static-exclusivity-swap">,
   HelpText<"Suppress static violations of exclusive access with swap()">;
 
-def enable_sil_opaque_values : Flag<["-"], "enable-sil-opaque-values">,
-  HelpText<"Enable SIL Opaque Values">;
-  
 def enable_large_loadable_types : Flag<["-"], "enable-large-loadable-types">,
   HelpText<"Enable Large Loadable types IRGen pass">;
 

@@ -143,6 +143,9 @@ public:
   /// pipeline or after serialization.
   bool StripOwnershipAfterSerialization = false;
 
+  /// If set to true, compile with the SIL Opaque Values enabled.
+  bool EnableSILOpaqueValues = false;
+
   /// The name of the file to which the backend should save YAML optimization
   /// records.
   std::string OptRecordFile;

@@ -439,7 +439,7 @@ SILResultInfo::getOwnershipKind(SILFunction &F) const {
 }
 
 SILModuleConventions::SILModuleConventions(const SILModule &M)
-    : loweredAddresses(!M.getASTContext().LangOpts.EnableSILOpaqueValues
+    : loweredAddresses(!M.getOptions().EnableSILOpaqueValues
                        || M.getStage() == SILStage::Lowered) {}
 
 bool SILModuleConventions::isReturnedIndirectlyInSIL(SILType type,

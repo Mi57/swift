@@ -314,8 +314,6 @@ int main(int argc, char **argv) {
     EnableObjCInterop ? true :
     DisableObjCInterop ? false : llvm::Triple(Target).isOSDarwin();
 
-  Invocation.getLangOptions().EnableSILOpaqueValues = EnableSILOpaqueValues;
-
   Invocation.getLangOptions().OptimizationRemarkPassedPattern =
       createOptRemarkRegex(PassRemarksPassed);
   Invocation.getLangOptions().OptimizationRemarkMissedPattern =
@@ -333,6 +331,7 @@ int main(int argc, char **argv) {
   if (OptimizationGroup != OptGroup::Diagnostics)
     SILOpts.OptMode = OptimizationMode::ForSpeed;
   SILOpts.VerifySILOwnership = !DisableSILOwnershipVerifier;
+  SILOpts.EnableSILOpaqueValues = EnableSILOpaqueValues;
 
   SILOpts.VerifyExclusivity = VerifyExclusivity;
   if (EnforceExclusivity.getNumOccurrences() != 0) {

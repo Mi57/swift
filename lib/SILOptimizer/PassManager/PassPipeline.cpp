@@ -103,6 +103,9 @@ static void addMandatoryOptPipeline(SILPassPipelinePlan &P) {
   const auto &Options = P.getOptions();
   P.addClosureLifetimeFixup();
   if (Options.shouldOptimize()) {
+    // FIXME: CopyPropagation should run all the time, ideally even at Onone.
+    if (Options.EnableSILOpaqueValues)
+      P.addCopyPropagation();
     P.addSemanticARCOpts();
     P.addDestroyHoisting();
   }

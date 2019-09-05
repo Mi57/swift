@@ -80,6 +80,7 @@
 
 #define DEBUG_TYPE "address-lowering"
 #include "BlockArgumentStorage.h"
+#include "swift/Basic/BlotSetVector.h"
 #include "swift/Basic/Range.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/DebugUtils.h"
@@ -329,7 +330,7 @@ struct AddressLoweringState {
   // All opaque values and associated storage.
   ValueStorageMap valueStorageMap;
   // All call sites with formally indirect SILArgument or SILResult conventions.
-  SmallSetVector<ApplySite, 16> indirectApplies;
+  SmallBlotSetVector<ApplySite, 16> indirectApplies;
   // All function-exiting terminators (return or throw instructions).
   SmallVector<SILInstruction *, 8> exitingInsts;
   // Delete these instructions after performing transformations. They must
@@ -394,7 +395,6 @@ static void convertIndirectFunctionArgs(AddressLoweringState &pass) {
     if (param.isFormalIndirect() && !fnConv.isSILIndirect(param)) {
       SILArgument *arg = pass.F->getArgument(argIdx);
       SILType addrType = arg->getType().getAddressType();
-
       LoadInst *loadArg = argBuilder.createLoad(
           SILValue(arg).getLoc(), SILUndef::get(addrType, *pass.F),
           LoadOwnershipQualifier::Unqualified);
@@ -1483,8 +1483,6 @@ protected:
 /// Top-level entry: Allocate storage for formally indirect results at the given
 /// call site. Create a new call instruction with indirect SIL arguments.
 void ApplyRewriter::convertApplyWithIndirectResults() {
-  pass.indirectApplies.remove(apply);
-
   // Gather information from the old apply before rewriting it.
 
   // List of new call arguments.
@@ -2587,11 +2585,10 @@ static void rewriteFunction(AddressLoweringState &pass) {
   //
   // Also rewrite any try_apply with an indirect result and remove the
   // corresponding block argument.
-  //
-  // FIXME: remove an apply from this set when it's rewritten.
-  for (ApplySite apply : pass.indirectApplies)
-    rewriteIndirectApply(apply, pass);
-
+  while (!pass.indirectApplies.empty()) {
+    if (auto apply = pass.indirectApplies.pop_back_val())
+      rewriteIndirectApply(apply.getValue(), pass);
+  }
   // Rewrite this function's return value now that all opaque values within the
   // function are rewritten. This still depends on a valid ValueStorage
   // projection operands.
@@ -2833,7 +2830,7 @@ void AddressLowering::runOnFunction(SILFunction *F) {
 
 /// The entry point to this module transformation.
 void AddressLowering::run() {
-  if (getModule()->getASTContext().LangOpts.EnableSILOpaqueValues) {
+  if (getModule()->getOptions().EnableSILOpaqueValues) {
     for (auto &F : *getModule())
       runOnFunction(&F);
   }
