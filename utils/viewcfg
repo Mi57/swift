@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 
+fontname = "input"
 
 class Block(object):
 
@@ -152,6 +153,9 @@ def main():
     file_name = tempfile.gettempdir() + "/viewcfg" + suffix + ".dot"
     with open(file_name, 'w') as out_file:
         out_file.write('digraph "CFG" {\n')
+        out_file.write("""graph [fontname = "{font}"];
+                          node [fontname = "{font}"];
+                          edge [fontname = "{font}"];""".format(font=fontname))
         for block in block_list:
             if block.content is not None:
                 out_file.write(
