@@ -26,6 +26,8 @@ bool swift::isValueAddressOrTrivial(SILValue v) {
 }
 
 // These operations forward both owned and guaranteed ownership.
+//
+// FIXME: replace this with a check on OperandOwnership.
 static bool isOwnershipForwardingValueKind(SILNodeKind kind) {
   switch (kind) {
   case SILNodeKind::TupleInst:
@@ -57,6 +59,8 @@ static bool isOwnershipForwardingValueKind(SILNodeKind kind) {
 
 // These operations forward guaranteed ownership, but don't necessarily forward
 // owned values.
+//
+// FIXME: replace this with a check on OperandOwnership.
 static bool isGuaranteedForwardingValueKind(SILNodeKind kind) {
   switch (kind) {
   case SILNodeKind::TupleExtractInst:

@@ -225,25 +225,6 @@ struct BorrowingOperand {
     llvm_unreachable("Covered switch isn't covered?!");
   }
 
-  /// Is this a borrow scope operand that can open new borrow scopes
-  /// for owned values.
-  bool canAcceptOwnedValues() const {
-    switch (kind) {
-    // begin_borrow can take any parameter
-    case BorrowingOperandKind::BeginBorrow:
-    // Yield can implicit borrow owned values.
-    case BorrowingOperandKind::Yield:
-    // FullApplySites can implicit borrow owned values.
-    case BorrowingOperandKind::BeginApply:
-    case BorrowingOperandKind::Apply:
-    case BorrowingOperandKind::TryApply:
-      return true;
-    case BorrowingOperandKind::Branch:
-      return false;
-    }
-    llvm_unreachable("Covered switch isn't covered?!");
-  }
-
   /// Is the result of this instruction also a borrow introducer?
   ///
   /// TODO: This needs a better name.
