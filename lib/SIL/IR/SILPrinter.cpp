@@ -1742,6 +1742,12 @@ public:
           [&] { *this << ", "; });
       *this << ')';
     }
+    for (auto elt : TI->getElements()) {
+      if (elt.getOwnershipKind() != TI->getOwnershipKind()) {
+        *this << " @" << TI->getOwnershipKind();
+        break;
+      }
+    }
   }
   
   void visitEnumInst(EnumInst *UI) {
