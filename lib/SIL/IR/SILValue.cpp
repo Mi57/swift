@@ -384,6 +384,9 @@ llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &os,
   case OperandOwnership::BitwiseEscape:
     os << "bitwise-escape";
     break;
+  case OperandOwnership::ForwardingUnowned:
+    os << "bitwise-escape";
+    break;
   case OperandOwnership::Borrow:
     os << "borrow";
     break;

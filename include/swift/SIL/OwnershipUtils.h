@@ -32,31 +32,47 @@ class DeadEndBlocks;
 /// Returns true if v is an address or trivial.
 bool isValueAddressOrTrivial(SILValue v);
 
-/// Is this an operand that can forward both owned and guaranteed ownership into
-/// one of the operand's owner instruction's result.
-bool isOwnershipForwardingUse(Operand *op);
-
-/// Is this an operand that can forward guaranteed ownership into one of the
-/// operand's owner instruction's result.
-bool isGuaranteedForwardingUse(Operand *op);
-
-/// Is this an operand that can forward owned ownership into one of the
-/// operand's owner instruction's result.
-bool isOwnedForwardingUse(Operand *use);
-
-/// Is this a value that is the result of an instruction that forwards
-/// guaranteed ownership from one of its operands.
+/// Is the opcode that produces \p value capable of forwarding guaranteed
+/// values?
 ///
-/// Precondition: value has guaranteed ownership.
-bool isGuaranteedForwardingValue(SILValue value);
+/// This may be true even if the current instance of the instruction is not a
+/// ForwardingBorrow. If true, then the operation may be trivially rewritten
+/// with Guaranteed ownership.
+bool canOpcodeForwardGuaranteedValues(SILValue value);
 
-/// Is this value the result of an instruction that 'forward's owned ownership,
-/// but may not be able to forward guaranteed ownership.
+/// Is the opcode that consumes \p use capable of forwarding guaranteed values?
 ///
-/// This will be either a multiple value instruction resuilt, a single value
-/// instruction that forwards or an argument that forwards the ownership from a
-/// previous terminator.
-bool isOwnedForwardingValue(SILValue value);
+/// This may be true even if \p use is not a ForwardingBorrow. If true, then the
+/// operation may be trivially rewritten with Guaranteed ownership.
+bool canOpcodeForwardGuaranteedValues(Operand *use);
+
+// This is the use-def equivalent of use->getOperandOwnership() ==
+// OperandOwnership::ForwardingBorrow.
+inline bool isForwardingBorrow(SILValue value) {
+  assert(value.getOwnershipKind() == OwnershipKind::Guaranteed);
+  return canOpcodeForwardGuaranteedValues(value);
+}
+
+/// Is the opcode that produces \p value capable of forwarding owned values?
+///
+/// This may be true even if the current instance of the instruction is not a
+/// ForwardingConsume. If true, then the operation may be trivially rewritten
+/// with Owned ownership.
+bool canOpcodeForwardOwnedValues(SILValue value);
+
+/// Is this opcode that consumes \p use capable of forwarding owned values?
+///
+/// This may be true even if the current instance of the instruction is not a
+/// ForwardingConsume. If true, then the operation may be trivially rewritten
+/// with Owned ownership.
+bool canOpcodeForwardOwnedValues(Operand *use);
+
+// This is the use-def equivalent of use->getOperandOwnership() ==
+// OperandOwnership::ForwardingConsume.
+inline bool isForwardingConsume(SILValue value) {
+  assert(value.getOwnershipKind() == OwnershipKind::Owned);
+  return canOpcodeForwardOwnedValues(value);
+}
 
 class ForwardingOperand {
   Operand *use;

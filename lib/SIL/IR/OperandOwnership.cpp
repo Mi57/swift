@@ -232,13 +232,13 @@ OPERAND_OWNERSHIP(DestroyingConsume, DestroyValue)
 OPERAND_OWNERSHIP(DestroyingConsume, EndLifetime)
 OPERAND_OWNERSHIP(DestroyingConsume, BeginCOWMutation)
 OPERAND_OWNERSHIP(DestroyingConsume, EndCOWMutation)
-OPERAND_OWNERSHIP(ForwardingConsume, MarkUninitialized)
 
 // Instructions that move an owned value.
 OPERAND_OWNERSHIP(ForwardingConsume, CheckedCastValueBranch)
 OPERAND_OWNERSHIP(ForwardingConsume, UnconditionalCheckedCastValue)
 OPERAND_OWNERSHIP(ForwardingConsume, InitExistentialValue)
 OPERAND_OWNERSHIP(ForwardingConsume, DeinitExistentialValue)
+OPERAND_OWNERSHIP(ForwardingConsume, MarkUninitialized)
 OPERAND_OWNERSHIP(ForwardingConsume, Throw)
 
 // Instructions that expose a pointer within a borrow scope.
@@ -302,9 +302,9 @@ FORWARD_ANY_OWNERSHIP(SwitchEnum)
 FORWARD_ANY_OWNERSHIP(CheckedCastBranch)
 FORWARD_ANY_OWNERSHIP(Return)
 
-// FIXME: Tuple, Struct, and Destructure should be reborrows because the
-// borrowed value is different on either side of the operation and the lifetimes
-// of borrowed members could differ.
+// FIXME: Guaranteed Tuple, Struct, and Destructure should be Reborrow, not
+// ForwardingBorrow, because the borrowed value is different on either side of
+// the operation and the lifetimes of borrowed members could differ.
 FORWARD_ANY_OWNERSHIP(Tuple)
 FORWARD_ANY_OWNERSHIP(Struct)
 FORWARD_ANY_OWNERSHIP(DestructureStruct)

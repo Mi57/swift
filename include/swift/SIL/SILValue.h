@@ -696,6 +696,8 @@ getOwnershipConstraint(OperandOwnership operandOwnership) {
   case OperandOwnership::PointerEscape:
   case OperandOwnership::BitwiseEscape:
     return {OwnershipKind::Any, UseLifetimeConstraint::NonLifetimeEnding};
+  case OperandOwnership::ForwardingUnowned:
+    return {OwnershipKind::Unowned, UseLifetimeConstraint::NonLifetimeEnding};
   case OperandOwnership::Borrow:
     return {OwnershipKind::Owned, UseLifetimeConstraint::NonLifetimeEnding};
   case OperandOwnership::DestroyingConsume:
@@ -725,7 +727,7 @@ ValueOwnershipKind::getForwardingOperandOwnership() const {
   case OwnershipKind::None:
     return OperandOwnership::None;
   case OwnershipKind::Unowned:
-    return OperandOwnership::InstantaneousUse;
+    return OperandOwnership::ForwardingUnowned;
   case OwnershipKind::Guaranteed:
     return OperandOwnership::ForwardingBorrow;
   case OwnershipKind::Owned:
