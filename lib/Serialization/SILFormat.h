@@ -361,6 +361,16 @@ namespace sil_block {
     BCArray<ValueIDField>
   >;
 
+  // SIL instructions with one type, ownership, and a list of values.
+  using SILOneTypeOwnershipValuesLayout = BCRecordLayout<
+    SIL_ONE_TYPE_VALUES,
+    SILInstOpCodeField,
+    BCFixed<2>,          // Ownership kind
+    TypeIDField,
+    SILTypeCategoryField,
+    BCArray<ValueIDField>
+  >;
+
   enum ApplyKind : unsigned {
     SIL_APPLY = 0,
     SIL_PARTIAL_APPLY,

@@ -1906,6 +1906,7 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     assert(RecordKind == SIL_ONE_OPERAND && "Layout should be OneOperand.");
     SILValue Operand = getLocalValue(
         ValID, getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn));
+    auto ownership = ValueOwnershipKind(Attr);
     ResultInst = Builder.createDestructureTuple(Loc, Operand);
     break;
   }

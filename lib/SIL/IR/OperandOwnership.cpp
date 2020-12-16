@@ -303,8 +303,8 @@ FORWARD_ANY_OWNERSHIP(CheckedCastBranch)
 FORWARD_ANY_OWNERSHIP(Return)
 
 // FIXME: Tuple, Struct, and Destructure should be reborrows because the
-// borrowed value is different on either side of the operation and the lifetimes
-// of borrowed members could differ.
+// borrowed value is different on either side of the operation. The lifetimes
+// of borrowed members could differ, and the ownership could differ.
 FORWARD_ANY_OWNERSHIP(Tuple)
 FORWARD_ANY_OWNERSHIP(Struct)
 FORWARD_ANY_OWNERSHIP(DestructureStruct)

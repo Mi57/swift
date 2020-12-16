@@ -1330,8 +1330,6 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
   ALWAYS_LOADABLE_CHECKED_REF_STORAGE(Name, "...")
 #include "swift/AST/ReferenceStorage.def"
   case SILInstructionKind::RetainValueInst:
-  case SILInstructionKind::DestructureStructInst:
-  case SILInstructionKind::DestructureTupleInst:
   case SILInstructionKind::RetainValueAddrInst:
   case SILInstructionKind::UnmanagedRetainValueInst:
   case SILInstructionKind::EndBorrowInst:
@@ -1365,7 +1363,6 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
   case SILInstructionKind::AbortApplyInst:
   case SILInstructionKind::EndApplyInst:
   case SILInstructionKind::ReturnInst:
-  case SILInstructionKind::UncheckedOwnershipConversionInst:
   case SILInstructionKind::IsEscapingClosureInst:
   case SILInstructionKind::ThrowInst: {
     unsigned Attr = 0;
@@ -1389,6 +1386,14 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
       Attr = ECMI->doKeepUnique();
     }
     writeOneOperandLayout(SI.getKind(), Attr, SI.getOperand(0));
+    break;
+  }
+  case SILInstructionKind::DestructureStructInst:
+  case SILInstructionKind::DestructureTupleInst:
+  case SILInstructionKind::UncheckedOwnershipConversionInst: {
+    auto *svi = cast<SingleValueInstruction>(&SI);
+    unsigned attr = unsigned(svi.getOwnershipKind());
+    writeOneOperandLayout(svi->getKind(), attr, svi->getOperand(0));
     break;
   }
   case SILInstructionKind::MarkUninitializedInst: {
@@ -1946,9 +1951,10 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
       ListOfValues.push_back(addValueRef(Elt));
     }
 
-    SILOneTypeValuesLayout::emitRecord(Out, ScratchRecord,
+    SILOneTypeOwnershipValuesLayout::emitRecord(Out, ScratchRecord,
         SILAbbrCodes[SILOneTypeValuesLayout::Code],
         (unsigned)SI.getKind(),
+        (unsigned)StrI->getOwnershipKind(),
         S.addTypeRef(StrI->getType().getASTType()),
         (unsigned)StrI->getType().getCategory(), ListOfValues);
     break;
@@ -1983,14 +1989,16 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
     // Format: a type followed by a list of values. A value is expressed by
     // 2 IDs: ValueID, ValueResultNumber.
     const TupleInst *TI = cast<TupleInst>(&SI);
+
     SmallVector<ValueID, 4> ListOfValues;
     for (auto Elt : TI->getElements()) {
       ListOfValues.push_back(addValueRef(Elt));
     }
 
     unsigned abbrCode = SILAbbrCodes[SILOneTypeValuesLayout::Code];
-    SILOneTypeValuesLayout::emitRecord(Out, ScratchRecord, abbrCode,
+    SILOneTypeOwnershipValuesLayout::emitRecord(Out, ScratchRecord, abbrCode,
         (unsigned)SI.getKind(),
+        (unsigned)TI->getOwnershipKind(),
         S.addTypeRef(TI->getType().getASTType()),
         (unsigned)TI->getType().getCategory(),
         ListOfValues);
