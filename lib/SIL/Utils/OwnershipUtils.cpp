@@ -60,7 +60,10 @@ static bool isOwnershipForwardingValueKind(SILNodeKind kind) {
 // These operations forward guaranteed ownership, but don't necessarily forward
 // owned values.
 //
-// FIXME: replace this with a check on OperandOwnership.
+// WARNING: whether this operation actually forwards a guaranteed value depends
+// on its result's ownwership kind, not the ownership kind of its
+// operand. e.g. when the result is Unowned, the operand is an InstantaneousUse,
+// not a ForwardedBorrow.
 static bool isGuaranteedForwardingValueKind(SILNodeKind kind) {
   switch (kind) {
   case SILNodeKind::TupleExtractInst:
@@ -114,6 +117,9 @@ bool swift::isOwnedForwardingValue(SILValue value) {
 }
 
 bool swift::isGuaranteedForwardingValue(SILValue value) {
+  assert(value.getOwnershipKind() == OwnershipKind::Guaranteed &&
+         "only forwards when the result is guaranteed, regardless of operand");
+
   // If we have an argument from a transforming terminator, we can forward
   // guaranteed.
   if (auto *arg = dyn_cast<SILArgument>(value))
@@ -133,14 +139,7 @@ bool swift::isGuaranteedForwardingValue(SILValue value) {
 }
 
 bool swift::isGuaranteedForwardingUse(Operand *use) {
-  auto *user = use->getUser();
-  auto kind = SILNodeKind(user->getKind());
-  bool result = isGuaranteedForwardingValueKind(kind);
-  if (result) {
-    assert(!isa<OwnedFirstArgForwardingSingleValueInst>(user));
-    assert(isa<OwnershipForwardingInst>(user));
-  }
-  return result;
+  return use->getOperandOwnership() == OperandOwnership::ForwardedBorrow;
 }
 
 bool swift::isOwnershipForwardingUse(Operand *use) {
