@@ -26,7 +26,7 @@ using namespace swift;
 namespace {
 
 class OperandOwnershipClassifier
-    : public SILInstructionVisitor<OperandOwnershipClassifier, OperandOwnership> {
+  : public SILInstructionVisitor<OperandOwnershipClassifier, OperandOwnership> {
   LLVM_ATTRIBUTE_UNUSED SILModule &mod;
 
   const Operand &op;
@@ -252,10 +252,10 @@ OPERAND_OWNERSHIP(InteriorPointer, OpenExistentialBoxValue)
 OPERAND_OWNERSHIP(InteriorPointer, HopToExecutor)
 
 // Instructions that propagate a value value within a borrow scope.
-OPERAND_OWNERSHIP(ForwardedBorrow, TupleExtract)
-OPERAND_OWNERSHIP(ForwardedBorrow, StructExtract)
-OPERAND_OWNERSHIP(ForwardedBorrow, DifferentiableFunctionExtract)
-OPERAND_OWNERSHIP(ForwardedBorrow, LinearFunctionExtract)
+OPERAND_OWNERSHIP(ForwardingBorrow, TupleExtract)
+OPERAND_OWNERSHIP(ForwardingBorrow, StructExtract)
+OPERAND_OWNERSHIP(ForwardingBorrow, DifferentiableFunctionExtract)
+OPERAND_OWNERSHIP(ForwardingBorrow, LinearFunctionExtract)
 
 OPERAND_OWNERSHIP(EndBorrow, EndBorrow)
 
@@ -277,7 +277,7 @@ OPERAND_OWNERSHIP(EndBorrow, EndBorrow)
 
 #undef OPERAND_OWNERSHIP
 
-// Conditionally either ForwardingConsume or ForwardedBorrow, depending on
+// Conditionally either ForwardingConsume or ForwardingBorrow, depending on
 // instruction result's dynamic ownership kind.
 #define FORWARD_ANY_OWNERSHIP(INST)                                            \
   OperandOwnership                                                             \
@@ -359,7 +359,7 @@ OperandOwnership OperandOwnershipClassifier::visitBranchInst(BranchInst *bi) {
 OperandOwnership
 OperandOwnershipClassifier::visitStoreBorrowInst(StoreBorrowInst *i) {
   if (getValue() == i->getSrc()) {
-    return OperandOwnership::ForwardedBorrow;
+    return OperandOwnership::ForwardingBorrow;
   }
   return OperandOwnership::None;
 }
@@ -402,7 +402,7 @@ OperandOwnershipClassifier::visitFullApply(FullApplySite apply) {
 
   // Allow passing callee operands with no ownership as guaranteed.
   // FIXME: why do we allow this?
-  if (operandOwnership == OperandOwnership::ForwardedBorrow
+  if (operandOwnership == OperandOwnership::ForwardingBorrow
       && apply.isCalleeOperand(op)) {
     return OperandOwnership::InstantaneousUse;
   }
@@ -680,13 +680,13 @@ BUILTIN_OPERAND_OWNERSHIP(ForwardingConsume, UnsafeGuaranteed)
 // propagate lifetime through a pointer, they should probably InteriorPointer,
 // otherwise, they should be InstantaneousUse and should not require a
 // guaranteed value.
-BUILTIN_OPERAND_OWNERSHIP(ForwardedBorrow, CancelAsyncTask)
-BUILTIN_OPERAND_OWNERSHIP(ForwardedBorrow, CreateAsyncTask)
-BUILTIN_OPERAND_OWNERSHIP(ForwardedBorrow, CreateAsyncTaskFuture)
-BUILTIN_OPERAND_OWNERSHIP(ForwardedBorrow, InitializeDefaultActor)
-BUILTIN_OPERAND_OWNERSHIP(ForwardedBorrow, DestroyDefaultActor)
-BUILTIN_OPERAND_OWNERSHIP(ForwardedBorrow, AutoDiffAllocateSubcontext)
-BUILTIN_OPERAND_OWNERSHIP(ForwardedBorrow, AutoDiffProjectTopLevelSubcontext)
+BUILTIN_OPERAND_OWNERSHIP(ForwardingBorrow, CancelAsyncTask)
+BUILTIN_OPERAND_OWNERSHIP(ForwardingBorrow, CreateAsyncTask)
+BUILTIN_OPERAND_OWNERSHIP(ForwardingBorrow, CreateAsyncTaskFuture)
+BUILTIN_OPERAND_OWNERSHIP(ForwardingBorrow, InitializeDefaultActor)
+BUILTIN_OPERAND_OWNERSHIP(ForwardingBorrow, DestroyDefaultActor)
+BUILTIN_OPERAND_OWNERSHIP(ForwardingBorrow, AutoDiffAllocateSubcontext)
+BUILTIN_OPERAND_OWNERSHIP(ForwardingBorrow, AutoDiffProjectTopLevelSubcontext)
 
 // FIXME: ConvertTaskToJob is documented as taking NativePointer. It's operand's
 // ownership should be 'None'.

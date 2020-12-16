@@ -640,6 +640,11 @@ enum class OperandOwnership {
   /// (ref_to_unowned, unchecked_trivial_bitcast)
   BitwiseEscape,
 
+  /// MARK: Uses of Unowned values:
+
+  /// Forwarding instruction with an Unowned result must have Unowned operands.
+  ForwardingUnowned,
+
   /// MARK: Uses of Owned values:
 
   /// Borrow. Propagates the owned value within a scope, without consuming it.
@@ -665,7 +670,7 @@ enum class OperandOwnership {
   /// Forwarded Borrow. Propagates the guaranteed value within the base's
   /// borrow scope.
   /// (tuple_extract, struct_extract, cast, switch)
-  ForwardedBorrow,
+  ForwardingBorrow,
   /// End Borrow. End the borrow scope opened directly by the operand.
   /// The operand must be a begin_borrow, begin_apply, or function argument.
   /// (end_borrow, end_apply)
@@ -698,7 +703,7 @@ getOwnershipConstraint(OperandOwnership operandOwnership) {
     return {OwnershipKind::Owned, UseLifetimeConstraint::LifetimeEnding};
   case OperandOwnership::NestedBorrow:
   case OperandOwnership::InteriorPointer:
-  case OperandOwnership::ForwardedBorrow:
+  case OperandOwnership::ForwardingBorrow:
     return {OwnershipKind::Guaranteed,
             UseLifetimeConstraint::NonLifetimeEnding};
   case OperandOwnership::EndBorrow:
@@ -722,7 +727,7 @@ ValueOwnershipKind::getForwardingOperandOwnership() const {
   case OwnershipKind::Unowned:
     return OperandOwnership::InstantaneousUse;
   case OwnershipKind::Guaranteed:
-    return OperandOwnership::ForwardedBorrow;
+    return OperandOwnership::ForwardingBorrow;
   case OwnershipKind::Owned:
     return OperandOwnership::ForwardingConsume;
   }

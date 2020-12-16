@@ -134,7 +134,7 @@ bool swift::isGuaranteedForwardingValue(SILValue value) {
 }
 
 bool swift::isGuaranteedForwardingUse(Operand *use) {
-  return use->getOperandOwnership() == OperandOwnership::ForwardedBorrow;
+  return use->getOperandOwnership() == OperandOwnership::ForwardingBorrow;
 }
 
 bool swift::isOwnershipForwardingUse(Operand *use) {

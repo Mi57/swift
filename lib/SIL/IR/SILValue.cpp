@@ -399,7 +399,7 @@ llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &os,
   case OperandOwnership::InteriorPointer:
     os << "interior-pointer";
     break;
-  case OperandOwnership::ForwardedBorrow:
+  case OperandOwnership::ForwardingBorrow:
     os << "forwarded-borrow";
     break;
   case OperandOwnership::EndBorrow:
