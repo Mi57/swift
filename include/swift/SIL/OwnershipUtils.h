@@ -46,6 +46,8 @@ bool isOwnedForwardingUse(Operand *use);
 
 /// Is this a value that is the result of an instruction that forwards
 /// guaranteed ownership from one of its operands.
+///
+/// Precondition: value has guaranteed ownership.
 bool isGuaranteedForwardingValue(SILValue value);
 
 /// Is this value the result of an instruction that 'forward's owned ownership,

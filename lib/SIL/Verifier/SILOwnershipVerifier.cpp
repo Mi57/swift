@@ -557,8 +557,8 @@ bool SILValueOwnershipChecker::checkValueWithoutLifetimeEndingUses(
   // Check if we are a guaranteed subobject. In such a case, we should never
   // have lifetime ending uses, since our lifetime is guaranteed by our
   // operand, so there is nothing further to do. So just return true.
-  if (isGuaranteedForwardingValue(value) &&
-      value.getOwnershipKind() == OwnershipKind::Guaranteed)
+  if (value.getOwnershipKind() == OwnershipKind::Guaranteed
+      && isGuaranteedForwardingValue(value))
     return true;
 
   // If we have an unowned value, then again there is nothing left to do.
@@ -676,8 +676,8 @@ bool SILValueOwnershipChecker::checkUses() {
   // Check if we are an instruction that forwards forwards guaranteed
   // ownership. In such a case, we are a subobject projection. We should not
   // have any lifetime ending uses.
-  if (isGuaranteedForwardingValue(value) &&
-      value.getOwnershipKind() == OwnershipKind::Guaranteed) {
+  if (value.getOwnershipKind() == OwnershipKind::Guaranteed
+      && isGuaranteedForwardingValue(value)) {
     if (!isSubobjectProjectionWithLifetimeEndingUses(value,
                                                      lifetimeEndingUsers)) {
       return false;
