@@ -407,7 +407,7 @@ static OperandOwnership getFunctionArgOwnership(SILArgumentConvention argConv,
   // owned values may be passed to guaranteed arguments without an explicit
   // borrow scope in the caller. In contrast, a begin_apply /does/ have an
   // explicit borrow scope in the caller so we must treat arguments passed to it
-  // as being borrowed for the entire borrow scope.
+  // as being borrowed for the entire region of coroutine execution.
   case SILArgumentConvention::Indirect_In_Constant:
   case SILArgumentConvention::Indirect_In_Guaranteed:
   case SILArgumentConvention::Direct_Guaranteed:
@@ -773,10 +773,8 @@ OperandOwnership OperandOwnershipClassifier::visitBuiltinInst(BuiltinInst *bi) {
 //===----------------------------------------------------------------------===//
 
 OperandOwnership Operand::getOperandOwnership() const {
-  // NOTE: NonUse distinguishes itself from InstantaneousUse because it does not
-  // require liveness. Discrimating such uses in the enum avoids the need to
-  // return an Optional<OperandOwnership>::None, which could be confused with
-  // OwnershipKind::None.
+  // A type-dependent operant is a NonUse (as opposed to say an
+  // InstantaneousUse) because it does not require liveness.
   if (isTypeDependent())
     return OperandOwnership::NonUse;
 
