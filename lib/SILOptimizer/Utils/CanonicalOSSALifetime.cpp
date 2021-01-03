@@ -146,6 +146,18 @@ static bool computeCanonicalLiveness(CanonicalOSSALifetimeState &lifetime) {
         defUseWorkList.insert(copy);
         continue;
       }
+      // Handle debug_value instructions separately.
+      if (lifetime.pruneDebug) {
+        if (auto *dvi = dyn_cast<DebugValueInst>(user)) {
+          // Only instructions potentially outside current pruned liveness are
+          // insteresting.
+          if (lifetime.getBlockLiveness(dvi->getParent())
+              != PrunedLiveBlocks::LiveOut) {
+            lifetime.recordDebugValue(dvi);
+          }
+          continue;
+        }
+      }
       switch (use->getOperandOwnership()) {
       case OperandOwnership::NonUse:
         continue;
@@ -253,6 +265,13 @@ static void findOrInsertDestroyInBlock(SILBasicBlock *bb,
   auto instIter = bb->getTerminator()->getIterator();
   while (true) {
     auto *inst = &*instIter;
+
+    if (lifetime.pruneDebug) {
+      if (auto *dvi = dyn_cast<DebugValueInst>(inst)) {
+        if (lifetime.debugValues.erase(dvi))
+          lifetime.consumes.recordDebugAfterConsume(dvi);
+      }
+    }
     switch (lifetime.isInterestingUser(inst)) {
     case CanonicalOSSALifetimeState::NonUser:
       break;
@@ -339,6 +358,11 @@ static void findOrInsertDestroys(CanonicalOSSALifetimeState &lifetime) {
       }
       break;
     }
+  }
+  // Add any debug_values from Dead blocks into the debugAfterConsume set.
+  for (auto *dvi : lifetime.debugValues) {
+    if (lifetime.getBlockLiveness(dvi->getParent()) == PrunedLiveBlocks::Dead)
+      lifetime.consumes.recordDebugAfterConsume(dvi);
   }
 }
 
@@ -435,7 +459,14 @@ static bool rewriteCopies(SILValue def, CanonicalOSSAConsumeInfo &consumes) {
       }
     }
   }
-  assert(consumes.empty());
+  assert(!consumes.hasUnclaimedConsumes());
+
+  // Remove any dead debug_values.
+  for (auto *dvi : consumes.getDebugInstsAfterConsume()) {
+    llvm::dbgs() << "  Removing debug_value: " << *dvi;
+    dvi->eraseFromParent();
+  }
+  consumes.clear();
 
   // Remove the leftover copy_value and destroy_value instructions.
   if (!instsToDelete.empty()) {

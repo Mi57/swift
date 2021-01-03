@@ -59,13 +59,19 @@ bool canonicalizeValueLifetime(SILValue def,
 /// This result remains valid during copy rewriting. The only instructions
 /// referenced it contains are consumes that cannot be deleted.
 class CanonicalOSSAConsumeInfo {
-  // Map blocks on the lifetime boundary to the last consuming instruction.
+  /// Map blocks on the lifetime boundary to the last consuming instruction.
   llvm::SmallDenseMap<SILBasicBlock *, SILInstruction *, 4> finalBlockConsumes;
 
-public:
-  bool empty() const { return finalBlockConsumes.empty(); }
+  /// Record any debug_value instructions found after a final consume.
+  SmallVector<DebugValueInst *, 8> debugAfterConsume;
 
-  void clear() { finalBlockConsumes.clear(); }
+public:
+  bool hasUnclaimedConsumes() const { return !finalBlockConsumes.empty(); }
+
+  void clear() {
+    finalBlockConsumes.clear();
+    debugAfterConsume.clear();
+  }
 
   void recordFinalConsume(SILInstruction *inst) {
     assert(!finalBlockConsumes.count(inst->getParent()));
@@ -83,6 +89,16 @@ public:
       return true;
     }
     return false;
+  }
+
+  /// Record a debug_value that is known to be outside pruned liveness. Assumes
+  /// that instructions are only visited once.
+  void recordDebugAfterConsume(DebugValueInst *dvi) {
+    debugAfterConsume.push_back(dvi);
+  }
+
+  ArrayRef<DebugValueInst *> getDebugInstsAfterConsume() const {
+    return debugAfterConsume;
   }
 
   SWIFT_ASSERT_ONLY_DECL(void dump() const LLVM_ATTRIBUTE_USED);
@@ -107,6 +123,10 @@ struct CanonicalOSSALifetimeState {
     }
   }
 
+  /// If true, then debug_value instructions outside of non-debug
+  /// liveness may be pruned during canonicalization.
+  bool pruneDebug;
+
   /// Current copied def for which this state describes the liveness.
   SILValue currentDef;
 
@@ -128,8 +148,15 @@ struct CanonicalOSSALifetimeState {
   /// pruned liveness does not consider destroy_values.
   SmallSetVector<SILBasicBlock *, 8> lifetimeEndBlocks;
 
+  /// Record all interesting debug_value instructions here rather then treating
+  /// them like a normal use. An interesting debug_value is one that may lie
+  /// outisde the pruned liveness at the time it is discovered.
+  llvm::SmallDenseSet<DebugValueInst *, 8> debugValues;
+
 public:
   CanonicalOSSAConsumeInfo consumes;
+
+  CanonicalOSSALifetimeState(bool pruneDebug): pruneDebug(pruneDebug) {}
 
   SILValue def() const { return currentDef; }
 
@@ -176,6 +203,10 @@ public:
     case PrunedLiveness::LifetimeEndingUse:
       return ConsumingUse;
     }
+  }
+
+  void recordDebugValue(DebugValueInst *dvi) {
+    debugValues.insert(dvi);
   }
 
   void recordLifetimeEnd(Operand *use) {
