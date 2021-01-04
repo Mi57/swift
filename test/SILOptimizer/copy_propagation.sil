@@ -1,4 +1,5 @@
-// RUN: %target-sil-opt -copy-propagation -enable-sil-opaque-values -enable-sil-verify-all %s | %FileCheck %s
+// RUN: %target-sil-opt -copy-propagation -canonical-ossa-rewrite-borrows -enable-sil-opaque-values -enable-sil-verify-all %s | %FileCheck %s --check-prefixes=CHECK,CHECK-OPT
+// RUN: %target-sil-opt -mandatory-copy-propagation -canonical-ossa-rewrite-borrows -enable-sil-opaque-values -enable-sil-verify-all %s | %FileCheck %s --check-prefixes=CHECK,CHECK-DEBUG
 
 sil_stage canonical
 
@@ -28,7 +29,7 @@ bb0(%0 : @guaranteed $T):
   return %2 : $T
 }
 
-// CHECK: sil [ossa] @multiReturnValue : $@convention(thin) <T> (@in_guaranteed T) -> (@out T, @out T) {
+// CHECK-LABEL: sil [ossa] @multiReturnValue : $@convention(thin) <T> (@in_guaranteed T) -> (@out T, @out T) {
 // CHECK: bb0(%0 : @guaranteed $T):
 // CHECK-NOT: destroy
 // CHECK:   [[CPY1:%.*]] = copy_value %0 : $T
@@ -113,23 +114,22 @@ bb3(%11 : @owned $T):
 // CHECK-LABEL: sil [ossa] @testConsume : $@convention(thin) <T> (@in T, @inout T) -> () {
 // CHECK: bb0(%0 : @owned $T, %1 : $*T):
 //
-// The original copy_value is deleted.
-// CHECK-NEXT:   debug_value %0 : $T
+// Mandatory opt reuses the original copy for the consuming store.
+// CHECK-DEBUG-NEXT:   [[STOREVAL:%.*]] = copy_value %0 : $T
 //
-// A new copy_value is inserted before the consuming store.
-// CHECK-NEXT:   %3 = copy_value %0 : $T
-// CHECK-NEXT:   store %3 to [assign] %1 : $*T
+// CHECK-NEXT:   debug_value %0 : $T
+// CHECK-DEBUG-NEXT: store [[STOREVAL]] to [assign] %1 : $*T
+// CHECK-OPT-NEXT:   store %0 to [assign] %1 : $*T
 //
 // The non-consuming use now uses the original value.
-// CHECK-NEXT:   debug_value %0 : $T
+// CHECK-DEBUG-NEXT:   debug_value %0 : $T
 //
-// A new destroy is inserted after the last use.
-// CHECK-NEXT:   destroy_value %0 : $T
 // CHECK-NEXT:   debug_value_addr %1 : $*T
 //
-// The original destroy is deleted.
-// CHECK-NEXT:   %8 = tuple ()
-// CHECK-NEXT:   return %8 : $()
+// The original destroy is deleted with optimizations enabled.
+// CHECK-DEBUG-NEXT:   destroy_value %0 : $T
+// CHECK-NEXT:   tuple ()
+// CHECK-NEXT:   return
 // CHECK-LABEL: // end sil function 'testConsume'
 sil [ossa] @testConsume : $@convention(thin) <T> (@in T, @inout T) -> () {
 bb0(%arg : @owned $T, %addr : $*T):
@@ -145,24 +145,23 @@ bb0(%arg : @owned $T, %addr : $*T):
 
 // CHECK-LABEL: sil [ossa] @testDestroyEdge : $@convention(thin) <T> (@in T, @inout T, Builtin.Int1) -> () {
 // CHECK: bb0(%0 : @owned $T, %1 : $*T, %2 : $Builtin.Int1):
-// CHECK-NEXT:   cond_br %2, bb2, bb1
+// CHECK-OPT-NEXT:   destroy_value %0 : $T
+// CHECK-DEBUG-NEXT: cond_br %2, bb2, bb1
 //
 // CHECK: bb1:
-//
-// The critical edge is split.
-// CHECK-NEXT:   destroy_value %0 : $T
-// CHECK-NEXT:   br bb3
+// CHECK-DEBUG-NEXT: destroy_value %0 : $T
+// CHECK-NEXT:     br bb3
 //
 // CHECK: bb2:
-// The original copy is deleted.
-// CHECK-NEXT:   debug_value %0 : $T
-// CHECK-NEXT:   destroy_value %0 : $T
+// The original copy is deleted in both cases.
+// CHECK-DEBUG-NEXT:   debug_value %0 : $T
+// CHECK-DEBUG-NEXT:   destroy_value %0 : $T
 // CHECK-NEXT:   br bb3
 //
 // CHECK: bb3:
-// The original destroy is deleted.
-// CHECK-NEXT:   %9 = tuple ()
-// CHECK-NEXT:   return %9 : $()
+// The original destroy is deleted in both cases.
+// CHECK-NEXT:   tuple ()
+// CHECK-NEXT:   return
 // CHECK-LABEL: } // end sil function 'testDestroyEdge'
 sil [ossa] @testDestroyEdge : $@convention(thin) <T> (@in T, @inout T, Builtin.Int1) -> () {
 bb0(%arg : @owned $T, %addr : $*T, %z : $Builtin.Int1):
@@ -190,9 +189,9 @@ sil [ossa] @takeGuaranteedAndOwnedArg : $@convention(thin) <T> (@in_guaranteed T
 //
 // CHECK-LABEL: sil [ossa] @testGuaranteedAndOwnedArg : $@convention(thin) <T> (@in T) -> () {
 // CHECK: bb0(%0 : @owned $T):
+// CHECK-NEXT: [[CPY:%.*]] = copy_value %0 : $T
 // CHECK-NEXT: // function_ref takeGuaranteedAndOwnedArg
 // CHECK-NEXT: function_ref @takeGuaranteedAndOwnedArg : $@convention(thin) <τ_0_0> (@in_guaranteed τ_0_0, @in τ_0_0) -> ()
-// CHECK-NEXT: [[CPY:%.*]] = copy_value %0 : $T
 // CHECK-NEXT: apply %{{.*}}<T>(%0, [[CPY]]) : $@convention(thin) <τ_0_0> (@in_guaranteed τ_0_0, @in τ_0_0) -> ()
 // CHECK-NEXT: destroy_value %0 : $T
 // CHECK-NEXT: return %{{.*}} : $()

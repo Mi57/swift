@@ -66,15 +66,21 @@ void CopyPropagation::run() {
     for (auto &i : bb) {
       if (auto *copy = dyn_cast<CopyValueInst>(&i))
         copiedDefs.insert(
-          CanonicalOSSALifetimeState::getCanonicalCopiedDef(copy));
+            CanonicalizeOSSALifetime::getCanonicalCopiedDef(copy));
     }
   }
   // Perform copy propgation for each copied value.
-  CanonicalOSSALifetimeState lifetime(pruneDebug);
+  CanonicalizeOSSALifetime canonicalizer(pruneDebug);
   for (auto &def : copiedDefs) {
-    canonicalizeValueLifetime(def, lifetime);
+    canonicalizer.canonicalizeValueLifetime(def);
+    if (SILValue outerCopy = canonicalizer.createdOuterCopy()) {
+      SILValue outerDef = canonicalizer.getCanonicalCopiedDef(outerCopy);
+      canonicalizer.canonicalizeValueLifetime(outerDef);
+    }
+    // TODO: also canonicalize any lifetime.persistentCopies like separate owned
+    // live ranges.
   }
-  if (lifetime.changed) {
+  if (canonicalizer.hasChanged()) {
     invalidateAnalysis(SILAnalysis::InvalidationKind::Instructions);
     DeadEndBlocks deBlocks(f);
     f->verifyOwnership(&deBlocks);

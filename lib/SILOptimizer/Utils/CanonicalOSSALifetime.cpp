@@ -12,98 +12,26 @@
 ///
 /// This top-level API rewrites the extended lifetime of a SILValue:
 ///
-///     bool canonicalizeValueLifetime(SILValue def,
-///                                    CanonicalOSSALifetimeState&)
+///     bool CanonicalizeOSSALifetime::canonicalizeValueLifetime(SILValue def)
 ///
 /// Each time it's called on a single OSSA value, `def`, it performs three
 /// steps:
 ///
 /// 1. Compute "pruned" liveness of def and its copies, ignoring original
-///    destroys.
+///    destroys. Initializes `liveness`.
 ///
-/// 2. Find `def`s final destroy points based on its pruned liveness.
-///
-/// 3. Rewrite `def`s original copies and destroys, inserting new copies
-/// where needed.
-///
-/// The state used by this transformation is encapsulated in
-/// CanonicalOSSALifetimeState, simply refered to as `lifetime`:
-///
-/// - Step 1 initializes `lifetime.liveBlocks`.
-///
-/// - Step 2 initializes `lifetime.consumes` and inserts new destroy_value
+/// 2. Find `def`s final destroy points based on its pruned
+///   liveness. Initializes `consumes` and inserts new destroy_value
 ///   instructions.
 ///
-/// - Step 3 deletes original copies and destroys and inserts new copies.
+/// 3. Rewrite `def`s original copies and destroys, inserting new copies
+/// where needed. Deletes original copies and destroys and inserts new copies.
 ///
-/// Example #1: Handle consuming and nonconsuming uses.
+/// See CanonicalOSSALifetime.h for examples.
 ///
-///     bb0(%arg : @owned $T, %addr : @trivial $*T):
-///       %copy = copy_value %arg : $T
-///       debug_value %copy : $T
-///       store %copy to [init] %addr : $*T
-///       debug_value %arg : $T
-///       debug_value_addr %addr : $*T
-///       destroy_value %arg : $T
-///
-/// Will be transformed to:
-///
-///     bb0(%arg : @owned $T, %addr : @trivial $*T):
-///       // The original copy is deleted.
-///       debug_value %arg : $T
-///       // A new copy_value is inserted before the consuming store.
-///       %copy = copy_value %arg : $T
-///       store %copy to [init] %addr : $*T
-///       // The non-consuming use now uses the original value.
-///       debug_value %arg : $T
-///       // A new destroy is inserted after the last use.
-///       destroy_value %arg : $T
-///       debug_value_addr %addr : $*T
-///       // The original destroy is deleted.
-///
-/// Example #2: Handle control flow.
-///
-///     bb0(%arg : @owned $T):
-///       cond_br %_, bb1, bb2
-///     bb1:
-///       br bb3
-///     bb2:
-///       debug_value %arg : $T
-///       %copy = copy_value %arg : $T
-///       destroy_value %copy : $T
-///       br bb3
-///     bb3:
-///       destroy_value %arg : $T
-///
-/// Will be transformed to:
-///
-///     bb0(%arg : @owned $T):
-///       cond_br %_, bb1, bb2
-///     bb1:
-///       destroy_value %arg : $T
-///       br bb3
-///     bb2:
-///       // The original copy is deleted.
-///       debug_value %arg : $T
-///       destroy_value %arg : $T
-///       br bb3
-///     bb2:
-///       // The original destroy is deleted.
-///
-///
-/// TODO: Guaranteed Values...
-///
-/// CanonicalOSSALifetimeState is currently limited to owned values, but will be
-/// extended canonicalize guaranteed values. To handle copies of guaranteed
-/// values, pruned liveness will first be computed for the guaranteed
-/// scope. Then a second pruned liveness will be computed for all the uses
-/// exactly as done for owned values. If any uses are outside the scope, then a
-/// single copy at the beginning of that scope will provide an owned value to
-/// all those uses. Destroy placement will then proceed exactly as it does for
-/// owned values. Finally, copy rewriting will proceed just as it does for owned
-/// values, inserting a copy for any consuming use within the lifetime. The only
-/// difference is that uses within the borrow scope will use the borrowed value,
-/// and uses outside will use the copy of the borrow.
+/// TODO: Enable canonical-ossa-rewrite-borrows to rewrite single-block borrows.
+/// Add support for multi-block borrows, load_borrow, and phi by using
+/// persistentCopies.
 ///
 /// TODO: If all client passes can maintain block numbers, then the
 /// SmallDenseMaps/SetVectors can be replaced with bitsets/sparsesets.
@@ -130,37 +58,154 @@ STATISTIC(NumDestroysGenerated, "number of destroy_value instructions created");
 STATISTIC(NumUnknownUsers, "number of functions with unknown users");
 
 //===----------------------------------------------------------------------===//
+//                        MARK: Rewrite borrow scopes
+//===----------------------------------------------------------------------===//
+
+llvm::cl::opt<bool>
+    EnableRewriteBorrows("canonical-ossa-rewrite-borrows", llvm::cl::init(true),
+                         llvm::cl::desc("Enable rewriting borrow scopes"));
+
+bool CanonicalizeOSSALifetime::computeBorrowLiveness() {
+  auto borrowedVal = BorrowedValue::get(currentDef);
+  if (!borrowedVal) {
+    return false;
+  }
+  switch (borrowedVal->kind) {
+  case BorrowedValueKind::SILFunctionArgument:
+    // For efficiency, function arguments skip liveness.
+    return true;
+  case BorrowedValueKind::LoadBorrow:
+  case BorrowedValueKind::Phi:
+    // TODO: Canonicalize load_borrow scope and phi once consolidateBorrowScope
+    // can handle persistentCopies.
+    return false;
+  case BorrowedValueKind::BeginBorrow:
+    break;
+  }
+  if (!EnableRewriteBorrows) {
+    return false;
+  }
+  borrowedVal->visitLocalScopeEndingUses([this](Operand *use) {
+    liveness.updateForUse(use, /*lifetimeEnding*/ true);
+  });
+
+  // TODO: Remove this check. Canonicalize multi-block borrow scopes only after
+  // consolidateBorrowScope can handle persistentCopies, otherwise we may end up
+  // generating more dynamic copies than the non-canonical form.
+  if (liveness.numLiveBlocks() > 1) {
+    return false;
+  }
+  return true;
+}
+
+// Create a copy for outer uses of the borrow scope introduced by
+// currentDef. This copy should only be used by outer uses in the same block
+// as the borrow scope.
+//
+// To use an existing outer copy, we could find its earliest consume. But the
+// new copy will immediately canonicalized and a canonical begin_borrow scope
+// have no outside uses of its first block.
+static CopyValueInst *createOuterCopy(BeginBorrowInst *beginBorrow) {
+  SILBuilderWithScope B(beginBorrow);
+
+  auto loc = RegularLocation::getAutoGeneratedLocation(
+      beginBorrow->getLoc().getSourceLoc());
+  auto *copy = B.createCopyValue(loc, beginBorrow->getOperand());
+
+  ++NumCopiesGenerated;
+  LLVM_DEBUG(llvm::dbgs() << "  Outer copy " << *copy);
+
+  return copy;
+}
+
+// TODO: Canonicalize multi-block borrow scopes, load_borrow scope, and phi
+// borrow scopes by adding one copy per block to persistentCopies for
+// each block that dominates an outer use.
+void CanonicalizeOSSALifetime::consolidateBorrowScope() {
+  if (isa<SILFunctionArgument>(currentDef)) {
+    return;
+  }
+  // Gather all outer uses before rewriting any to avoid scanning any basic
+  // block more than once.
+  SmallVector<Operand *, 8> outerUses;
+  llvm::SmallDenseSet<SILInstruction *, 8> outerUseInsts;
+  defUseWorklist.clear();
+  defUseWorklist.insert(currentDef);
+  while (!defUseWorklist.empty()) {
+    SILValue value = defUseWorklist.pop_back_val();
+    for (Operand *use : value->getUses()) {
+      auto *user = use->getUser();
+      // Recurse through copies.
+      if (auto *copy = dyn_cast<CopyValueInst>(user)) {
+        defUseWorklist.insert(copy);
+        continue;
+      }
+      // debug_value uses are handled like normal uses here. They should be
+      // stripped later if required when handling outerCopy or persistentCopies.
+      if (liveness.getBlockLiveness(user->getParent())
+          != PrunedLiveBlocks::LiveOut) {
+        outerUses.push_back(use);
+        outerUseInsts.insert(use->getUser());
+      }
+    }
+  }
+  // Remove outer uses that occur before the end of the borrow scope.
+  auto *beginBorrow = cast<BeginBorrowInst>(currentDef);
+  BorrowedValue::get(beginBorrow)->visitLocalScopeEndingUses([&](Operand *use) {
+    // Forward iterate until we find the end of the borrow scope.
+    auto *endScope = use->getUser();
+    for (auto instIter = beginBorrow->getIterator(),
+              endIter = endScope->getIterator();
+         instIter != endIter; ++instIter) {
+      outerUseInsts.erase(&*instIter);
+    }
+  });
+  if (outerUseInsts.empty()) {
+    return;
+  }
+  // Rewrite the outer uses.
+  this->outerCopy = createOuterCopy(beginBorrow);
+  for (Operand *use : outerUses) {
+    if (!outerUseInsts.count(use->getUser())) {
+      continue;
+    }
+    LLVM_DEBUG(llvm::dbgs() << "  Use of outer copy " << *use->getUser());
+    use->set(outerCopy);
+  }
+}
+
+//===----------------------------------------------------------------------===//
 //                    MARK: Step 1. Compute pruned liveness
 //===----------------------------------------------------------------------===//
 
-static bool computeCanonicalLiveness(CanonicalOSSALifetimeState &lifetime) {
-  SmallSetVector<SILValue, 8> defUseWorkList;
-  defUseWorkList.insert(lifetime.def());
-  while (!defUseWorkList.empty()) {
-    SILValue value = defUseWorkList.pop_back_val();
+bool CanonicalizeOSSALifetime::computeCanonicalLiveness() {
+  defUseWorklist.clear();
+  defUseWorklist.insert(currentDef);
+  while (!defUseWorklist.empty()) {
+    SILValue value = defUseWorklist.pop_back_val();
     for (Operand *use : value->getUses()) {
       auto *user = use->getUser();
 
       // Recurse through copies.
       if (auto *copy = dyn_cast<CopyValueInst>(user)) {
-        defUseWorkList.insert(copy);
+        defUseWorklist.insert(copy);
         continue;
       }
       // Handle debug_value instructions separately.
-      if (lifetime.pruneDebug) {
+      if (pruneDebug) {
         if (auto *dvi = dyn_cast<DebugValueInst>(user)) {
           // Only instructions potentially outside current pruned liveness are
           // insteresting.
-          if (lifetime.getBlockLiveness(dvi->getParent())
+          if (liveness.getBlockLiveness(dvi->getParent())
               != PrunedLiveBlocks::LiveOut) {
-            lifetime.recordDebugValue(dvi);
+            recordDebugValue(dvi);
           }
           continue;
         }
       }
       switch (use->getOperandOwnership()) {
       case OperandOwnership::NonUse:
-        continue;
+        break;
       case OperandOwnership::TrivialUse:
       case OperandOwnership::ForwardingUnowned:
         llvm_unreachable("this operand cannot handle ownership");
@@ -169,36 +214,32 @@ static bool computeCanonicalLiveness(CanonicalOSSALifetimeState &lifetime) {
       case OperandOwnership::InstantaneousUse:
       case OperandOwnership::UnownedInstantaneousUse:
       case OperandOwnership::BitwiseEscape:
-        lifetime.updateLivenessForUse(use);
+        liveness.updateForUse(use, /*lifetimeEnding*/ false);
         break;
       case OperandOwnership::ForwardingConsume:
-        lifetime.recordLifetimeEnd(use);
-        lifetime.updateLivenessForUse(use);
+        recordConsumingUse(use);
+        liveness.updateForUse(use, /*lifetimeEnding*/ true);
         break;
       case OperandOwnership::DestroyingConsume:
         // destroy_value does not force pruned liveness (but store etc. does).
         if (!isa<DestroyValueInst>(user)) {
-          lifetime.updateLivenessForUse(use);
+          liveness.updateForUse(use, /*lifetimeEnding*/ true);
         }
-        lifetime.recordLifetimeEnd(use);
+        recordConsumingUse(use);
         break;
       case OperandOwnership::Borrow:
         // An entire borrow scope is considered a single use that occurs at the
         // point of the end_borrow.
-        BorrowingOperand(use).visitLocalEndScopeUses([&lifetime](Operand *end){
-          lifetime.updateLivenessForUse(end);
+        BorrowingOperand(use).visitLocalEndScopeUses([this](Operand *end) {
+          liveness.updateForUse(end, /*lifetimeEnding*/ false);
           return true;
         });
         break;
       case OperandOwnership::InteriorPointer:
-        // TODO: can be ignored since rewriting does not shrink the borrow scope
       case OperandOwnership::ForwardingBorrow:
-        // TODO: For liveness, handle forwarded borrows like a copy.
       case OperandOwnership::EndBorrow:
       case OperandOwnership::Reborrow:
-        // TODO: record EndBorrow and Reborrow as both a liveness use and
-        // potential lifetime end
-        llvm_unreachable("unexpected guaranteed value");
+        llvm_unreachable("operand kind cannot take an owned value");
       }
     }
   }
@@ -211,46 +252,45 @@ static bool computeCanonicalLiveness(CanonicalOSSALifetimeState &lifetime) {
 //===----------------------------------------------------------------------===//
 
 /// The liveness boundary is at a CFG edge `predBB` -> `succBB`, meaning that
-/// `lifetime.def()` is live out of at least one other `predBB` successor.
+/// `currentDef` is live out of at least one other `predBB` successor.
 ///
 /// Create and record a final destroy_value at the beginning of `succBB`
 /// (assuming no critical edges).
 static void insertDestroyOnCFGEdge(SILBasicBlock *predBB, SILBasicBlock *succBB,
-                                   CanonicalOSSALifetimeState &lifetime) {
+                                   SILValue def,
+                                   CanonicalOSSAConsumeInfo &consumes) {
   assert(succBB->getSinglePredecessorBlock() == predBB
          && "value is live-out on another predBB successor: critical edge?");
 
   SILBuilderWithScope builder(succBB->begin());
   auto loc = RegularLocation::getAutoGeneratedLocation(
     succBB->begin()->getLoc().getSourceLoc());
-  auto *di = builder.createDestroyValue(loc, lifetime.def());
+  auto *di = builder.createDestroyValue(loc, def);
 
-  lifetime.consumes.recordFinalConsume(di);
+  consumes.recordFinalConsume(di);
 
-  lifetime.setChanged();
   ++NumDestroysGenerated;
-  LLVM_DEBUG(llvm::dbgs() << "  Destroy on edge "; di->dump());
+  LLVM_DEBUG(llvm::dbgs() << "  Destroy on edge " << *di);
 }
 
 /// This liveness boundary is within a basic block at the given position.
 ///
 /// Create a final destroy, immediately after `pos`.
 static void insertDestroyAtInst(SILBasicBlock::iterator pos,
-                                DestroyValueInst *existingDestroy,
-                                CanonicalOSSALifetimeState &lifetime) {
+                                DestroyValueInst *existingDestroy, SILValue def,
+                                CanonicalOSSAConsumeInfo &consumes) {
   if (existingDestroy) {
-    lifetime.consumes.recordFinalConsume(existingDestroy);
+    consumes.recordFinalConsume(existingDestroy);
     return;
   }
   SILBuilderWithScope builder(pos);
   auto loc = RegularLocation::getAutoGeneratedLocation(
     (*pos).getLoc().getSourceLoc());
-  auto *di = builder.createDestroyValue(loc, lifetime.def());
-  lifetime.consumes.recordFinalConsume(di);
+  auto *di = builder.createDestroyValue(loc, def);
+  consumes.recordFinalConsume(di);
 
-  lifetime.setChanged();
   ++NumDestroysGenerated;
-  LLVM_DEBUG(llvm::dbgs() << "  Destroy at last use "; di->dump());
+  LLVM_DEBUG(llvm::dbgs() << "  Destroy at last use " << *di);
 }
 
 // The pruned liveness boundary is within the given basic block. Find the
@@ -258,36 +298,38 @@ static void insertDestroyAtInst(SILBasicBlock::iterator pos,
 // destroy. Otherwise, insert a new destroy_value.
 //
 // Return true if a new destroy was inserted.
-static void findOrInsertDestroyInBlock(SILBasicBlock *bb,
-                                       CanonicalOSSALifetimeState &lifetime) {
-  auto *defInst = lifetime.def()->getDefiningInstruction();
+void CanonicalizeOSSALifetime::findOrInsertDestroyInBlock(SILBasicBlock *bb) {
+  auto *defInst = currentDef->getDefiningInstruction();
   DestroyValueInst *existingDestroy = nullptr;
   auto instIter = bb->getTerminator()->getIterator();
   while (true) {
     auto *inst = &*instIter;
 
-    if (lifetime.pruneDebug) {
+    if (pruneDebug) {
       if (auto *dvi = dyn_cast<DebugValueInst>(inst)) {
-        if (lifetime.debugValues.erase(dvi))
-          lifetime.consumes.recordDebugAfterConsume(dvi);
+        if (debugValues.erase(dvi))
+          consumes.recordDebugAfterConsume(dvi);
       }
     }
-    switch (lifetime.isInterestingUser(inst)) {
-    case CanonicalOSSALifetimeState::NonUser:
+    switch (liveness.isInterestingUser(inst)) {
+    case PrunedLiveness::NonUser:
       break;
-    case CanonicalOSSALifetimeState::NonConsumingUse:
+    case PrunedLiveness::NonLifetimeEndingUse:
       // Insert a destroy after this non-consuming use.
       if (inst == bb->getTerminator()) {
         for (auto &succ : bb->getSuccessors()) {
-          insertDestroyOnCFGEdge(bb, succ, lifetime);
+          insertDestroyOnCFGEdge(bb, succ, currentDef, consumes);
+          setChanged();
         }
       } else {
-        insertDestroyAtInst(std::next(instIter), existingDestroy, lifetime);
+        insertDestroyAtInst(std::next(instIter), existingDestroy, currentDef,
+                            consumes);
+        setChanged();
       }
       return;
-    case CanonicalOSSALifetimeState::ConsumingUse:
+    case PrunedLiveness::LifetimeEndingUse:
       // This consuming use becomes a final destroy.
-      lifetime.consumes.recordFinalConsume(inst);
+      consumes.recordFinalConsume(inst);
       return;
     }
     // This is not a potential last user. Keep scanning.
@@ -296,78 +338,82 @@ static void findOrInsertDestroyInBlock(SILBasicBlock *bb,
       existingDestroy = nullptr;
     } else if (!existingDestroy) {
       if (auto *destroy = dyn_cast<DestroyValueInst>(inst)) {
-        auto destroyDef = CanonicalOSSALifetimeState::getCanonicalCopiedDef(
-          destroy->getOperand());
-        if (destroyDef == lifetime.def()) {
+        auto destroyDef = CanonicalizeOSSALifetime::getCanonicalCopiedDef(
+            destroy->getOperand());
+        if (destroyDef == currentDef) {
           existingDestroy = destroy;
         }
       }
     }
     if (instIter == bb->begin()) {
-      assert(cast<SILArgument>(lifetime.def())->getParent() == bb);
-      insertDestroyAtInst(instIter, existingDestroy, lifetime);
+      assert(cast<SILArgument>(currentDef)->getParent() == bb);
+      insertDestroyAtInst(instIter, existingDestroy, currentDef, consumes);
+      setChanged();
       return;
     }
     --instIter;
     // If the original def is reached, this is a dead live range. Insert a
     // destroy immediately after the def.
     if (&*instIter == defInst) {
-      insertDestroyAtInst(std::next(instIter), existingDestroy, lifetime);
+      insertDestroyAtInst(std::next(instIter), existingDestroy, currentDef,
+                          consumes);
+      setChanged();
       return;
     }
   }
 }
 
-/// Populate `lifetime.consumes` with the final destroy points once copies are
+/// Populate `consumes` with the final destroy points once copies are
 /// eliminated. This only applies to owned values.
 ///
 /// Observations:
-/// - lifetime.def() must be postdominated by some subset of its
+/// - currentDef must be postdominated by some subset of its
 ///   consuming uses, including destroys on all return paths.
 /// - The postdominating consumes cannot be within nested loops.
 /// - Any blocks in nested loops are now marked LiveOut.
-static void findOrInsertDestroys(CanonicalOSSALifetimeState &lifetime) {
+void CanonicalizeOSSALifetime::findOrInsertDestroys() {
   // Visit each original consuming use or destroy as the starting point for a
   // backward CFG traversal.
-  auto lifetimeEndBlocks = lifetime.getLifetimeEndBlocks();
-  SmallSetVector<SILBasicBlock *, 8> worklist(lifetimeEndBlocks.begin(),
-                                              lifetimeEndBlocks.end());
+  blockWorklist.clear();
+  blockWorklist.insert(consumingBlocks.begin(), consumingBlocks.end());
   // This worklist is also a visited set, so we never pop the entries.
-  for (unsigned blockIdx = 0; blockIdx < worklist.size(); ++blockIdx) {
+  for (unsigned blockIdx = 0; blockIdx < blockWorklist.size(); ++blockIdx) {
     // Process each block that has not been visited and is not LiveOut.
-    SILBasicBlock *bb = worklist[blockIdx];
-    switch (lifetime.getBlockLiveness(bb)) {
+    SILBasicBlock *bb = blockWorklist[blockIdx];
+    switch (liveness.getBlockLiveness(bb)) {
     case PrunedLiveBlocks::LiveOut:
       // A lifetimeEndBlock may be determined to be LiveOut after analyzing the
-      // extended lifetime. It is irrelevent for finding the boundary.
+      // extended  It is irrelevent for finding the boundary.
       break;
     case PrunedLiveBlocks::LiveWithin: {
       // The liveness boundary is inside this block. Insert a final destroy
       // inside the block if it doesn't already have one.
-      findOrInsertDestroyInBlock(bb, lifetime);
+      findOrInsertDestroyInBlock(bb);
       break;
     }
     case PrunedLiveBlocks::Dead:
       // Continue searching upward to find the pruned liveness boundary.
       for (auto *predBB : bb->getPredecessorBlocks()) {
-        if (lifetime.getBlockLiveness(predBB) == PrunedLiveBlocks::LiveOut) {
-          insertDestroyOnCFGEdge(predBB, bb, lifetime);
+        if (liveness.getBlockLiveness(predBB) == PrunedLiveBlocks::LiveOut) {
+          insertDestroyOnCFGEdge(predBB, bb, currentDef, consumes);
+          setChanged();
         } else {
-          worklist.insert(predBB);
+          blockWorklist.insert(predBB);
         }
       }
       break;
     }
   }
   // Add any debug_values from Dead blocks into the debugAfterConsume set.
-  for (auto *dvi : lifetime.debugValues) {
-    if (lifetime.getBlockLiveness(dvi->getParent()) == PrunedLiveBlocks::Dead)
-      lifetime.consumes.recordDebugAfterConsume(dvi);
+  for (auto *dvi : debugValues) {
+    if (liveness.getBlockLiveness(dvi->getParent()) == PrunedLiveBlocks::Dead) {
+      consumes.recordDebugAfterConsume(dvi);
+    }
   }
 }
 
 //===----------------------------------------------------------------------===//
-// MARK: Step 3. Rewrite copies and destroys for a single copied definition.
+// MARK: Step 3. Rewrite copies and destroys
 //===----------------------------------------------------------------------===//
 
 /// The lifetime extends beyond given consuming use. Copy the value.
@@ -381,16 +427,19 @@ static void copyLiveUse(Operand *use) {
   use->set(copy);
 
   ++NumCopiesGenerated;
-  LLVM_DEBUG(llvm::dbgs() << "  Copying at last use "; copy->dump());
+  LLVM_DEBUG(llvm::dbgs() << "  Copying at last use " << *copy);
 }
 
-/// Revisit the def-use chain of `lifetime.def()`. Mark unneeded original
+/// Revisit the def-use chain of currentDef. Mark unneeded original
 /// copies and destroys for deletion. Insert new copies for interior uses that
 /// require ownership of the used operand.
-static bool rewriteCopies(SILValue def, CanonicalOSSAConsumeInfo &consumes) {
+void CanonicalizeOSSALifetime::rewriteCopies() {
+  bool isOwned = currentDef.getOwnershipKind() == OwnershipKind::Owned;
+  assert((!isOwned || !consumes.hasPersistentCopies())
+         && "persistent copies use borrowed values");
+
   SmallSetVector<SILInstruction *, 8> instsToDelete;
-  SmallSetVector<CopyValueInst *, 8> defUseWorklist;
-  bool changed = false;
+  defUseWorklist.clear();
 
   // Visit each operand in the def-use chain.
   //
@@ -400,21 +449,25 @@ static bool rewriteCopies(SILValue def, CanonicalOSSAConsumeInfo &consumes) {
     auto *user = use->getUser();
     // Recurse through copies.
     if (auto *copy = dyn_cast<CopyValueInst>(user)) {
-      defUseWorklist.insert(copy);
-      return true;
+      if (!consumes.isPersistentCopy(copy)) {
+        defUseWorklist.insert(copy);
+        return true;
+      }
     }
     if (auto *destroy = dyn_cast<DestroyValueInst>(user)) {
       // If this destroy was marked as a final destroy, ignore it; otherwise,
       // delete it.
       if (!consumes.claimConsume(destroy)) {
         instsToDelete.insert(destroy);
-        LLVM_DEBUG(llvm::dbgs() << "  Removing "; destroy->dump());
+        LLVM_DEBUG(llvm::dbgs() << "  Removing " << *destroy);
         ++NumDestroysEliminated;
       }
       return true;
     }
 
     // Nonconsuming uses do not need copies and cannot be marked as destroys.
+    // A lifetime-ending use here must be a consume because EndBorrow/Reborrow
+    // uses have been filtered out.
     if (!use->isLifetimeEnding())
       return true;
 
@@ -425,16 +478,22 @@ static bool rewriteCopies(SILValue def, CanonicalOSSAConsumeInfo &consumes) {
   };
 
   // Perform a def-use traversal, visiting each use operand.
-  for (auto useIter = def->use_begin(); useIter != def->use_end();) {
+  for (auto useIter = currentDef->use_begin(), endIter = currentDef->use_end();
+       useIter != endIter;) {
     Operand *use = *useIter++;
+    // A direct lifetime-ending use of a guaranteed value (EndBorrow or
+    // Reborrow), never needs a copy.
+    if (!isOwned && use->isLifetimeEnding()) {
+      continue;
+    }
     if (!visitUse(use)) {
       copyLiveUse(use);
-      changed = true;
+      setChanged();
     }
   }
   while (!defUseWorklist.empty()) {
-    CopyValueInst *srcCopy = defUseWorklist.pop_back_val();
-    // Recurse through copies, then remove them.
+    CopyValueInst *srcCopy = cast<CopyValueInst>(defUseWorklist.pop_back_val());
+    // Recurse through copies while replacing their uses.
     Operand *reusedCopyOp = nullptr;
     for (auto useIter = srcCopy->use_begin(); useIter != srcCopy->use_end();) {
       Operand *use = *useIter++;
@@ -443,18 +502,18 @@ static bool rewriteCopies(SILValue def, CanonicalOSSAConsumeInfo &consumes) {
           reusedCopyOp = use;
         } else {
           copyLiveUse(use);
-          changed = true;
+          setChanged();
         }
       }
     }
     if (!(reusedCopyOp && srcCopy->hasOneUse())) {
-      changed = true;
+      setChanged();
       srcCopy->replaceAllUsesWith(srcCopy->getOperand());
       if (reusedCopyOp) {
         reusedCopyOp->set(srcCopy);
       } else {
         instsToDelete.insert(srcCopy);
-        LLVM_DEBUG(llvm::dbgs() << "  Removing "; srcCopy->dump());
+        LLVM_DEBUG(llvm::dbgs() << "  Removing " << *srcCopy);
         ++NumCopiesEliminated;
       }
     }
@@ -463,7 +522,7 @@ static bool rewriteCopies(SILValue def, CanonicalOSSAConsumeInfo &consumes) {
 
   // Remove any dead debug_values.
   for (auto *dvi : consumes.getDebugInstsAfterConsume()) {
-    llvm::dbgs() << "  Removing debug_value: " << *dvi;
+    LLVM_DEBUG(llvm::dbgs() << "  Removing debug_value: " << *dvi);
     dvi->eraseFromParent();
   }
   consumes.clear();
@@ -472,36 +531,49 @@ static bool rewriteCopies(SILValue def, CanonicalOSSAConsumeInfo &consumes) {
   if (!instsToDelete.empty()) {
     recursivelyDeleteTriviallyDeadInstructions(instsToDelete.takeVector(),
                                                /*force=*/true);
-    changed = true;
+    setChanged();
   }
-  return changed;
 }
 
 //===----------------------------------------------------------------------===//
 //                            MARK: Top-Level API
 //===----------------------------------------------------------------------===//
 
-bool swift::canonicalizeValueLifetime(SILValue def,
-                                      CanonicalOSSALifetimeState &lifetime) {
-  // FIXME: handle guaranteed values by creating another pruned liveness for the
-  // borrow scope as described in the file-level comment.
-  if (def.getOwnershipKind() != OwnershipKind::Owned) {
+bool CanonicalizeOSSALifetime::canonicalizeValueLifetime(SILValue def) {
+  switch (def.getOwnershipKind()) {
+  case OwnershipKind::None:
+  case OwnershipKind::Unowned:
+  case OwnershipKind::Any:
     return false;
+  case OwnershipKind::Guaranteed:
+    initDef(def);
+    if (!computeBorrowLiveness()) {
+      return false;
+    }
+    // Set outerCopy and persistentCopies and rewrite uses
+    // outside the scope.
+    consolidateBorrowScope();
+    // Invalidate book-keeping before deleting instructions.
+    clearLiveness();
+    // Rewrite copies and delete extra destroys within the scope.
+    assert(!consumes.hasFinalConsumes());
+    rewriteCopies();
+    return true;
+  case OwnershipKind::Owned:
+    initDef(def);
+    // Step 1: compute liveness
+    if (!computeCanonicalLiveness()) {
+      clearLiveness();
+      return false;
+    }
+    // Step 2: record final destroys
+    findOrInsertDestroys();
+    // Invalidate book-keeping before deleting instructions.
+    clearLiveness();
+    // Step 3: rewrite copies and delete extra destroys
+    rewriteCopies();
+    return true;
   }
-  lifetime.initDef(def);
-  // Step 1: computeLiveness
-  if (!computeCanonicalLiveness(lifetime)) {
-    lifetime.clearLiveness();
-    return false;
-  }
-  // Step 2: findOrInsertDestroys
-  findOrInsertDestroys(lifetime);
-  // Invalidate book-keeping before deleting instructions.
-  lifetime.clearLiveness();
-  // Step 3: rewriteCopies
-  if (rewriteCopies(def, lifetime.consumes))
-    lifetime.setChanged();
-  return true;
 }
 
 //===----------------------------------------------------------------------===//
