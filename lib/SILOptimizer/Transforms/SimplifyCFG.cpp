@@ -3957,7 +3957,7 @@ class JumpThreadSimplifyCFGPass : public SILFunctionTransform {
 public:
   void run() override {
     // FIXME: Handle ownership.
-    if (getFunction()->hasOwnership())
+    if (getFunction()->hasOwnership() && !ForceRunOnOwnership)
       return;
     if (SimplifyCFG(*getFunction(), *this, getOptions().VerifyAll,
                     /*EnableJumpThread=*/true)
