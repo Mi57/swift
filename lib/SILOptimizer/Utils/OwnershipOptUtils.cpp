@@ -594,9 +594,18 @@ rewriteReborrows(SILValue newBorrowedValue,
 namespace {
 
 struct OwnershipRAUWUtility {
-  SingleValueInstruction *oldValue;
+  SILValue oldValue;
   SILValue newValue;
   OwnershipFixupContext &ctx;
+
+  // For terminator results, the consuming point is the predecessor's
+  // terminator. This avoids destroys on unused paths. It is also the
+  // instruction which will be deleted, thus needs operand cleanup.
+  SILInstruction *getConsumingPoint() const {
+    if (auto *blockArg = dyn_cast<SILPhiArgument>(oldValue))
+      return blockArg->getTerminatorForResultArg();
+    return cast<SingleValueInstruction>(oldValue);
+  }
 
   SILBasicBlock::iterator handleUnowned();
 
@@ -655,7 +664,6 @@ SILBasicBlock::iterator OwnershipRAUWUtility::handleUnowned() {
     auto extender = getLifetimeExtender();
     SILValue borrow =
         extender.createPlusZeroBorrow(newValue, oldValue->getUses());
-    SILBuilderWithScope builder(oldValue);
     return replaceAllUsesAndErase(oldValue, borrow, callbacks);
   }
   case OwnershipKind::Owned: {
@@ -685,7 +693,6 @@ SILBasicBlock::iterator OwnershipRAUWUtility::handleUnowned() {
     }
     auto extender = getLifetimeExtender();
     SILValue copy = extender.createPlusZeroCopy(newValue, oldValue->getUses());
-    SILBuilderWithScope builder(oldValue);
     auto result = replaceAllUsesAndErase(oldValue, copy, callbacks);
     return result;
   }
@@ -755,9 +762,9 @@ SILBasicBlock::iterator OwnershipRAUWUtility::perform() {
   // NOTE: This handles RAUWing with undef.
   if (newValue.getOwnershipKind() == OwnershipKind::None)
     return replaceAllUsesAndErase(oldValue, newValue, ctx.callbacks);
-  assert(SILValue(oldValue).getOwnershipKind() != OwnershipKind::None);
+  assert(oldValue.getOwnershipKind() != OwnershipKind::None);
 
-  switch (SILValue(oldValue).getOwnershipKind()) {
+  switch (oldValue.getOwnershipKind()) {
   case OwnershipKind::None:
     // If our old value was none and our new value is not, we need to do
     // something more complex that we do not support yet, so bail. We should
@@ -771,11 +778,12 @@ SILBasicBlock::iterator OwnershipRAUWUtility::perform() {
   case OwnershipKind::Owned: {
     // If we have an owned value that we want to replace with a value with any
     // other non-None ownership, we need to copy the other value for a
-    // lifetimeEnding RAUW, then RAUW the value, and insert a destroy_value on
+    // lifetimeEnding RAUW, RAUW the value, and insert a destroy_value of
     // the original value.
     auto extender = getLifetimeExtender();
-    SILValue copy = extender.createPlusOneCopy(newValue, oldValue);
-    cleanupOperandsBeforeDeletion(oldValue, ctx.callbacks);
+    auto *consumingPoint = getConsumingPoint();
+    SILValue copy = extender.createPlusOneCopy(newValue, consumingPoint);
+    cleanupOperandsBeforeDeletion(consumingPoint, ctx.callbacks);
     auto result = replaceAllUsesAndErase(oldValue, copy, ctx.callbacks);
     return result;
   }
@@ -929,7 +937,7 @@ OwnershipRAUWHelper::replaceAddressUses(SingleValueInstruction *oldValue,
 //===----------------------------------------------------------------------===//
 
 OwnershipRAUWHelper::OwnershipRAUWHelper(OwnershipFixupContext &inputCtx,
-                                         SingleValueInstruction *inputOldValue,
+                                         SILValue inputOldValue,
                                          SILValue inputNewValue)
     : ctx(&inputCtx), oldValue(inputOldValue), newValue(inputNewValue) {
   // If we are already not valid, just bail.
@@ -940,6 +948,11 @@ OwnershipRAUWHelper::OwnershipRAUWHelper(OwnershipFixupContext &inputCtx,
   // and leave the object valid.
   if (!oldValue->getFunction()->hasOwnership())
     return;
+
+  // This utility currently only handles erasing SingleValueInstructions and
+  // terminator results.
+  assert(isa<SingleValueInstruction>(inputOldValue)
+         || cast<SILPhiArgument>(inputOldValue)->isTerminatorResult());
 
   // Otherwise, lets check if we can perform this RAUW operation. If we can't,
   // set ctx to nullptr to invalidate the helper and return.
@@ -1052,9 +1065,11 @@ OwnershipRAUWHelper::perform(SingleValueInstruction *maybeTransformedNewValue) {
   // Make sure to always clear our context after we transform.
   SWIFT_DEFER { ctx->clear(); };
 
-  if (oldValue->getType().isAddress())
-    return replaceAddressUses(oldValue, actualNewValue);
-
+  if (oldValue->getType().isAddress()) {
+    assert(isa<SingleValueInstruction>(oldValue)
+           && "block argument cannot be an address");
+    return replaceAddressUses(cast<SingleValueInstruction>(oldValue), newValue);
+  }
   OwnershipRAUWUtility utility{oldValue, actualNewValue, *ctx};
   return utility.perform();
 }
