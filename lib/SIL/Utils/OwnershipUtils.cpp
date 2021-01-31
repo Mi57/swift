@@ -12,6 +12,7 @@
 
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/Basic/Defer.h"
+#include "swift/Basic/SmallPtrSetVector.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/LinearLifetimeChecker.h"
 #include "swift/SIL/Projection.h"
@@ -191,7 +192,7 @@ llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &os,
   return os;
 }
 
-bool BorrowingOperand::visitLocalEndScopeUses(
+bool BorrowingOperand::visitScopeEndingUses(
     function_ref<bool(Operand *)> func) const {
   switch (kind) {
   case BorrowingOperandKind::Invalid:
@@ -227,12 +228,22 @@ bool BorrowingOperand::visitLocalEndScopeUses(
     return true;
   }
   }
-
   llvm_unreachable("Covered switch isn't covered");
 }
 
-void BorrowingOperand::visitBorrowIntroducingUserResults(
-    function_ref<void(BorrowedValue)> visitor) const {
+bool BorrowingOperand::visitExtendedScopeEndingUses(
+    function_ref<bool(Operand *)> func) const {
+  if (hasBorrowIntroducingUser()) {
+    return visitBorrowIntroducingUserResults(
+        [func](BorrowedValue borrowedValue) {
+          return borrowedValue.visitExtendedLocalScopeEndingUses(func);
+        });
+  }
+  return visitScopeEndingUses(func);
+}
+
+bool BorrowingOperand::visitBorrowIntroducingUserResults(
+    function_ref<bool(BorrowedValue)> visitor) const {
   switch (kind) {
   case BorrowingOperandKind::Invalid:
     llvm_unreachable("Using invalid case");
@@ -248,72 +259,38 @@ void BorrowingOperand::visitBorrowIntroducingUserResults(
   }
   case BorrowingOperandKind::Branch: {
     auto *bi = cast<BranchInst>(op->getUser());
-    for (auto *succBlock : bi->getSuccessorBlocks()) {
-      auto value =
-          BorrowedValue::get(succBlock->getArgument(op->getOperandNumber()));
-      assert(value);
-      visitor(value);
-    }
-    return;
+    auto value = BorrowedValue::get(
+        bi->getDestBB()->getArgument(op->getOperandNumber()));
+    assert(value && "guaranteed-to-unowned conversion not allowed on branches");
+    return visitor(value);
   }
   }
   llvm_unreachable("Covered switch isn't covered?!");
 }
 
-void BorrowingOperand::visitConsumingUsesOfBorrowIntroducingUserResults(
-    function_ref<void(Operand *)> func) const {
-  // First visit all of the results of our user that are borrow introducing
-  // values.
-  visitBorrowIntroducingUserResults([&](BorrowedValue value) {
-    // Visit the scope ending instructions of this value. If any of them are
-    // consuming borrow scope operands, visit the consuming uses of the
-    // results or successor arguments.
-    //
-    // This enables one to walk the def-use chain of guaranteed phis for a
-    // single guaranteed scope.
-    value.visitLocalScopeEndingUses([&](Operand *valueUser) {
-      if (auto subBorrowScopeOp = BorrowingOperand::get(valueUser)) {
-        if (subBorrowScopeOp.isReborrow()) {
-          subBorrowScopeOp.visitUserResultConsumingUses(func);
-          return;
-        }
-      }
+BorrowedValue BorrowingOperand::getBorrowIntroducingUserResult() {
+  switch (kind) {
+  case BorrowingOperandKind::Invalid:
+  case BorrowingOperandKind::Apply:
+  case BorrowingOperandKind::TryApply:
+  case BorrowingOperandKind::BeginApply:
+  case BorrowingOperandKind::Yield:
+    return BorrowedValue();
 
-      // Otherwise, if we don't have a borrow scope operand that consumes
-      // guaranteed values, just visit value user.
-      func(valueUser);
-    });
-  });
-}
+  case BorrowingOperandKind::BeginBorrow:
+    return BorrowedValue(cast<BeginBorrowInst>(op->getUser()));
 
-void BorrowingOperand::visitUserResultConsumingUses(
-    function_ref<void(Operand *)> visitor) const {
-  auto *ti = dyn_cast<TermInst>(op->getUser());
-  if (!ti) {
-    for (SILValue result : op->getUser()->getResults()) {
-      for (auto *use : result->getUses()) {
-        if (use->isLifetimeEnding()) {
-          visitor(use);
-        }
-      }
-    }
-    return;
+  case BorrowingOperandKind::Branch: {
+    auto *bi = cast<BranchInst>(op->getUser());
+    return BorrowedValue(bi->getDestBB()->getArgument(op->getOperandNumber()));
   }
-
-  for (auto *succBlock : ti->getSuccessorBlocks()) {
-    auto *arg = succBlock->getArgument(op->getOperandNumber());
-    for (auto *use : arg->getUses()) {
-      if (use->isLifetimeEnding()) {
-        visitor(use);
-      }
-    }
   }
 }
 
 void BorrowingOperand::getImplicitUses(
     SmallVectorImpl<Operand *> &foundUses,
     std::function<void(Operand *)> *errorFunction) const {
-  visitLocalEndScopeUses([&](Operand *op) {
+  visitScopeEndingUses([&](Operand *op) {
     foundUses.push_back(op);
     return true;
   });
@@ -371,8 +348,8 @@ void BorrowedValue::getLocalScopeEndingInstructions(
   llvm_unreachable("Covered switch isn't covered?!");
 }
 
-void BorrowedValue::visitLocalScopeEndingUses(
-    function_ref<void(Operand *)> visitor) const {
+bool BorrowedValue::visitLocalScopeEndingUses(
+    function_ref<bool(Operand *)> visitor) const {
   assert(isLocalScope() && "Should only call this given a local scope");
   switch (kind) {
   case BorrowedValueKind::Invalid:
@@ -384,10 +361,11 @@ void BorrowedValue::visitLocalScopeEndingUses(
   case BorrowedValueKind::Phi:
     for (auto *use : value->getUses()) {
       if (use->isLifetimeEnding()) {
-        visitor(use);
+        if (!visitor(use))
+          return false;
       }
     }
-    return;
+    return true;
   }
   llvm_unreachable("Covered switch isn't covered?!");
 }
@@ -422,53 +400,42 @@ bool BorrowedValue::areUsesWithinScope(
 
   // Otherwise, gather up our local scope ending instructions, looking through
   // guaranteed phi nodes.
-  visitLocalScopeTransitiveEndingUses(
-      [&scratchSpace](Operand *op) { scratchSpace.emplace_back(op); });
+  visitExtendedLocalScopeEndingUses([&scratchSpace](Operand *op) {
+    scratchSpace.emplace_back(op);
+    return true;
+  });
 
   LinearLifetimeChecker checker(deadEndBlocks);
   return checker.validateLifetime(value, scratchSpace, uses);
 }
 
-bool BorrowedValue::visitLocalScopeTransitiveEndingUses(
-    function_ref<void(Operand *)> visitor) const {
+// The visitor \p func is only called on final scope-ending uses, not reborrows.
+bool BorrowedValue::visitExtendedLocalScopeEndingUses(
+    function_ref<bool(Operand *)> func) const {
   assert(isLocalScope());
 
-  SmallVector<Operand *, 32> worklist;
-  SmallPtrSet<Operand *, 16> beenInWorklist;
-  for (auto *use : value->getUses()) {
-    if (!use->isLifetimeEnding())
-      continue;
-    worklist.push_back(use);
-    beenInWorklist.insert(use);
-  }
+  SmallPtrSetVector<SILValue, 4> reborrows;
 
-  bool foundError = false;
-  while (!worklist.empty()) {
-    auto *op = worklist.pop_back_val();
-    assert(op->isLifetimeEnding() && "Expected only consuming uses");
-
-    // See if we have a borrow scope operand. If we do not, then we know we are
-    // a final consumer of our borrow scope introducer. Visit it and continue.
-    auto scopeOperand = BorrowingOperand::get(op);
-    if (!scopeOperand) {
-      visitor(op);
-      continue;
-    }
-
-    scopeOperand.visitConsumingUsesOfBorrowIntroducingUserResults(
-        [&](Operand *op) {
-          assert(op->isLifetimeEnding() && "Expected only consuming uses");
-          // Make sure we haven't visited this consuming operand yet. If we
-          // have, signal an error and bail without re-visiting the operand.
-          if (!beenInWorklist.insert(op).second) {
-            foundError = true;
-            return;
-          }
-          worklist.push_back(op);
+  auto visitEnd = [&](Operand *scopeEndingUse) {
+    if (scopeEndingUse->getOperandOwnership() == OperandOwnership::Reborrow) {
+      BorrowingOperand(scopeEndingUse).visitBorrowIntroducingUserResults(
+        [&](BorrowedValue borrowedValue) {
+          reborrows.insert(borrowedValue.value);
+          return true;
         });
-  }
+      return true;
+    }
+    return func(scopeEndingUse);
+  };
 
-  return foundError;
+  if (!visitLocalScopeEndingUses(visitEnd))
+    return false;
+
+  for (unsigned idx = 0; idx < reborrows.size(); ++idx) {
+    if (!BorrowedValue(reborrows[idx]).visitLocalScopeEndingUses(visitEnd))
+      return false;
+  }
+  return true;
 }
 
 bool BorrowedValue::visitInteriorPointerOperands(
@@ -876,6 +843,160 @@ OwnedValueIntroducer swift::getSingleOwnedValueIntroducer(SILValue inputValue) {
   }
 
   llvm_unreachable("Should never hit this");
+}
+
+// Find all use points of \p guaranteedValue within its borrow scope where
+// \p guaranteedValue is not itself a borrow introducer.
+// There is no need to consider reborrows in this case.
+//
+// Accumulate results in \p usePoints, ignoring existing elements.
+//
+// Skip over nested borrow scopes. Their scope-ending instructions are their use
+// points. Transitively find all scope-ending instructions by looking through
+// nested reborrows. Nested reborrows are not use points and \p visitReborrow is
+// not called for them.
+static bool
+findInnerTransitiveGuaranteedUses(SILValue guaranteedValue,
+                                  SmallVectorImpl<Operand *> &usePoints) {
+  // Push the value's immediate uses.
+  unsigned firstOffset = usePoints.size();
+  for (Operand *use : guaranteedValue->getUses()) {
+    if (use->getOperandOwnership() != OperandOwnership::NonUse)
+      usePoints.push_back(use);
+  }
+
+  // --- Transitively follow forwarded uses and look for escapes.
+
+  // FIXME: Remove this SmallPtrSet when destructures are reborrows. Currently
+  // it forwards multiple results! This means that usePoints could grow
+  // exponentially without a membership check. It's fine to do this membership
+  // check locally in this function (within a borrow scope). It isn't needed for
+  // the immediate uses, only the transitive uses.
+  SmallPtrSet<Operand *, 16> visitedUses;
+  auto pushUse = [&](Operand *use) {
+    if (use->getOperandOwnership() != OperandOwnership::NonUse) {
+      if (visitedUses.insert(use).second)
+        usePoints.push_back(use);
+    }
+  };
+
+  // usePoints grows in this loop.
+  for (unsigned i = firstOffset; i < usePoints.size(); ++i) {
+    Operand *use = usePoints[i];
+    switch (use->getOperandOwnership()) {
+    case OperandOwnership::NonUse:
+    case OperandOwnership::TrivialUse:
+    case OperandOwnership::ForwardingConsume:
+    case OperandOwnership::DestroyingConsume:
+    case OperandOwnership::Reborrow:
+      llvm_unreachable("this operand cannot handle an inner guaranteed use");
+
+    case OperandOwnership::ForwardingUnowned:
+    case OperandOwnership::PointerEscape:
+      return false;
+
+    case OperandOwnership::InstantaneousUse:
+    case OperandOwnership::UnownedInstantaneousUse:
+    case OperandOwnership::BitwiseEscape:
+    // This Reborrow is actually the end of a nested borrow scope so handle it
+    // like a normal use of this guaranteed value.
+    case OperandOwnership::EndBorrow:
+      pushUse(use);
+      break;
+
+    case OperandOwnership::InteriorPointer:
+      // If our base guaranteed value does not have any consuming uses (consider
+      // function arguments), we need to be sure to include interior pointer
+      // operands since we may not get a use from a end_scope instruction.
+      if (!InteriorPointerOperand(use).findTransitiveUses(usePoints)) {
+        return false;
+      }
+      break;
+
+    case OperandOwnership::ForwardingBorrow:
+      ForwardingOperand(use).visitForwardedValues(
+          [&](SILValue transitiveValue) {
+            // Do not include transitive uses with 'none' ownership
+            if (transitiveValue.getOwnershipKind() == OwnershipKind::None)
+              return true;
+            for (auto *transitiveUse : transitiveValue->getUses()) {
+              pushUse(transitiveUse);
+            }
+            return true;
+          });
+      break;
+
+    case OperandOwnership::Borrow: {
+      BorrowingOperand(use).visitExtendedScopeEndingUses(
+        [&](Operand *endScope) {
+          pushUse(endScope);
+          return true;
+        });
+    }
+    }
+  }
+  return true;
+}
+
+// Find all use points of \p guaranteedValue within its borrow scope. All use
+// points will be dominated by \p guaranteedValue.
+//
+// Record (non-nested) reborrows as uses and call \p visitReborrow.
+//
+// Borrow introducers are fundamentally different than "inner" guaranteed
+// values. Their only use points are their scope-ending uses. There is no need
+// to transitively process uses. However, unlike inner guaranteed values, they
+// can have reborrows. To transitively process reborrows, use
+// findExtendedTransitiveBorrowedUses.
+bool swift::findTransitiveGuaranteedUses(
+    SILValue guaranteedValue, SmallVectorImpl<Operand *> &usePoints,
+    function_ref<bool(Operand *)> visitReborrow) {
+
+  // Handle local borrow introducers without following uses.
+  // SILFunctionArguments are *not* borrow introducers in this context--we're
+  // trying to find lifetime of values within a function.
+  if (auto borrowedValue = BorrowedValue(guaranteedValue)) {
+    if (borrowedValue.isLocalScope()) {
+      borrowedValue.visitLocalScopeEndingUses([&](Operand *scopeEnd) {
+        usePoints.push_back(scopeEnd);
+        if (scopeEnd->getOperandOwnership() == OperandOwnership::Reborrow)
+          visitReborrow(scopeEnd);
+        return true;
+      });
+    }
+    return true;
+  }
+  return findInnerTransitiveGuaranteedUses(guaranteedValue, usePoints);
+}
+
+// Find all use points of \p guaranteedValue within its borrow scope. If the
+// guaranteed value introduces a borrow scope, then this includes the extended
+// borrow scope by following reborrows.
+bool swift::
+findExtendedTransitiveGuaranteedUses(SILValue guaranteedValue,
+                                     SmallVectorImpl<Operand *> &usePoints) {
+  SmallSetVector<SILValue, 4> reborrows;
+  auto visitReborrow = [&](Operand *reborrow) {
+    BorrowingOperand(reborrow).visitBorrowIntroducingUserResults(
+      [&](BorrowedValue borrowedValue) {
+        reborrows.insert(borrowedValue.value);
+        return true;
+      });
+    return true;
+  };
+  if (!findTransitiveGuaranteedUses(guaranteedValue, usePoints, visitReborrow))
+    return false;
+
+  // For guaranteed values that do not introduce a borrow scope, reborrows will
+  // be empty at this point.
+  for (unsigned idx = 0; idx < reborrows.size(); ++idx) {
+    bool result =
+      findTransitiveGuaranteedUses(reborrows[idx], usePoints, visitReborrow);
+    // It is impossible to find a Pointer escape while traversing reborrows.
+    assert(result && "visiting reborrows always succeeds");
+    (void)result;
+  }
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
