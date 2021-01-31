@@ -100,6 +100,46 @@ insertOwnedBaseValueAlongBranchEdge(BranchInst *bi, SILValue innerCopy,
 }
 
 //===----------------------------------------------------------------------===//
+//                          BorrowedLifetimeExtender
+//===----------------------------------------------------------------------===//
+
+// Gather all transitive phi-reborrows and check that all the borrowed uses can
+// be found with no escapes.
+BorrowedLifetimeExtender BorrowedLifetimeExtender::canExtendOverBorrowScope(
+    BorrowedValue borrowedValue) {
+
+  BorrowedLifetimeExtender extender;
+
+  auto visitReborrow = [&](Operand *endScope) {
+    if (auto borrowingOper = BorrowingOperand(endScope)) {
+      assert(borrowingOper.isReborrow());
+
+      extender.reborrowedOperands.insert(endScope);
+
+      // FIXME: handle non-phi reborrows by using a separate worklist of
+      // SILValues that doesn't need to be preserved in the extender.
+      auto borrowedValue = borrowingOper.getBorrowIntroducingUserResult();
+      extender.reborrowedValues.insert(borrowedValue.value);
+    }
+    return true;
+  };
+
+  bool result = borrowedValue.visitLocalScopeEndingUses(visitReborrow);
+  assert(result && "reborrow always succeeds");
+
+  for (unsigned idx = 0; idx < extender.reborrowedValues.size(); ++idx) {
+    auto borrowedValue = BorrowedValue(extender.reborrowedValues[idx]);
+    result = borrowedValue.visitLocalScopeEndingUses(visitReborrow);
+    assert(result && "reborrow always succeeds");
+  }
+  return extender;
+}
+
+void BorrowedLifetimeExtender::extendOverBorrowScope(SILValue ownedValue) {
+  //!!!
+}
+
+//===----------------------------------------------------------------------===//
 //                      Ownership RAUW Helper Functions
 //===----------------------------------------------------------------------===//
 

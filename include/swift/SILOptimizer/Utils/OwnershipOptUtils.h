@@ -30,6 +30,43 @@ namespace swift {
 // Defined in BasicBlockUtils.h
 struct JointPostDominanceSetComputer;
 
+/// Model an extended borrow scope, including transitive reborrows. Allow
+/// extending the lifetime of an owned value across that extended borrow
+/// scope. This handles uses of reborrows that are not dominated by the owned
+/// value by generating phis and copying the borrowed values the reach this
+/// borrow scope from non-dominated paths.
+///
+/// This applies to "local" borrow scopes (begin_borrow, load_borrow, & phi).
+struct BorrowedLifetimeExtender {
+  /// If the extended lifetime of \p borrowedValue can be analyzed, return a
+  /// valid BorrowedLifetimeExtender instance with the information needed to
+  /// extend an owned value over that extended lifetime.
+  ///
+  /// A borrowed value's "extended" lifetime transitively include the uses of
+  /// reborrows.
+  static BorrowedLifetimeExtender
+  canExtendOverBorrowScope(BorrowedValue borrowedValue);
+
+private:
+  BorrowedValue borrowedValue;
+
+  llvm::SmallDenseSet<PhiOperand, 4> reborrowedOperands;
+  llvm::SmallSetVector<PhiValue, 4> reborrowedValues;
+
+  BorrowedLifetimeExtender() = default;
+
+  BorrowedLifetimeExtender(BorrowedValue borrowedValue)
+      : borrowedValue(borrowedValue) {}
+
+  bool computeExtensionOverBorrowScope();
+
+public:
+  operator bool() const { return borrowedValue; }
+
+  /// Extend \p ownedValue over this extended borrow scope
+  void extendOverBorrowScope(SILValue ownedValue);
+};
+
 /// A struct that contains context shared in between different operation +
 /// "ownership fixup" utilities. Please do not put actual methods on this, it is
 /// meant to be composed with.
