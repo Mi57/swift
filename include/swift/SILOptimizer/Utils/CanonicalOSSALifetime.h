@@ -189,6 +189,9 @@ private:
   /// liveness may be pruned during canonicalization.
   bool pruneDebugMode;
 
+  /// If true, then new destroy_value instructions will be poison.
+  bool poisonRefsMode;
+
   NonLocalAccessBlockAnalysis *accessBlockAnalysis;
   // Lazily initialize accessBlocks only when
   // extendLivenessThroughOverlappingAccess is invoked.
@@ -237,11 +240,11 @@ private:
   CanonicalOSSAConsumeInfo consumes;
 
 public:
-  CanonicalizeOSSALifetime(bool pruneDebugMode,
+  CanonicalizeOSSALifetime(bool pruneDebugMode, bool poisonRefsMode,
                            NonLocalAccessBlockAnalysis *accessBlockAnalysis,
                            DominanceAnalysis *dominanceAnalysis,
                            DeadEndBlocks *deBlocks)
-      : pruneDebugMode(pruneDebugMode),
+      : pruneDebugMode(pruneDebugMode), poisonRefsMode(poisonRefsMode),
         accessBlockAnalysis(accessBlockAnalysis),
         dominanceAnalysis(dominanceAnalysis), deBlocks(deBlocks) {}
 

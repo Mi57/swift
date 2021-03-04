@@ -1,5 +1,5 @@
-// RUN: %target-sil-opt -copy-propagation -canonical-ossa-rewrite-borrows -enable-sil-opaque-values -enable-sil-verify-all %s | %FileCheck %s --check-prefixes=CHECK,CHECK-OPT
-// RUN: %target-sil-opt -mandatory-copy-propagation -canonical-ossa-rewrite-borrows -enable-sil-opaque-values -enable-sil-verify-all %s | %FileCheck %s --check-prefixes=CHECK,CHECK-DEBUG
+// RUN: %target-sil-opt -copy-propagation -canonical-ossa-rewrite-borrows -enable-sil-verify-all %s | %FileCheck %s --check-prefixes=CHECK,CHECK-OPT
+// RUN: %target-sil-opt -mandatory-copy-propagation -enable-sil-verify-all %s | %FileCheck %s --check-prefixes=CHECK,CHECK-DEBUG
 //
 // Most CopyPropagation tests are still in copy_propagation_opaque.sil.
 
@@ -27,12 +27,15 @@ struct NativeObjectPair {
   var obj2 : Builtin.NativeObject
 }
 
+// -O ignores this because there's no copy_value
+// -Onone hoists the destroy and adds a poison flag.
 //
-// CHECK-OPT-LABEL: sil [ossa] @testDestroyAfterCall : $@convention(thin) (@owned B) -> () {
-// CHECK-OPT: bb0(%0 : @owned $B):
-// CHECK-OPT:   apply
+// CHECK-LABEL: sil [ossa] @testDestroyAfterCall : $@convention(thin) (@owned B) -> () {
+// CHECK: bb0(%0 : @owned $B):
+// CHECK-ONONE:   destroy_value [poison] %0 : $B
+// CHECK:   apply
 // CHECK-OPT:   destroy_value %0 : $B
-// CHECK-OPT-LABEL: } // end sil function 'testDestroyAfterCall'
+// CHECK-LABEL: } // end sil function 'testDestroyAfterCall'
 sil [ossa] @testDestroyAfterCall : $@convention(thin) (@owned B) -> () {
 bb0(%arg : @owned $B):
   %f = function_ref @dummy : $@convention(thin) () -> ()
@@ -42,6 +45,104 @@ bb0(%arg : @owned $B):
   return %10 : $()
 }
 
+// -O removes the copy/destroy
+// -Onone requres a destroy at the lifetime end. It reuses the
+// existing one without adding poison.
+//
+// CHECK-LABEL: sil [ossa] @testDestroyAfterConsumingStore : $@convention(thin) (@owned K) -> () {
+// CHECK: bb0(%0 : @owned $C):
+// CHECK: [[ADR:%.*]] = alloc_stack $C
+// CHECK-OPT-NOT: copy_value
+// CHECK-ONONE: copy_value %0 : %K
+// CHECK: store %0 to [init] [[ADR]] : %*K
+// CHECK-OPT-NOT: destroy_value
+// CHECK-ONONE: destroy_value [[ADR]] : %K
+// CHECK: destroy_addr
+// CHECK-LABEL: } // end sil function 'testDestroyAfterConsumingStore'
+sil [ossa] @testDestroyAfterConsumingStore : $@convention(thin) (@owned K) -> () {
+bb0(%arg : @owned $C):
+  %adr = alloc_stack $C
+  %copy = copy_value %arg : $C
+  store %copy to [init] %adr : $*C
+  destroy_value %arg : $C
+  destroy_addr %adr : $*C
+  dealloc_stack %adr : $*C
+  %10 = tuple ()
+  return %10 : $()
+}
+
+// -O removes the copy/destroy
+// -Onone requres a destroy at the lifetime end. It creates a new poison one.
+//
+// CHECK-LABEL: sil [ossa] @testDestroyAfterConsumingStore : $@convention(thin) (@owned K) -> () {
+// CHECK: bb0(%0 : @owned $C):
+// CHECK: [[ADR:%.*]] = alloc_stack $C
+// CHECK-OPT-NOT: copy_value
+// CHECK-ONONE: copy_value %0 : %K
+// CHECK: store %{{.*}} to [init] [[ADR]] : %*K
+// CHECK-OPT-NOT: destroy_value
+// CHECK-ONONE: destroy_value [poison] [[ADR]] : %K
+// CHECK: apply
+// CHECK: destroy_addr
+// CHECK-LABEL: } // end sil function 'testDestroyAfterConsumingStore'
+sil [ossa] @testDestroyAfterConsumingStoreAndCall : $@convention(thin) (@owned K) -> () {
+bb0(%arg : @owned $C):
+  %adr = alloc_stack $C
+  %copy = copy_value %arg : $C
+  store %copy to [init] %adr : $*C
+  %f = function_ref @dummy : $@convention(thin) () -> ()
+  %call = apply %f() : $@convention(thin) () -> ()
+  destroy_value %arg : $C
+  destroy_addr %adr : $*C
+  dealloc_stack %adr : $*C
+  %10 = tuple ()
+  return %10 : $()
+}
+
+// -O removes the copy/destroy
+// -Onone reuses the existint lifetime-ending destroy.
+//
+// CHECK-LABEL: sil [ossa] @testDestroyAfterConsumingCall : $@convention(thin) (@owned C) -> () {
+// CHECK: bb0(%0 : @owned $C):
+// CHECK-OPT-NOT: copy_value
+// CHECK-ONONE:   %1 = copy_value %0 : $C
+// CHECK: apply %2(%{{.*}}) : $@convention(thin) (@owned C) -> ()
+// CHECK-OPT-NOT: destroy_value
+// CHECK-ONONE:   destroy_value %0 : $C
+// CHECK-LABEL: } // end sil function 'testDestroyAfterConsumingCall'
+sil [ossa] @testDestroyAfterConsumingCall : $@convention(thin) (@owned C) -> () {
+bb0(%arg : @owned $C):
+  %copy = copy_value %arg : $C
+  %f = function_ref @takeOwnedC : $@convention(thin) (@owned C) -> ()
+  %call = apply %f(%copy) : $@convention(thin) (@owned C) -> ()
+  destroy_value %arg : $C
+  %10 = tuple ()
+  return %10 : $()
+}
+
+// -O removes the copy/destroy
+// -Onone requres a destroy at the lifetime end. It creates a new poison one.
+//
+// CHECK-LABEL: sil [ossa] @testDestroyAfterConsumingCallAndCall : $@convention(thin) (@owned C) -> () {
+// CHECK: bb0(%0 : @owned $C):
+// CHECK-OPT-NOT: copy_value
+// CHECK-ONONE: copy_value %0 : $C
+// CHECK: apply %{{.*}}(%{{.*}}) : $@convention(thin) (@owned C) -> ()
+// CHECK-OPT-NOT: destroy_value
+// CHECK-ONONE:  destroy_value [poison] %0 : $C
+// CHECK: apply
+// CHECK-LABEL: } // end sil function 'testDestroyAfterConsumingCallAndCall'
+sil [ossa] @testDestroyAfterConsumingCallAndCall : $@convention(thin) (@owned C) -> () {
+bb0(%arg : @owned $C):
+  %copy = copy_value %arg : $C
+  %f1 = function_ref @takeOwnedC : $@convention(thin) (@owned C) -> ()
+  %call1 = apply %f1(%copy) : $@convention(thin) (@owned C) -> ()
+  %f2 = function_ref @dummy : $@convention(thin) () -> ()
+  %call2 = apply %f2() : $@convention(thin) () -> ()
+  destroy_value %arg : $C
+  %10 = tuple ()
+  return %10 : $()
+}
 
 // -----------------------------------------------------------------------------
 // Test begin/end_apply
