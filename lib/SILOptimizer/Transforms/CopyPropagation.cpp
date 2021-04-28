@@ -57,7 +57,7 @@ using namespace swift;
 // This only applies to -O copy-propagation.
 llvm::cl::opt<bool>
     EnableRewriteBorrows("canonical-ossa-rewrite-borrows",
-                         llvm::cl::init(false),
+                         llvm::cl::init(true),
                          llvm::cl::desc("Enable rewriting borrow scopes"));
 
 namespace {
@@ -531,4 +531,3 @@ SILTransform *swift::createCopyPropagation() {
                              /*canonicalizeBorrows*/ EnableRewriteBorrows,
                              /*poisonRefs*/ false);
 }
-
