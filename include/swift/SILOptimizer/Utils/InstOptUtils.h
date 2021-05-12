@@ -782,8 +782,17 @@ makeNewValueAvailable(SILValue value, SILBasicBlock *inBlock);
 /// Warning: This does not properly cleanup an OSSA lifetime with a consuming
 /// use blocks inside a loop relative to \p value. The client must create
 /// separate copies for any uses within the loop.
+///
+/// Note: insertOSSADestroys is a more general utility.
 void endLifetimeAtLeakingBlocks(SILValue value,
                                 ArrayRef<SILBasicBlock *> userBBs);
+
+/// Fix the OSSA lifetime of an owned value. Insert destroys on leaking blocks
+/// and after the last non-consuming uses.
+///
+/// \p value is be a well-formed owned OSSA value in all respects except that it
+/// may be mising destroy_values. It may not have uses after consumes.
+bool insertOSSADestroys(SILValue value);
 
 /// Given a forwarding instruction, eliminate it if all of its users are debug
 /// instructions and ownership uses.

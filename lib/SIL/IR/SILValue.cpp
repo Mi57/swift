@@ -70,6 +70,7 @@ SILInstruction *ValueBase::getDefiningInstruction() {
     return inst;
   if (auto *result = dyn_cast<MultipleValueInstructionResult>(this))
     return result->getParent();
+  assert(isa<SILArgument>(this) || isa<SILUndef>(this));
   return nullptr;
 }
 

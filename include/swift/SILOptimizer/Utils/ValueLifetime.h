@@ -85,18 +85,31 @@ public:
   /// We templatize over the RangeTy so that we can initialize
   /// ValueLifetimeAnalysis with misc iterators including transform
   /// iterators.
+  ///
+  /// \p v may not be Undef.
   template <typename RangeTy>
-  ValueLifetimeAnalysis(SILArgument *def, const RangeTy &useRange)
-      : defValue(def), inLiveBlocks(def->getFunction()), userSet() {
+  ValueLifetimeAnalysis(SILValue v, const RangeTy &useRange)
+      : inLiveBlocks(v->getFunction()), userSet() {
+    auto *defInst =  v->getDefiningInstruction();
+    if (defInst)
+      defValue = defInst;
+    else
+      defValue = cast<SILArgument>(v);
     for (SILInstruction *use : useRange)
       userSet.insert(use);
     propagateLiveness();
   }
 
+  /// \p v may not be Undef.
   ValueLifetimeAnalysis(
-      SILArgument *def,
+      SILValue v,
       llvm::iterator_range<ValueBaseUseIterator> useRange)
-      : defValue(def), inLiveBlocks(def->getFunction()), userSet() {
+      : inLiveBlocks(v->getFunction()), userSet() {
+    auto *defInst =  v->getDefiningInstruction();
+    if (defInst)
+      defValue = defInst;
+    else
+      defValue = cast<SILArgument>(v);
     for (Operand *use : useRange)
       userSet.insert(use->getUser());
     propagateLiveness();
