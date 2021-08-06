@@ -5123,3 +5123,18 @@ bb0(%0 : @owned $Klass, %1 : @owned $Klass):
   return %7 : $()
 }
 
+// Test Ownership RAUW when the replacement address requires an additional unchecked_addr_cast.
+//
+//
+// CHECK-LABEL: sil [ossa] @testAddrCast : $@convention(thin) (UnsafePointer<AnyObject>) -> @owned Optional<AnyObject> {
+// // CHECK: !!!
+sil [ossa] @testAddrCast : $@convention(thin) (UnsafePointer<AnyObject>) -> @owned Optional<AnyObject> {
+bb0(%0 : $UnsafePointer<AnyObject>):
+  %1 = struct_extract %0 : $UnsafePointer<AnyObject>, #UnsafePointer._rawValue
+  %2 = pointer_to_address %1 : $Builtin.RawPointer to [strict] $*AnyObject
+  %3 = index_addr %2 : $*AnyObject, undef : $Builtin.Word
+  %4 = address_to_pointer %3 : $*AnyObject to $Builtin.RawPointer
+  %5 = pointer_to_address %4 : $Builtin.RawPointer to [strict] $*Optional<AnyObject>
+  %6 = load [copy] %5 : $*Optional<AnyObject>
+  return %6 : $Optional<AnyObject>
+}

@@ -884,7 +884,7 @@ static void eliminateReborrowsOfRecursiveBorrows(
 }
 
 //===----------------------------------------------------------------------===//
-//                OwnershipRAUWUtility - RAUW + fix ownership
+//                OwnershipRAUWPrepare - RAUW + fix ownership
 //===----------------------------------------------------------------------===//
 
 /// Given an old value and a new value, lifetime extend new value as appropriate
@@ -892,10 +892,14 @@ static void eliminateReborrowsOfRecursiveBorrows(
 /// invariants. We leave fixing up the lifetime of old value to our caller.
 namespace {
 
-struct OwnershipRAUWUtility {
+struct OwnershipRAUWPrepare {
   SILValue oldValue;
   SILValue newValue;
   OwnershipFixupContext &ctx;
+
+  OwnershipLifetimeExtender getLifetimeExtender() { return {ctx}; }
+
+  const InstModCallbacks &getCallbacks() const { return ctx.callbacks; }
 
   // For terminator results, the consuming point is the predecessor's
   // terminator. This avoids destroys on unused paths. It is also the
@@ -907,18 +911,15 @@ struct OwnershipRAUWUtility {
     return cast<SingleValueInstruction>(oldValue);
   }
 
-  SILBasicBlock::iterator handleUnowned();
+  SILValue prepareReplacement();
 
-  SILBasicBlock::iterator perform();
-
-  OwnershipLifetimeExtender getLifetimeExtender() { return {ctx}; }
-
-  const InstModCallbacks &getCallbacks() const { return ctx.callbacks; }
+private:
+  SILValue prepareUnowned();
 };
 
 } // anonymous namespace
 
-SILBasicBlock::iterator OwnershipRAUWUtility::handleUnowned() {
+SILValue OwnershipRAUWPrepare::prepareUnowned() {
   auto &callbacks = ctx.callbacks;
   switch (newValue.getOwnershipKind()) {
   case OwnershipKind::None:
@@ -927,7 +928,7 @@ SILBasicBlock::iterator OwnershipRAUWUtility::handleUnowned() {
     llvm_unreachable("Invalid for values");
   case OwnershipKind::Unowned:
     // An unowned value can always be RAUWed with another unowned value.
-    return replaceAllUsesAndErase(oldValue, newValue, callbacks);
+    return newValue;
   case OwnershipKind::Guaranteed: {
     // If we have an unowned value that we want to replace with a guaranteed
     // value, we need to ensure that the guaranteed value is live at all use
@@ -935,7 +936,7 @@ SILBasicBlock::iterator OwnershipRAUWUtility::handleUnowned() {
     //
     // TODO: Implement this for more interesting cases.
     if (isa<SILFunctionArgument>(newValue))
-      return replaceAllUsesAndErase(oldValue, newValue, callbacks);
+      return newValue;
 
     // Otherwise, we need to lifetime extend the borrow over all of the use
     // points. To do so, we copy the value, borrow it, and insert an unchecked
@@ -963,7 +964,7 @@ SILBasicBlock::iterator OwnershipRAUWUtility::handleUnowned() {
     auto borrowPt = getBorrowPoint(newValue, oldValue);
     SILValue borrow = extender.borrowCopyOverGuaranteedUses(
         newValue, borrowPt, oldValue->getUses());
-    return replaceAllUsesAndErase(oldValue, borrow, callbacks);
+    return borrow;
   }
   case OwnershipKind::Owned: {
     // If we have an unowned value that we want to replace with an owned value,
@@ -992,14 +993,13 @@ SILBasicBlock::iterator OwnershipRAUWUtility::handleUnowned() {
     }
     auto extender = getLifetimeExtender();
     SILValue copy = extender.createPlusZeroCopy(newValue, oldValue->getUses());
-    auto result = replaceAllUsesAndErase(oldValue, copy, callbacks);
-    return result;
+    return copy;
   }
   }
   llvm_unreachable("covered switch isn't covered?!");
 }
 
-SILBasicBlock::iterator OwnershipRAUWUtility::perform() {
+SILValue OwnershipRAUWPrepare::prepareReplacement() {
   assert(oldValue->getFunction()->hasOwnership());
   assert(OwnershipRAUWHelper::hasValidRAUWOwnership(oldValue, newValue) &&
       "Should have checked if can perform this operation before calling it?!");
@@ -1008,7 +1008,8 @@ SILBasicBlock::iterator OwnershipRAUWUtility::perform() {
   //
   // NOTE: This handles RAUWing with undef.
   if (newValue.getOwnershipKind() == OwnershipKind::None)
-    return replaceAllUsesAndErase(oldValue, newValue, ctx.callbacks);
+    return newValue;
+  
   assert(oldValue.getOwnershipKind() != OwnershipKind::None);
 
   switch (oldValue.getOwnershipKind()) {
@@ -1020,9 +1021,7 @@ SILBasicBlock::iterator OwnershipRAUWUtility::perform() {
   case OwnershipKind::Any:
     llvm_unreachable("Invalid for values");
   case OwnershipKind::Guaranteed: {
-    auto extender = getLifetimeExtender();
-    SILValue newGuaranteedValue = extender.borrowOverValue(newValue, oldValue);
-    return replaceAllUsesAndErase(oldValue, newGuaranteedValue, ctx.callbacks);
+    return getLifetimeExtender().borrowOverValue(newValue, oldValue);
   }
   case OwnershipKind::Owned: {
     // If we have an owned value that we want to replace with a value with any
@@ -1033,11 +1032,10 @@ SILBasicBlock::iterator OwnershipRAUWUtility::perform() {
     auto *consumingPoint = getConsumingPoint();
     SILValue copy = extender.createPlusOneCopy(newValue, consumingPoint);
     cleanupOperandsBeforeDeletion(consumingPoint, ctx.callbacks);
-    auto result = replaceAllUsesAndErase(oldValue, copy, ctx.callbacks);
-    return result;
+    return copy;
   }
   case OwnershipKind::Unowned: {
-    return handleUnowned();
+    return prepareUnowned();
   }
   }
   llvm_unreachable("Covered switch isn't covered?!");
@@ -1047,22 +1045,21 @@ SILBasicBlock::iterator OwnershipRAUWUtility::perform() {
 //                     Interior Pointer Operand Rebasing
 //===----------------------------------------------------------------------===//
 
-SILBasicBlock::iterator
-OwnershipRAUWHelper::replaceAddressUses(SingleValueInstruction *oldValue,
-                                        SILValue newValue) {
-  assert(oldValue->getType().isAddress() &&
-         oldValue->getType() == newValue->getType());
+/// Return an address equivalent to \p newValue that can be used to replace all
+/// uses of \p oldValue.
+///
+/// Precondition: RAUW of two addresses
+SILValue
+OwnershipRAUWHelper::getReplacementAddress() {
+  assert(oldValue->getType().isAddress() && newValue->getType().isAddress());
 
-  // If we are replacing addresses, see if we need to handle interior pointer
-  // fixups. If we don't have any extra info, then we know that we can just RAUW
-  // without any further work.
+  // If newValue was not generated by an interior pointer, then it cannot
+  // be within a borrow scope, so direct replacement works.
   if (!ctx->extraAddressFixupInfo.intPtrOp)
-    return replaceAllUsesAndErase(oldValue, newValue, ctx->callbacks);
+    return newValue;
 
-  // We are RAUWing two addresses and we found that:
-  //
-  // 1. newValue is an address associated with an interior pointer instruction.
-  // 2. oldValue has uses that are outside of newValue's borrow scope.
+  // newValue may be within a borrow scope, and oldValue may have uses that are
+  // outside of newValue's borrow scope.
   //
   // So, we need to copy/borrow the base value of the interior pointer to
   // lifetime extend the base value over the new uses. Then we clone the
@@ -1092,11 +1089,9 @@ OwnershipRAUWHelper::replaceAddressUses(SingleValueInstruction *oldValue,
     return (srcAddr == intPtrUser) ? SILValue(newIntPtrUser) : SILValue();
   };
   SILValue clonedAddr =
-      cloneUseDefChain(newValue, /*insetPt*/ oldValue, checkBase);
+      cloneUseDefChain(newValue, /*insertPt*/ oldValue, checkBase);
   assert(clonedAddr != newValue && "expect at least the base to be replaced");
-
-  // Now that we have an addr that is setup appropriately, RAUW!
-  return replaceAllUsesAndErase(oldValue, clonedAddr, ctx->callbacks);
+  return clonedAddr;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1208,8 +1203,9 @@ OwnershipRAUWHelper::OwnershipRAUWHelper(OwnershipFixupContext &inputCtx,
     return;
   }
 
-  auto *intPtrInst =
-    cast<SingleValueInstruction>(borrowedAddress.interiorPointerOp.getUser());
+  // This cloner check must match the later cloner invocation in
+  // getReplacementAddress()
+  auto *intPtrUser = cast<SingleValueInstruction>(intPtr->getUser());
   auto checkBase = [&](SILValue srcAddr) {
     return (srcAddr == intPtrInst) ? SILValue(intPtrInst) : SILValue();
   };
@@ -1221,6 +1217,7 @@ OwnershipRAUWHelper::OwnershipRAUWHelper(OwnershipFixupContext &inputCtx,
   }
 
   // For now, just gather up uses
+  ctx->extraAddressFixupInfo.intPtrOp = intPtr;
   auto &oldValueUses = ctx->extraAddressFixupInfo.allAddressUsesFromOldValue;
   if (InteriorPointerOperand::findTransitiveUsesForAddress(oldValue,
                                                            oldValueUses)) {
@@ -1240,27 +1237,30 @@ OwnershipRAUWHelper::OwnershipRAUWHelper(OwnershipFixupContext &inputCtx,
   }
 }
 
-SILBasicBlock::iterator
-OwnershipRAUWHelper::perform(SingleValueInstruction *maybeTransformedNewValue) {
+SILValue OwnershipRAUWHelper::getReplacementValue() {
   assert(isValid() && "OwnershipRAUWHelper invalid?!");
 
-  SILValue actualNewValue = newValue;
-  if (maybeTransformedNewValue)
-    actualNewValue = maybeTransformedNewValue;
-
   if (!oldValue->getFunction()->hasOwnership())
-    return replaceAllUsesAndErase(oldValue, actualNewValue, ctx->callbacks);
-
-  // Make sure to always clear our context after we transform.
-  SWIFT_DEFER { ctx->clear(); };
+    return newValue;
 
   if (oldValue->getType().isAddress()) {
     assert(isa<SingleValueInstruction>(oldValue)
            && "block argument cannot be an address");
-    return replaceAddressUses(cast<SingleValueInstruction>(oldValue), newValue);
+    return getReplacementAddress();
   }
-  OwnershipRAUWUtility utility{oldValue, actualNewValue, *ctx};
-  return utility.perform();
+  OwnershipRAUWPrepare rauwPrepare{oldValue, newValue, *ctx};
+  return rauwPrepare.prepareReplacement();
+}
+
+SILBasicBlock::iterator
+OwnershipRAUWHelper::perform(SILValue replacementValue) {
+  if (!replacementValue)
+    replacementValue = getReplacementValue();
+
+  // Make sure to always clear our context after we transform.
+  SWIFT_DEFER { ctx->clear(); };
+
+  return replaceAllUsesAndErase(oldValue, replacementValue, ctx->callbacks);
 }
 
 //===----------------------------------------------------------------------===//

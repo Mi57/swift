@@ -75,9 +75,10 @@ struct OwnershipFixupContext {
     /// and use this to seed that new lifetime.
     SmallVector<Operand *, 8> allAddressUsesFromOldValue;
 
-    /// This is the interior pointer operand that the new value we want to RAUW
-    /// is transitively derived from and enables us to know the underlying
-    /// borrowed base value that we need to lifetime extend.
+    /// This is the interior pointer operand (e.g. ref_element_addr operand)
+    /// that the new value we want to RAUW is transitively derived from and
+    /// enables us to know the underlying borrowed base value that we need to
+    /// lifetime extend.
     InteriorPointerOperand intPtrOp;
 
     void clear() {
@@ -120,6 +121,8 @@ public:
 private:
   OwnershipFixupContext *ctx;
   SILValue oldValue;
+  // newValue is the aspirational replacement. It might not be the actual
+  // replacement after SILCombine fixups (like type casting) and OSSA fixups.
   SILValue newValue;
 
 public:
@@ -149,26 +152,25 @@ public:
   operator bool() const { return isValid(); }
   bool isValid() const { return bool(ctx) && bool(oldValue) && bool(newValue); }
 
-  /// Perform the actual RAUW. We require that \p newValue and \p oldValue have
-  /// the same type at this point (in contrast to when calling
-  /// OwnershipRAUWFixupHelper::get()).
+  /// Return a value based on newValue that can be used to replace all uses of
+  /// oldValue. Only used by clients that must transform \p newValue, such as
+  /// adding type casts, before it can be used to replace \p oldValue.
+  SILValue getReplacementValue();
+
+  /// Perform the actual RAUW--replace all uses if \p oldValue.
   ///
-  /// This is so that we can avoid creating "forwarding" transformation
-  /// instructions before we know if we can perform the RAUW. Any such
-  /// "forwarding" transformation must be performed upon \p newValue at \p
-  /// oldValue's insertion point so that we can then here RAUW the transformed
-  /// \p newValue.
+  /// Precondition: \p replacementValue is either invalid or has the same type
+  /// as \p oldValue and is a valid OSSA replacement.
   SILBasicBlock::iterator
-  perform(SingleValueInstruction *maybeTransformedNewValue = nullptr);
+  perform(SILValue replacementValue = SILValue());
 
 private:
-  SILBasicBlock::iterator replaceAddressUses(SingleValueInstruction *oldValue,
-                                             SILValue newValue);
-
   void invalidate() {
     ctx->clear();
     ctx = nullptr;
   }
+
+  SILValue getReplacementAddress();
 };
 
 /// A utility composed ontop of OwnershipFixupContext that knows how to replace
