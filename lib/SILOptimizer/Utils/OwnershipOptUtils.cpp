@@ -1089,7 +1089,8 @@ OwnershipRAUWHelper::getReplacementAddress() {
     return (srcAddr == intPtrUser) ? SILValue(newIntPtrUser) : SILValue();
   };
   SILValue clonedAddr =
-      cloneUseDefChain(newValue, /*insertPt*/ oldValue, checkBase);
+    cloneUseDefChain(newValue, oldValue->getDefiningInsertionPoint(),
+                     checkBase);
   assert(clonedAddr != newValue && "expect at least the base to be replaced");
   return clonedAddr;
 }
@@ -1203,21 +1204,9 @@ OwnershipRAUWHelper::OwnershipRAUWHelper(OwnershipFixupContext &inputCtx,
     return;
   }
 
-  // This cloner check must match the later cloner invocation in
-  // getReplacementAddress()
-  auto *intPtrUser = cast<SingleValueInstruction>(intPtr->getUser());
-  auto checkBase = [&](SILValue srcAddr) {
-    return (srcAddr == intPtrInst) ? SILValue(intPtrInst) : SILValue();
-  };
-  // This cloner check must match the later cloner invocation in
-  // replaceAddressUses()
-  if (!canCloneUseDefChain(newValue, checkBase)) {
-    invalidate();
-    return;
-  }
-
   // For now, just gather up uses
-  ctx->extraAddressFixupInfo.intPtrOp = intPtr;
+  ctx->extraAddressFixupInfo.intPtrOp =
+    cast<SingleValueInstruction>(intPtr->getUser());
   auto &oldValueUses = ctx->extraAddressFixupInfo.allAddressUsesFromOldValue;
   if (InteriorPointerOperand::findTransitiveUsesForAddress(oldValue,
                                                            oldValueUses)) {
@@ -1235,6 +1224,18 @@ OwnershipRAUWHelper::OwnershipRAUWHelper(OwnershipFixupContext &inputCtx,
     // We do not need to copy the base value! Clear the extra info we have.
     ctx->extraAddressFixupInfo.clear();
   }
+  // This cloner check must match the later cloner invocation in
+  // getReplacementAddress()
+  auto *intPtrUser = cast<SingleValueInstruction>(intPtr->getUser());
+  auto checkBase = [&](SILValue srcAddr) {
+    return (srcAddr == intPtrInst) ? SILValue(intPtrInst) : SILValue();
+  };
+  // This cloner check must match the later cloner invocation in
+  // replaceAddressUses()
+  if (!canCloneUseDefChain(newValue, checkBase)) {
+    invalidate();
+    return;
+  }
 }
 
 SILValue OwnershipRAUWHelper::getReplacementValue() {
@@ -1244,8 +1245,6 @@ SILValue OwnershipRAUWHelper::getReplacementValue() {
     return newValue;
 
   if (oldValue->getType().isAddress()) {
-    assert(isa<SingleValueInstruction>(oldValue)
-           && "block argument cannot be an address");
     return getReplacementAddress();
   }
   OwnershipRAUWPrepare rauwPrepare{oldValue, newValue, *ctx};
