@@ -858,6 +858,15 @@ struct BorrowedAddress {
   InteriorPointerOperand interiorPointerOp;
 
   BorrowedAddress(SILValue address);
+
+  bool operator==(const BorrowedAddress &other) const {
+    return mayBeBorrowed == other.mayBeBorrowed
+      && interiorPointerOp == other.interiorPointerOp;
+  }
+
+  bool operator!=(const BorrowedAddress &other) const {
+    return !(*this == other);
+  }
 };
 
 class OwnedValueIntroducerKind {

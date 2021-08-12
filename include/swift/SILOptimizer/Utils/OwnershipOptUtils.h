@@ -152,10 +152,16 @@ public:
   operator bool() const { return isValid(); }
   bool isValid() const { return bool(ctx) && bool(oldValue) && bool(newValue); }
 
-  /// Return a value based on newValue that can be used to replace all uses of
-  /// oldValue. Only used by clients that must transform \p newValue, such as
+  /// Perform OSSA fixup on newValue and return a fixed-up value based that can
+  /// be used to replace all uses of oldValue.
+  ///
+  /// This is only used by clients that must transform \p newValue, such as
   /// adding type casts, before it can be used to replace \p oldValue.
-  SILValue getReplacementValue();
+  ///
+  /// \p rewrittenNewValue is only passed when the client needs to regenerate
+  /// newValue after checking its RAUW validity, but before performing OSSA
+  /// fixup on it.
+  SILValue prepareReplacement(SILValue rewrittenNewValue = SILValue());
 
   /// Perform the actual RAUW--replace all uses if \p oldValue.
   ///

@@ -894,7 +894,6 @@ namespace {
 
 struct OwnershipRAUWPrepare {
   SILValue oldValue;
-  SILValue newValue;
   OwnershipFixupContext &ctx;
 
   OwnershipLifetimeExtender getLifetimeExtender() { return {ctx}; }
@@ -911,15 +910,15 @@ struct OwnershipRAUWPrepare {
     return cast<SingleValueInstruction>(oldValue);
   }
 
-  SILValue prepareReplacement();
+  SILValue prepareReplacement(SILValue newValue);
 
 private:
-  SILValue prepareUnowned();
+  SILValue prepareUnowned(SILValue newValue);
 };
 
 } // anonymous namespace
 
-SILValue OwnershipRAUWPrepare::prepareUnowned() {
+SILValue OwnershipRAUWPrepare::prepareUnowned(SILValue newValue) {
   auto &callbacks = ctx.callbacks;
   switch (newValue.getOwnershipKind()) {
   case OwnershipKind::None:
@@ -999,7 +998,7 @@ SILValue OwnershipRAUWPrepare::prepareUnowned() {
   llvm_unreachable("covered switch isn't covered?!");
 }
 
-SILValue OwnershipRAUWPrepare::prepareReplacement() {
+SILValue OwnershipRAUWPrepare::prepareReplacement(SILValue newValue) {
   assert(oldValue->getFunction()->hasOwnership());
   assert(OwnershipRAUWHelper::hasValidRAUWOwnership(oldValue, newValue) &&
       "Should have checked if can perform this operation before calling it?!");
@@ -1035,7 +1034,7 @@ SILValue OwnershipRAUWPrepare::prepareReplacement() {
     return copy;
   }
   case OwnershipKind::Unowned: {
-    return prepareUnowned();
+    return prepareUnowned(newValue);
   }
   }
   llvm_unreachable("Covered switch isn't covered?!");
@@ -1205,8 +1204,6 @@ OwnershipRAUWHelper::OwnershipRAUWHelper(OwnershipFixupContext &inputCtx,
   }
 
   // For now, just gather up uses
-  ctx->extraAddressFixupInfo.intPtrOp =
-    cast<SingleValueInstruction>(intPtr->getUser());
   auto &oldValueUses = ctx->extraAddressFixupInfo.allAddressUsesFromOldValue;
   if (InteriorPointerOperand::findTransitiveUsesForAddress(oldValue,
                                                            oldValueUses)) {
@@ -1223,23 +1220,37 @@ OwnershipRAUWHelper::OwnershipRAUWHelper(OwnershipFixupContext &inputCtx,
                                        ctx->deBlocks)) {
     // We do not need to copy the base value! Clear the extra info we have.
     ctx->extraAddressFixupInfo.clear();
+    return;
   }
   // This cloner check must match the later cloner invocation in
   // getReplacementAddress()
-  auto *intPtrUser = cast<SingleValueInstruction>(intPtr->getUser());
+  auto *intPtrInst =
+    cast<SingleValueInstruction>(ctx->extraAddressFixupInfo.intPtrOp.getUser());
   auto checkBase = [&](SILValue srcAddr) {
     return (srcAddr == intPtrInst) ? SILValue(intPtrInst) : SILValue();
   };
-  // This cloner check must match the later cloner invocation in
-  // replaceAddressUses()
   if (!canCloneUseDefChain(newValue, checkBase)) {
     invalidate();
     return;
   }
 }
 
-SILValue OwnershipRAUWHelper::getReplacementValue() {
+SILValue OwnershipRAUWHelper::prepareReplacement(SILValue rewrittenNewValue) {
   assert(isValid() && "OwnershipRAUWHelper invalid?!");
+
+  if (rewrittenNewValue) {
+    // Everything about \n newValue that the constructor checks should also be
+    // true for rewrittenNewValue.
+    assert(rewrittenNewValue->getType() == newValue->getType());
+    assert(rewrittenNewValue->getOwnershipKind()
+           == newValue->getOwnershipKind());
+    assert(rewrittenNewValue->getParentBlock() == newValue->getParentBlock());
+    assert(BorrowedAddress(rewrittenNewValue) == BorrowedAddress(newValue));
+
+    newValue = rewrittenNewValue;
+  }
+  assert(newValue && "prepareReplacement can only be called once");
+  SWIFT_DEFER { newValue = SILValue(); };
 
   if (!oldValue->getFunction()->hasOwnership())
     return newValue;
@@ -1247,14 +1258,16 @@ SILValue OwnershipRAUWHelper::getReplacementValue() {
   if (oldValue->getType().isAddress()) {
     return getReplacementAddress();
   }
-  OwnershipRAUWPrepare rauwPrepare{oldValue, newValue, *ctx};
-  return rauwPrepare.prepareReplacement();
+  OwnershipRAUWPrepare rauwPrepare{oldValue, *ctx};
+  return rauwPrepare.prepareReplacement(newValue);
 }
 
 SILBasicBlock::iterator
 OwnershipRAUWHelper::perform(SILValue replacementValue) {
   if (!replacementValue)
-    replacementValue = getReplacementValue();
+    replacementValue = prepareReplacement();
+
+  assert(!newValue && "prepareReplacement() must be called");
 
   // Make sure to always clear our context after we transform.
   SWIFT_DEFER { ctx->clear(); };
