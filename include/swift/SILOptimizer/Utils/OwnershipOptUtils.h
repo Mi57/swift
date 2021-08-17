@@ -152,6 +152,13 @@ public:
   operator bool() const { return isValid(); }
   bool isValid() const { return bool(ctx) && bool(oldValue) && bool(newValue); }
 
+  /// True if replacement requires copying the original instruction's source
+  /// operand, creating a new borrow scope for that copy, then cloning the
+  /// original.
+  bool requiresCopyBorrowAndClone() const {
+    return ctx->extraAddressFixupInfo.intPtrOp;
+  }
+
   /// Perform OSSA fixup on newValue and return a fixed-up value based that can
   /// be used to replace all uses of oldValue.
   ///
