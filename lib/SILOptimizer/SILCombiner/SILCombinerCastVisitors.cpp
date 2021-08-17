@@ -1070,9 +1070,9 @@ SILCombiner::visitConvertFunctionInst(ConvertFunctionInst *cfi) {
         continue;
       }
 
-      OwnershipRAUWHelper helper(ownershipFixupContext, pa,
-                                 cfi->getConverted());
-      if (!helper)
+      OwnershipRAUWHelper checkRAUW(ownershipFixupContext, pa,
+                                    cfi->getConverted());
+      if (!checkRAUW)
         continue;
       
       SmallVector<SILValue, 4> args(pa->getArguments().begin(),
@@ -1092,7 +1092,12 @@ SILCombiner::visitConvertFunctionInst(ConvertFunctionInst *cfi) {
       // We need to end the lifetime of the convert_function/partial_apply since
       // the helper assumes that ossa is correct upon input.
       localBuilder.emitDestroyValueOperation(pa->getLoc(), newConvert);
-      helper.perform(helper.prepareReplacement(newConvert));
+      // 'newConvert' may have different ownership than then 'cfi'. newConvert
+      // is always owned, while 'cfi' may have been guaranteed. OSSA-RAUW
+      // validity depends on the ownership kind. Reinstantiate
+      // OwnershipRAUWHelper to verify that it is still valid
+      // (a very fast check in this case).
+      OwnershipRAUWHelper(ownershipFixupContext, pa, newConvert).perform();
     }
   }
 
