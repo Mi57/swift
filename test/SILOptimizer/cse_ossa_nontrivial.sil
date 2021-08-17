@@ -868,7 +868,7 @@ bb0(%0 : @guaranteed $TestKlass):
 //
 // CHECK-LABEL: sil [ossa] @cse_ossa_outsideaccessscope :
 // CHECK: struct_element_addr
-// CHECK: struct_element_addr
+// CHECK-NOT: struct_element_addr
 // CHECK-LABEL: } // end sil function 'cse_ossa_outsideaccessscope'
 sil [ossa] @cse_ossa_outsideaccessscope : $@convention(thin) (@guaranteed TestKlass) -> () {
 bb0(%0 : @guaranteed $TestKlass):
