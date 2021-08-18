@@ -128,6 +128,8 @@ private:
 public:
   OwnershipRAUWHelper() : ctx(nullptr) {}
 
+  ~OwnershipRAUWHelper() { invalidate(); }
+
   /// Return an instance of this class if we can perform the specific RAUW
   /// operation ignoring if the types line up. Returns None otherwise.
   ///
@@ -179,7 +181,8 @@ public:
 
 private:
   void invalidate() {
-    ctx->clear();
+    if (ctx)
+      ctx->clear();
     ctx = nullptr;
   }
 
