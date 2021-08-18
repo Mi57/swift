@@ -681,6 +681,12 @@ static SILBasicBlock::iterator getBorrowPoint(SILValue newValue,
 
 /// Borrow \p newValue over the lifetime of \p guaranteedValue. Return the
 /// new guaranteed value.
+///
+/// FIXME: Consider replacing all of newValue's uses with the new copy of
+/// newValue. This may allow newValue's original borrow scope to be removed,
+/// which then allows the copy to be removed. The result would be a single
+/// borrow scope over all newValue's and guaranteedValue's uses, which is
+/// usually preferrable to a new copy and separate borrow scope.
 SILValue
 OwnershipLifetimeExtender::borrowOverValue(SILValue newValue,
                                            SILValue guaranteedValue) {

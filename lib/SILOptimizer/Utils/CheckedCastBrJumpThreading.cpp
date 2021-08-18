@@ -381,16 +381,18 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForSuccessPreds(
   //
   // NOTE: Assumes that failure predecessors have already been processed and
   // removed from the current block's predecessors.
-  assert(false && "untested success Pred");
-
   // Add an unconditional jump at the end of the block.
   // Take argument value from the dominating BB
   auto *CCBI = cast<CheckedCastBranchInst>(CCBBlock->getTerminator());
   SILBuilderWithScope(CCBI).createBranch(CCBI->getLoc(), CCBI->getSuccessBB());
   assert(CCBI->getSuccessBB()->getNumArguments() == 1);
-  auto *successArg = cast<SILPhiArgument>(CCBI->getSuccessBB()->getArgument(0));
-  //!!! use RAUW helper
-  successArg->replaceAllUsesWith(SuccessArg);
+  auto *oldSuccessArg =
+    cast<SILPhiArgument>(CCBI->getSuccessBB()->getArgument(0));
+
+  OwnershipRAUWHelper rauwTransform(rauwContext, oldSuccessArg, SuccessArg);
+  assert(rauwTransform.isValid() && "sufficiently checked by canRAUW");
+  rauwTransform.perform();
+
   CCBI->getSuccessBB()->eraseArgument(0);
   CCBI->eraseFromParent();
 }
