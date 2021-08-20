@@ -686,7 +686,8 @@ static SILBasicBlock::iterator getBorrowPoint(SILValue newValue,
 /// newValue. This may allow newValue's original borrow scope to be removed,
 /// which then allows the copy to be removed. The result would be a single
 /// borrow scope over all newValue's and guaranteedValue's uses, which is
-/// usually preferrable to a new copy and separate borrow scope.
+/// usually preferrable to a new copy and separate borrow scope. When doing
+/// this, we can use newValue as the borrow point instead of getBorrowPoint.
 SILValue
 OwnershipLifetimeExtender::borrowOverValue(SILValue newValue,
                                            SILValue guaranteedValue) {
@@ -1278,7 +1279,11 @@ OwnershipRAUWHelper::perform(SILValue replacementValue) {
   // Make sure to always clear our context after we transform.
   SWIFT_DEFER { ctx->clear(); };
 
-  return replaceAllUsesAndErase(oldValue, replacementValue, ctx->callbacks);
+  if (auto *svi = dyn_cast<SingleValueInstruction>(oldValue))
+    return replaceAllUsesAndErase(svi, replacementValue, ctx->callbacks);
+
+  // The caller must rewrite the terminator after RAUW.
+  return replaceAllUses(oldValue, replacementValue, ctx->callbacks);
 }
 
 //===----------------------------------------------------------------------===//

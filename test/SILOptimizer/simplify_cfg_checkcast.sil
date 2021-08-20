@@ -1,7 +1,7 @@
 // RUN: %target-sil-opt -enable-sil-verify-all %s -jumpthread-simplify-cfg -enable-ossa-simplify-cfg -enable-ossa-rewriteterminator | %FileCheck %s
 // RUN: %target-sil-opt -enable-sil-verify-all %s -jumpthread-simplify-cfg -enable-ossa-simplify-cfg -enable-ossa-rewriteterminator -debug-only=sil-simplify-cfg 2>&1 | %FileCheck %s --check-prefix=CHECK-TRACE
 //
-// REQUIRES: EnableOSSASimplifyCFG
+// REQUIRES!!!: EnableOSSASimplifyCFG
 
 // FIXME: When OSSA optimization is complete, convert XCHECK to CHECK lines
 
