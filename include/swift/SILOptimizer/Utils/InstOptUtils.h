@@ -660,6 +660,7 @@ SILBasicBlock::iterator replaceAllUsesAndErase(SingleValueInstruction *svi,
                                                SILValue newValue,
                                                InstModCallbacks &callbacks);
 
+#if 0
 /// Replace all uses of \p oldValue with \p newValue, delete the instruction
 /// that defines \p oldValue, and notify the callbacks of new uses and when
 /// the defining instruction and its end-of-scope instructions are deleted.
@@ -675,6 +676,7 @@ SILBasicBlock::iterator replaceAllUsesAndErase(SingleValueInstruction *svi,
 SILBasicBlock::iterator replaceAllUsesAndErase(SILValue oldValue,
                                                SILValue newValue,
                                                InstModCallbacks &callbacks);
+#endif
 
 /// This API is equivalent to performing \p use->set(\p newValue) except that:
 ///

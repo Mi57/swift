@@ -1958,6 +1958,7 @@ swift::replaceAllUsesAndErase(SingleValueInstruction *svi, SILValue newValue,
   return nextii;
 }
 
+#if 0
 SILBasicBlock::iterator
 swift::replaceAllUsesAndErase(SILValue oldValue, SILValue newValue,
                               InstModCallbacks &callbacks) {
@@ -1996,6 +1997,7 @@ swift::replaceAllUsesAndErase(SILValue oldValue, SILValue newValue,
   callbacks.deleteInst(oldTerm);
   return nextii;
 }
+#endif
 
 /// Given that we are going to replace use's underlying value, if the use is a
 /// lifetime ending use, insert an end scope scope use for the underlying value
