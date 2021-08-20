@@ -1283,7 +1283,9 @@ OwnershipRAUWHelper::perform(SILValue replacementValue) {
     return replaceAllUsesAndErase(svi, replacementValue, ctx->callbacks);
 
   // The caller must rewrite the terminator after RAUW.
-  return replaceAllUses(oldValue, replacementValue, ctx->callbacks);
+  auto *term = cast<SILPhiArgument>(oldValue)->getTerminatorForResult();
+  auto nextII = term->getParent()->end();
+  return replaceAllUses(oldValue, replacementValue, nextII, ctx->callbacks);
 }
 
 //===----------------------------------------------------------------------===//
