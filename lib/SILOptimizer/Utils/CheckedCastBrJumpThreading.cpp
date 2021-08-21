@@ -269,20 +269,26 @@ canRAUW(OwnershipFixupContext &rauwContext) {
   return OwnershipRAUWHelper::hasValidRAUWOwnership(oldSuccessArg, SuccessArg);
 }
 
-// Erase the checked_cast_br that terminates this block, assuming no remaining
-// uses of the successful cast result.
+// Erase the checked_cast_br that terminates this block. The caller must replace
+// and erase the successful cast result.
 //
 // The checked_cast_br failure result's uses are replaced with the cast's
 // operand, and the block argument representing that result is deleted. Since
 // the checked_cast's uses now use its forwarded operand, they are still in
 // valid OSSA form, so this can be done before updateOSSAAfterCloning, which
 // doesn't need to know about the erased checked_cast.
-static void eraseCheckedCastBr(SILBasicBlock *castBB) {
-  auto *checkedCastBr = cast<CheckedCastBranchInst>(castBB->getTerminator());
+static void eraseCheckedCastBr(
+  CheckedCastBranchInst *checkedCastBr,
+  CheckedCastBranchInst::SuccessorPath successorIdx) {
 
   SILBuilderWithScope Builder(checkedCastBr);
-  Builder.createBranch(checkedCastBr->getLoc(), checkedCastBr->getFailureBB());
-  if (castBB->getParent()->hasOwnership()) {
+  Builder.createBranch(checkedCastBr->getLoc(),
+                       checkedCastBr->getSuccessors()[successorIdx]);
+  auto *successBB = checkedCastBr->getSuccessBB();
+  assert(successBB->getNumArguments() == 1);
+  assert(successBB->getArgument(0)->use_empty());
+  successBB->eraseArgument(0);
+  if (checkedCastBr->getFunction()->hasOwnership()) {
     auto *failureBB = checkedCastBr->getFailureBB();
     assert(failureBB->getNumArguments() == 1);
     failureBB->getArgument(0)->replaceAllUsesWith(checkedCastBr->getOperand());
@@ -299,8 +305,13 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForFailurePreds(
   assert(!Cloner.wasCloned());
   Cloner.cloneBlock();
   SILBasicBlock *TargetFailureBB = Cloner.getNewBB();
-  // This cloned block branches to the FailureBB, so just delete the cast.
-  eraseCheckedCastBr(TargetFailureBB);
+  // This cloned block branches to the FailureBB, so just delete the cast and
+  // ignore the success target which will keep it's original predecessor.
+  auto *clonedCCBI =
+    cast<CheckedCastBranchInst>(TargetFailureBB->getTerminator());
+  auto *clonedSuccessArg = clonedCCBI->getSuccessBB()->getArgument(0);
+  clonedSuccessArg->replaceAllUsesWithUndef();
+  eraseCheckedCastBr(clonedCCBI, CheckedCastBranchInst::FailIdx);
 
   // Redirect all FailurePreds to the copy of BB.
   for (auto *Pred : FailurePreds) {
@@ -320,10 +331,13 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForFailurePreds(
 void CheckedCastBrJumpThreading::Edit::modifyCFGForSuccessPreds(
   BasicBlockCloner &Cloner, OwnershipFixupContext &rauwContext) {
 
+  auto *checkedCastBr = cast<CheckedCastBranchInst>(CCBBlock->getTerminator());
+  auto *oldSuccessArg = checkedCastBr->getSuccessBB()->getArgument(0);
   if (InvertSuccess) {
     assert(!hasUnknownPreds && "is not handled, should have been checked");
-    // This success path is unused, so just delete the cast.
-    eraseCheckedCastBr(CCBBlock);
+    // This success path is unused, so undef its uses and delete the cast.
+    oldSuccessArg->replaceAllUsesWithUndef();
+    eraseCheckedCastBr(checkedCastBr, CheckedCastBranchInst::FailIdx);
     return;
   }
   if (!hasUnknownPreds) {
@@ -333,16 +347,13 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForSuccessPreds(
     // NOTE: Assumes that failure predecessors have already been processed and
     // removed from the current block's predecessors.
 
-    // RAUW the success arg while it is still a valid terminator result.
-    auto *CCBI = cast<CheckedCastBranchInst>(CCBBlock->getTerminator());
-    auto *successBB = CCBI->getSuccessBB();
-    auto *oldSuccessArg = cast<SILPhiArgument>(successBB->getArgument(0));
-
-    // Replace uses with SuccessArg from the dominating BB.
+    // Replace uses with SuccessArg from the dominating BB. Do this while it is
+    // still a valid terminator result, before erasing the cast.
     OwnershipRAUWHelper rauwTransform(rauwContext, oldSuccessArg, SuccessArg);
     assert(rauwTransform.isValid() && "sufficiently checked by canRAUW");
     rauwTransform.perform();
-    eraseCheckedCastBr(CCBBlock);
+
+    eraseCheckedCastBr(checkedCastBr, CheckedCastBranchInst::SuccessIdx);
     return;
   }
   // Only clone if there are preds on the success path.
@@ -389,6 +400,8 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForSuccessPreds(
   OwnershipRAUWHelper rauwUtil(rauwContext, clonedSuccessArg, SuccessArg);
   assert(rauwUtil.isValid() && "sufficiently checked by canRAUW");
   rauwUtil.perform();
+
+  eraseCheckedCastBr(clonedCCBI, CheckedCastBranchInst::SuccessIdx);
 }
 
 /// Handle a special case, where ArgBB is the entry block.
